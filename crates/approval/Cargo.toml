@@ -1,0 +1,9 @@
+[package]
+name = "approval"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+protocol = { workspace = true }
+sandbox-policy = { workspace = true }

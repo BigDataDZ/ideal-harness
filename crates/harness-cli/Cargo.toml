@@ -1,0 +1,17 @@
+[package]
+name = "harness-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ideal-harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+protocol = { workspace = true }
+sandbox-policy = { workspace = true }
+session = { workspace = true }
+tools = { workspace = true }
+agent-loop = { workspace = true }

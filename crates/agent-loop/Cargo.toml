@@ -1,0 +1,9 @@
+[package]
+name = "agent-loop"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+protocol = { workspace = true }
+session = { workspace = true }
+tools = { workspace = true }
