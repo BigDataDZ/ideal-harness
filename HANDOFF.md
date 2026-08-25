@@ -1,6 +1,6 @@
 # HANDOFF —— 开发交接文档
 
-> 最后更新：TASK-101 完成后、TASK-102 进行到依赖勘察阶段
+> 最后更新：TASK-102 完成后（commit `c880d0f`）
 > 用途：任何人/智能体接手开发时，从本文档 5 分钟内恢复全部上下文。
 > 阅读顺序：本文件 → `AGENTS.md` → `docs/ROADMAP.md`（任务卡）→ `docs/DESIGN-DECISIONS.md`（架构依据）→ `docs/DEVELOPMENT.md`（完整规范）
 
@@ -18,7 +18,7 @@
 |---|---|---|
 | P0 架构骨架（v0.1.0） | ✅ 完成 | 8 crate / 32 测试全绿；commit `03a5255` |
 | TASK-101 协议流式契约 | ✅ 完成 | commit `b661d4f`；protocol 5 测试（含旧 JSONL 兼容重放） |
-| **TASK-102 model-provider** | 🔄 **进行中（刚起步）** | 依赖缓存已勘察完毕，**代码未写**——见第四节断点详情 |
+| **TASK-102 model-provider** | ✅ 完成 | commit `c880d0f`；model-provider 10 测试（5 单元 + 5 故障注入），workspace 合计 42 全绿 |
 | TASK-103 / 104 | ⬜ 未开始 | 依赖 101（已满足）/ 102 |
 | P2~P5 | ⬜ 未开始 | 见 ROADMAP |
 
@@ -83,6 +83,6 @@ git log --oneline                        # 当前 2 个提交
 | 任务 | 状态 | 认领人 |
 |---|---|---|
 | TASK-101 | ✅ 完成（b661d4f） | ox-alpha（本会话） |
-| TASK-102 | 🔄 进行中（设计定稿，代码未写） | ox-alpha（本会话，中断于此） |
+| TASK-102 | ✅ 完成（c880d0f） | ox-alpha（本会话） |
 | TASK-103/104 | ⬜ 可认领 | — |
 | TASK-201~205 | ⬜（P2，需先完成 P1） | — |
