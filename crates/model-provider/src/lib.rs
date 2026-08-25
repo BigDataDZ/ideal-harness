@@ -23,10 +23,18 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_ERROR_BODY: u64 = 64 * 1024;
 
 /// 对话消息：OpenAI `messages` 数组的元素。
+/// `tool_calls` / `tool_call_id` 仅在工具调用闭环（TASK-103）中使用，
+/// 缺省时从线上格式省略，普通对话路径的序列化结果与 TASK-102 完全一致。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// assistant 发起工具调用时携带（role = "assistant"）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallRequest>>,
+    /// role = "tool" 的回填消息携带，对应被应答的调用 id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -34,6 +42,8 @@ impl ChatMessage {
         Self {
             role: "system".into(),
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -41,6 +51,8 @@ impl ChatMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -48,8 +60,69 @@ impl ChatMessage {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
+
+    /// assistant 发起工具调用的消息（content 可为空串）。
+    pub fn assistant_with_tool_calls(tool_calls: Vec<ToolCallRequest>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: String::new(),
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    /// role = "tool" 的结果回填消息。
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(call_id.into()),
+        }
+    }
+}
+
+/// 一次工具调用请求（流式分片聚合后的最终形态）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallRequest {
+    /// 上游分配的调用 id（tool 消息回填时必须原样带回）。
+    pub id: String,
+    /// 函数名。
+    pub name: String,
+    /// JSON 形式的参数串（流式分片按序拼接）。
+    pub arguments: String,
+}
+
+/// 单个流式分片中的 tool_calls 增量（OpenAI chunk 形态，按 index 聚合）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct ToolCallFragment {
+    #[serde(default)]
+    pub index: usize,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub function: Option<FunctionFragment>,
+}
+
+/// 工具调用分片的函数部分。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct FunctionFragment {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub arguments: Option<String>,
+}
+
+/// 一条 SSE data 行解析出的结构化增量（纯数据，无 IO）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamDelta {
+    pub content: Option<String>,
+    pub finish_reason: Option<String>,
+    pub tool_calls: Vec<ToolCallFragment>,
 }
 
 /// 一次流式采样的聚合结果。
@@ -59,6 +132,8 @@ pub struct ChatReply {
     pub text: String,
     /// 流中最后一次出现的非空 finish_reason（"stop" / "tool_calls" / "length" / ...）。
     pub finish_reason: Option<String>,
+    /// 聚合完成的工具调用请求（按分片 index 重组，arguments 已拼接）。
+    pub tool_calls: Vec<ToolCallRequest>,
 }
 
 /// SSE 单行三分类结果（纯解析，无 IO）。
@@ -85,12 +160,12 @@ pub fn parse_sse_line(line: &str) -> SseLine {
     }
 }
 
-/// 从一条 data JSON 行提取 `(delta.content, finish_reason)`。
+/// 从一条 data JSON 行提取结构化增量 [`StreamDelta`]。
 ///
-/// 结构化匹配 `choices[0].delta.content` 与 `choices[0].finish_reason`；
+/// 结构化匹配 `choices[0].delta.{content,tool_calls}` 与 `choices[0].finish_reason`；
 /// 非 JSON 行返回 [`ErrorCode::ModelStreamBroken`]——静默跳过会掩盖协议漂移，
 /// 截断/损坏必须在调用点显式可见（D4/D12）。
-pub fn extract_delta(data_line: &str) -> Result<(Option<String>, Option<String>), ErrorEnvelope> {
+pub fn extract_delta(data_line: &str) -> Result<StreamDelta, ErrorEnvelope> {
     #[derive(Deserialize)]
     struct ChunkPayload {
         #[serde(default)]
@@ -105,15 +180,20 @@ pub fn extract_delta(data_line: &str) -> Result<(Option<String>, Option<String>)
     #[derive(Deserialize, Default)]
     struct Delta {
         content: Option<String>,
+        #[serde(default)]
+        tool_calls: Vec<ToolCallFragment>,
     }
 
     match serde_json::from_str::<ChunkPayload>(data_line) {
         Ok(parsed) => {
             let choice = parsed.choices.first();
-            Ok((
-                choice.and_then(|c| c.delta.content.clone()),
-                choice.and_then(|c| c.finish_reason.clone()),
-            ))
+            Ok(StreamDelta {
+                content: choice.and_then(|c| c.delta.content.clone()),
+                finish_reason: choice.and_then(|c| c.finish_reason.clone()),
+                tool_calls: choice
+                    .map(|c| c.delta.tool_calls.clone())
+                    .unwrap_or_default(),
+            })
         }
         Err(e) => Err(ErrorEnvelope::new(
             ErrorCode::ModelStreamBroken,
@@ -162,10 +242,12 @@ fn map_transport_error(e: reqwest::Error) -> ErrorEnvelope {
 /// agent-loop 依赖的唯一抽象边界（TASK-103 的接入点）。
 pub trait ChatModel {
     /// 发起一次流式采样并聚合为完整回复。
+    /// `tools` 为 OpenAI tools 数组的原始 JSON（None = 不广告任何工具）。
     fn stream_chat(
         &self,
         spec: &ModelCallSpec,
         messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
     ) -> Result<ChatReply, ErrorEnvelope>;
 }
 
@@ -176,6 +258,8 @@ struct ChatRequest<'a> {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a serde_json::Value>,
 }
 
 /// OpenAI 兼容客户端（阻塞式）。Clone 安全：内部仅是连接池句柄与密钥副本。
@@ -233,6 +317,7 @@ impl ChatModel for OpenAiCompatClient {
         &self,
         spec: &ModelCallSpec,
         messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
     ) -> Result<ChatReply, ErrorEnvelope> {
         let url = format!("{}/chat/completions", spec.base_url.trim_end_matches('/'));
         let request = ChatRequest {
@@ -240,6 +325,7 @@ impl ChatModel for OpenAiCompatClient {
             messages,
             stream: true,
             temperature: spec.temperature,
+            tools,
         };
 
         let response = self
@@ -270,6 +356,8 @@ impl ChatModel for OpenAiCompatClient {
 fn consume_sse_stream(response: reqwest::blocking::Response) -> Result<ChatReply, ErrorEnvelope> {
     let reader = std::io::BufReader::new(response);
     let mut reply = ChatReply::default();
+    // 工具调用分片按 index 重组：id/name 取首个非空值，arguments 按序拼接。
+    let mut tool_slots: Vec<Option<ToolCallRequest>> = Vec::new();
     let mut seen_done = false;
 
     for line in reader.lines() {
@@ -283,16 +371,39 @@ fn consume_sse_stream(response: reqwest::blocking::Response) -> Result<ChatReply
                 break;
             }
             SseLine::Data(payload) => {
-                let (delta, finish) = extract_delta(&payload)?;
-                if let Some(t) = delta {
+                let delta = extract_delta(&payload)?;
+                if let Some(t) = delta.content {
                     reply.text.push_str(&t);
                 }
-                if let Some(f) = finish.filter(|f| !f.is_empty()) {
+                if let Some(f) = delta.finish_reason.filter(|f| !f.is_empty()) {
                     reply.finish_reason = Some(f);
+                }
+                for frag in delta.tool_calls {
+                    if tool_slots.len() <= frag.index {
+                        tool_slots.resize(frag.index + 1, None);
+                    }
+                    let slot = tool_slots[frag.index].get_or_insert_with(|| ToolCallRequest {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    });
+                    if let Some(id) = frag.id {
+                        slot.id = id;
+                    }
+                    if let Some(func) = frag.function {
+                        if let Some(name) = func.name {
+                            slot.name = name;
+                        }
+                        if let Some(args) = func.arguments {
+                            slot.arguments.push_str(&args);
+                        }
+                    }
                 }
             }
         }
     }
+
+    reply.tool_calls = tool_slots.into_iter().flatten().collect();
 
     if !seen_done {
         return Err(ErrorEnvelope::new(
@@ -324,22 +435,47 @@ mod tests {
 
     #[test]
     fn extract_delta_reads_content_and_finish_reason() {
-        let (text, finish) =
-            extract_delta(r#"{"choices":[{"delta":{"content":"你好"},"finish_reason":null}]}"#)
-                .unwrap();
-        assert_eq!(text.as_deref(), Some("你好"));
-        assert_eq!(finish, None);
+        let d = extract_delta(r#"{"choices":[{"delta":{"content":"你好"},"finish_reason":null}]}"#)
+            .unwrap();
+        assert_eq!(d.content.as_deref(), Some("你好"));
+        assert_eq!(d.finish_reason, None);
+        assert!(d.tool_calls.is_empty());
 
         // 收尾块只有 finish_reason
-        let (text, finish) =
-            extract_delta(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#).unwrap();
-        assert_eq!(text, None);
-        assert_eq!(finish.as_deref(), Some("stop"));
+        let d = extract_delta(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#).unwrap();
+        assert_eq!(d.content, None);
+        assert_eq!(d.finish_reason.as_deref(), Some("stop"));
 
         // 无 choices 的载荷是合法的（部分厂商发心跳帧）
-        let (text, finish) = extract_delta("{}").unwrap();
-        assert_eq!(text, None);
-        assert_eq!(finish, None);
+        let d = extract_delta("{}").unwrap();
+        assert_eq!(d.content, None);
+        assert_eq!(d.finish_reason, None);
+        assert!(d.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn extract_delta_parses_tool_call_fragments() {
+        let d = extract_delta(
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",
+                "function":{"name":"echo","arguments":"{\"text\":"}}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(d.tool_calls.len(), 1);
+        assert_eq!(d.tool_calls[0].index, 0);
+        assert_eq!(d.tool_calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(
+            d.tool_calls[0].function.as_ref().unwrap().name.as_deref(),
+            Some("echo")
+        );
+        assert_eq!(
+            d.tool_calls[0]
+                .function
+                .as_ref()
+                .unwrap()
+                .arguments
+                .as_deref(),
+            Some(r#"{"text":"#)
+        );
     }
 
     #[test]

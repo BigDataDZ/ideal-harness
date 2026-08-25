@@ -90,7 +90,7 @@ fn happy_path_aggregates_deltas_and_finish_reason() {
     });
 
     let reply = client()
-        .stream_chat(&spec(&base), &[ChatMessage::user("hi")])
+        .stream_chat(&spec(&base), &[ChatMessage::user("hi")], None)
         .expect("正常路径不应失败");
     assert_eq!(reply.text, "你好, world");
     assert_eq!(reply.finish_reason.as_deref(), Some("stop"));
@@ -107,7 +107,7 @@ fn hung_upstream_times_out_to_model_stream_broken() {
     });
 
     let err = client()
-        .stream_chat(&spec(&base), &[ChatMessage::user("hi")])
+        .stream_chat(&spec(&base), &[ChatMessage::user("hi")], None)
         .expect_err("挂起的上游必须以超时失败");
     let elapsed = started.elapsed();
 
@@ -129,7 +129,7 @@ fn stream_without_done_sentinel_is_reported_as_truncated() {
     });
 
     let err = client()
-        .stream_chat(&spec(&base), &[ChatMessage::user("hi")])
+        .stream_chat(&spec(&base), &[ChatMessage::user("hi")], None)
         .expect_err("缺 [DONE] 必须报截断");
     assert_eq!(err.code, ErrorCode::ModelStreamBroken);
     assert!(
@@ -149,7 +149,7 @@ fn non_json_data_line_is_model_stream_broken_not_skipped() {
     });
 
     let err = client()
-        .stream_chat(&spec(&base), &[ChatMessage::user("hi")])
+        .stream_chat(&spec(&base), &[ChatMessage::user("hi")], None)
         .expect_err("非 JSON data 行必须报错");
     assert_eq!(err.code, ErrorCode::ModelStreamBroken);
 }
@@ -168,7 +168,36 @@ fn connection_cut_mid_body_is_model_stream_broken() {
     });
 
     let err = client()
-        .stream_chat(&spec(&base), &[ChatMessage::user("hi")])
+        .stream_chat(&spec(&base), &[ChatMessage::user("hi")], None)
         .expect_err("半途断连必须报流中断");
     assert_eq!(err.code, ErrorCode::ModelStreamBroken);
+}
+
+/// 工具调用闭环（TASK-103 前置）：tool_calls 分片跨多个 chunk 到达，
+/// 必须按 index 重组——id/name 取首见值，arguments 按序拼接。
+#[test]
+fn tool_call_fragments_are_aggregated_by_index() {
+    let body = concat!(
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_9","function":{"name":"echo","arguments":"{\"text\":"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"hi\"}"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "\n\n",
+        "data: [DONE]\n\n",
+    );
+    let base = spawn_mock(move |mut stream| {
+        let _ = stream.write_all(sse_response(body).as_bytes());
+        let _ = stream.flush();
+    });
+
+    let reply = client()
+        .stream_chat(&spec(&base), &[ChatMessage::user("hi")], None)
+        .expect("工具调用流不应失败");
+    assert_eq!(reply.finish_reason.as_deref(), Some("tool_calls"));
+    assert_eq!(reply.tool_calls.len(), 1);
+    let tc = &reply.tool_calls[0];
+    assert_eq!(tc.id, "call_9");
+    assert_eq!(tc.name, "echo");
+    assert_eq!(tc.arguments, r#"{"text":"hi"}"#);
 }
