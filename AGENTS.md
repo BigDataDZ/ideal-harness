@@ -19,6 +19,7 @@ Rust 实现的 LLM Agent Harness 原型：protocol-first、事件溯源、三层
 | `crates/tools` | 工具注册表 + schema 校验 + 调度 | P3/P4 | protocol |
 | `crates/session` | JSONL 事件溯源：append/replay/fork | P5 | protocol |
 | `crates/context` | token 预算 + 双触发压缩判定 | P4 | protocol |
+| `crates/model-provider` | OpenAI 兼容 HTTP+SSE 客户端（错误→稳定码映射） | P1 | protocol, reqwest |
 | `crates/agent-loop` | Phase 状态机主循环 + Inbox | P3 | protocol, session, tools |
 | `crates/harness-cli` | 装配入口（唯一允许 main 的地方） | — | 全部 |
 

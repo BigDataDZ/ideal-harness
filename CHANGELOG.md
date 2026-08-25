@@ -8,6 +8,7 @@
 ### Added
 
 - **protocol（TASK-101）**：`Event::ModelChunkReceived` 流式增量事件、`ModelCallSpec` 调用规格（无认证字段，属 provider 层）；旧版 JSONL 向后兼容由测试锁定
+- **model-provider（TASK-102）**：OpenAI 兼容阻塞式 `chat/completions` SSE 客户端（reqwest + rustls，离线缓存可解析）；纯解析层 `parse_sse_line` / `extract_delta` 可独立测试；错误仅按结构化字段映射稳定码（超限→ContextWindowExceeded、超时/断流/截断→ModelStreamBroken）；API key 读 `IDEAL_HARNESS_API_KEY`，缺失即 fail-closed 拒绝；本地 TcpListener 故障注入测试覆盖超时/截断/非 JSON 行/半途断连
 
 ### 计划中（详见 docs/ROADMAP.md）
 

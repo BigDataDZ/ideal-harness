@@ -11,6 +11,11 @@ license = "Apache-2.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
 protocol = { path = "crates/protocol" }
 sandbox-policy = { path = "crates/sandbox-policy" }
 approval = { path = "crates/approval" }
@@ -18,3 +23,4 @@ tools = { path = "crates/tools" }
 session = { path = "crates/session" }
 context = { path = "crates/context" }
 agent-loop = { path = "crates/agent-loop" }
+model-provider = { path = "crates/model-provider" }

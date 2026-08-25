@@ -22,13 +22,13 @@
 
 ## 二、P1 可对话 MVP（v0.2）
 
-### TASK-101: 协议扩展——模型流式契约
+### TASK-101: 协议扩展——模型流式契约 ✅（commit `b661d4f`）
 - 目标 crate: protocol ⚠️串行
 - 内容：Event 增加 `ModelChunkReceived`；新增 `ModelCallSpec`（model/base_url/temperature）；ErrorCode 已含 ModelStreamBroken 无需改
 - 验收：序列化往返测试；旧 JSONL 文件仍可重放（向后兼容证明）
 - 明确不做：不引入认证字段（属 provider 层）
 
-### TASK-102: 新 crate model-provider——OpenAI 兼容客户端
+### TASK-102: 新 crate model-provider——OpenAI 兼容客户端 ✅
 - 目标 crate: model-provider（新建，允许依赖 protocol；加入所有权地图）
 - 内容：HTTP POST + SSE 流式解析；错误映射：HTTP 4xx→ToolArgsInvalid 类比归 Internal，超限→ContextWindowExceeded，断流→ModelStreamBroken；API key 读环境变量 `IDEAL_HARNESS_API_KEY`
 - 验收：mock HTTP server 三种故障注入测试（超时/截断/非 JSON 行）
