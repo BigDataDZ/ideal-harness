@@ -5,9 +5,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- **protocol（TASK-101）**：`Event::ModelChunkReceived` 流式增量事件、`ModelCallSpec` 调用规格（无认证字段，属 provider 层）；旧版 JSONL 向后兼容由测试锁定
+
 ### 计划中（详见 docs/ROADMAP.md）
 
-- P1 可对话 MVP：真实 LLM provider 接入、工具调用闭环、chat 子命令
+- P1 可对话 MVP：真实 LLM provider 接入（TASK-102~104）、工具调用闭环
 - P2 安全纵深：受限执行进程池、网络白名单代理、人工审批通道
 
 ## [0.1.0] - 2026-08-22

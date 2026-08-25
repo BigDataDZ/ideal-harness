@@ -44,7 +44,10 @@ mod tests {
     use super::*;
 
     fn policy(mode: SandboxMode) -> SandboxPolicy {
-        SandboxPolicy { mode, workspace_root: PathBuf::from("/ws") }
+        SandboxPolicy {
+            mode,
+            workspace_root: PathBuf::from("/ws"),
+        }
     }
 
     #[test]

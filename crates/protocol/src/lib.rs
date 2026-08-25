@@ -29,7 +29,10 @@ pub struct ErrorEnvelope {
 
 impl ErrorEnvelope {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 }
 
@@ -46,15 +49,57 @@ pub enum ToolOutcome {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    TurnStarted { turn_id: u64 },
-    UserMessage { text: String },
-    AssistantMessage { text: String },
-    ToolCallRequested { call_id: String, tool: String, args: serde_json::Value },
-    ToolResultAdded { call_id: String, outcome: ToolOutcome },
-    CompactionApplied { summary: String },
-    ApprovalDecided { call_id: String, approved: bool },
-    TurnCompleted { turn_id: u64 },
-    TurnAborted { turn_id: u64, reason: String },
+    TurnStarted {
+        turn_id: u64,
+    },
+    UserMessage {
+        text: String,
+    },
+    AssistantMessage {
+        text: String,
+    },
+    /// 流式采样的增量输出块（P1/TASK-101）：一次采样中的增量文本片段。
+    ModelChunkReceived {
+        call_id: String,
+        delta_text: String,
+    },
+    ToolCallRequested {
+        call_id: String,
+        tool: String,
+        args: serde_json::Value,
+    },
+    ToolResultAdded {
+        call_id: String,
+        outcome: ToolOutcome,
+    },
+    CompactionApplied {
+        summary: String,
+    },
+    ApprovalDecided {
+        call_id: String,
+        approved: bool,
+    },
+    TurnCompleted {
+        turn_id: u64,
+    },
+    TurnAborted {
+        turn_id: u64,
+        reason: String,
+    },
+}
+
+/// 一次模型调用的规格（P1/TASK-101）。
+/// 边界说明：认证字段（API key 等）属于 provider 层，
+/// 刻意不进协议——见 ROADMAP TASK-101「明确不做」。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelCallSpec {
+    /// 模型名，如 "deepseek-chat"。
+    pub model: String,
+    /// API base URL，如 "https://api.deepseek.com/v1"。
+    pub base_url: String,
+    /// None 表示使用 provider 默认温度；None 不写入线上格式。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
 }
 
 /// 带序号的事件记录：session 层持久化与流式补洞的最小单元。
@@ -80,7 +125,10 @@ mod tests {
         let back: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
         assert!(json.contains("tool_result_added"));
-        assert!(json.contains("sandbox_denied"), "error code 必须序列化为稳定 snake_case");
+        assert!(
+            json.contains("sandbox_denied"),
+            "error code 必须序列化为稳定 snake_case"
+        );
     }
 
     #[test]
@@ -92,6 +140,61 @@ mod tests {
         ] {
             let json = serde_json::to_string(&code).unwrap();
             assert_eq!(json, format!("\"{tag}\""));
+        }
+    }
+
+    #[test]
+    fn model_chunk_received_roundtrip_with_snake_case_tag() {
+        let e = Event::ModelChunkReceived {
+            call_id: "c42".into(),
+            delta_text: "你好".into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            json.contains("\"type\":\"model_chunk_received\""),
+            "tag 必须是稳定 snake_case: {json}"
+        );
+        let back: Event = serde_json::from_str(&json).unwrap();
+        assert_eq!(e, back);
+    }
+
+    #[test]
+    fn model_call_spec_roundtrip_and_optional_temperature_omission() {
+        let full = ModelCallSpec {
+            model: "deepseek-chat".into(),
+            base_url: "https://api.deepseek.com/v1".into(),
+            temperature: Some(0.7),
+        };
+        let j = serde_json::to_string(&full).unwrap();
+        assert_eq!(serde_json::from_str::<ModelCallSpec>(&j).unwrap(), full);
+
+        // temperature=None 必须从线上格式省略，读取端缺省还原为 None
+        let minimal = ModelCallSpec {
+            model: "m".into(),
+            base_url: "u".into(),
+            temperature: None,
+        };
+        let jm = serde_json::to_string(&minimal).unwrap();
+        assert!(
+            !jm.contains("temperature"),
+            "None 温度不应出现于线上格式: {jm}"
+        );
+        assert_eq!(serde_json::from_str::<ModelCallSpec>(&jm).unwrap(), minimal);
+    }
+
+    #[test]
+    fn legacy_v010_jsonl_lines_still_replay() {
+        // v0.1.0 真实落盘的行（不含新变体）。向后兼容铁律：旧会话文件必须原样可读。
+        let legacy_lines = [
+            r#"{"seq":0,"event":{"type":"turn_started","turn_id":0}}"#,
+            r#"{"seq":1,"event":{"type":"user_message","text":"你好"}}"#,
+            r#"{"seq":2,"event":{"type":"assistant_message","text":"echo: 收到"}}"#,
+            r#"{"seq":3,"event":{"type":"tool_result_added","call_id":"c1","outcome":{"failure":{"error":{"code":"sandbox_denied","message":"[sandbox: denied]"}}}}}"#,
+        ];
+        for (idx, line) in legacy_lines.iter().enumerate() {
+            let se: SequencedEvent = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("旧版本行必须仍可重放: {line} ({e})"));
+            assert_eq!(se.seq, idx as u64);
         }
     }
 }

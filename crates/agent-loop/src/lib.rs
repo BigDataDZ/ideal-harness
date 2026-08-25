@@ -50,7 +50,13 @@ impl<'a> AgentLoop<'a> {
         tools: &'a ToolRegistry,
         model: &'a dyn ModelProvider,
     ) -> Self {
-        Self { phase: Phase::Idle, inbox: Inbox::new(), session, tools, model }
+        Self {
+            phase: Phase::Idle,
+            inbox: Inbox::new(),
+            session,
+            tools,
+            model,
+        }
     }
 
     /// 一个 turn：drain inbox → 逐条采样 → 终结事件。
@@ -64,14 +70,18 @@ impl<'a> AgentLoop<'a> {
         );
         self.phase = Phase::Running;
         let turn_id = self.session.len();
-        self.session.append(Event::TurnStarted { turn_id }).expect("append turn_start");
+        self.session
+            .append(Event::TurnStarted { turn_id })
+            .expect("append turn_start");
 
         let mut completed = 0u64;
         for text in self.inbox.drain() {
             self.session.append(Event::UserMessage { text }).ok();
             match self.model.complete("") {
                 Ok(reply) => {
-                    self.session.append(Event::AssistantMessage { text: reply }).ok();
+                    self.session
+                        .append(Event::AssistantMessage { text: reply })
+                        .ok();
                     completed += 1;
                 }
                 Err(e) if e.code == ErrorCode::ContextWindowExceeded => {
@@ -92,7 +102,9 @@ impl<'a> AgentLoop<'a> {
     }
 
     fn abort(&mut self, turn_id: u64, reason: String) {
-        self.session.append(Event::TurnAborted { turn_id, reason }).ok();
+        self.session
+            .append(Event::TurnAborted { turn_id, reason })
+            .ok();
         self.phase = Phase::Idle;
     }
 }
@@ -114,7 +126,10 @@ mod tests {
     struct Broken;
     impl ModelProvider for Broken {
         fn complete(&self, _: &str) -> Result<String, ErrorEnvelope> {
-            Err(ErrorEnvelope::new(ErrorCode::ModelStreamBroken, "stream cut"))
+            Err(ErrorEnvelope::new(
+                ErrorCode::ModelStreamBroken,
+                "stream cut",
+            ))
         }
     }
 
@@ -140,7 +155,10 @@ mod tests {
         // started / user / assistant / completed
         let evs = events(&path);
         assert_eq!(evs.len(), 4);
-        assert_eq!(evs.last().unwrap().event, Event::TurnCompleted { turn_id: 0 });
+        assert_eq!(
+            evs.last().unwrap().event,
+            Event::TurnCompleted { turn_id: 0 }
+        );
         std::fs::remove_file(&path).ok();
     }
 

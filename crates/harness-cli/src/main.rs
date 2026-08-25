@@ -20,8 +20,10 @@ fn main() -> anyhow::Result<()> {
     println!("== ideal-harness 原型演示 ==");
 
     // 1) 沙箱策略（P2）
-    let policy =
-        SandboxPolicy { mode: SandboxMode::WorkspaceWrite, workspace_root: std::env::temp_dir() };
+    let policy = SandboxPolicy {
+        mode: SandboxMode::WorkspaceWrite,
+        workspace_root: std::env::temp_dir(),
+    };
     let outside = std::path::Path::new("C:/Windows/system32/config.sys");
     println!(
         "sandbox mode = {:?}; write {:?} allowed? {}",

@@ -18,15 +18,18 @@ impl JsonlSession {
     pub fn create(path: PathBuf) -> std::io::Result<Self> {
         let existing = replay(&path)?.len() as u64;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(Self { path, next_seq: existing, file })
+        Ok(Self {
+            path,
+            next_seq: existing,
+            file,
+        })
     }
 
     pub fn append(&mut self, event: Event) -> std::io::Result<SequencedEvent> {
         let seq = self.next_seq;
         self.next_seq += 1;
         let se = SequencedEvent { seq, event };
-        writeln!(self.file, "{}", serde_json::to_string(&se)?)
-            .and_then(|_| self.file.flush())?;
+        writeln!(self.file, "{}", serde_json::to_string(&se)?).and_then(|_| self.file.flush())?;
         Ok(se)
     }
 
@@ -133,7 +136,11 @@ mod tests {
     #[test]
     fn corrupt_line_is_an_error_not_silence() {
         let path = tmp("corrupt.jsonl");
-        std::fs::write(&path, "{\"seq\":0,\"event\":{\"type\":\"turn_started\",\"turn_id\":1}}\nGARBAGE\n").unwrap();
+        std::fs::write(
+            &path,
+            "{\"seq\":0,\"event\":{\"type\":\"turn_started\",\"turn_id\":1}}\nGARBAGE\n",
+        )
+        .unwrap();
         assert!(replay(&path).is_err());
         std::fs::remove_file(&path).ok();
     }

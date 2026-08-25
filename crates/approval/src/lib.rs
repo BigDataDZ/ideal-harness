@@ -1,7 +1,7 @@
 //! P2-3：fail-closed 审批流。
 //! 铁律：审批服务不存在 => 一律拒绝；拒绝时给出的信息要能教育模型正确重试。
 
-use protocol::{ErrorEnvelope, ErrorCode};
+use protocol::{ErrorCode, ErrorEnvelope};
 use sandbox_policy::SandboxMode;
 use serde::{Deserialize, Serialize};
 
@@ -117,14 +117,25 @@ mod tests {
 
     #[test]
     fn valid_pair_passes_and_noop_passes() {
-        assert!(validate_escalation_args(Some(WorkspaceWrite), Some("need to write workspace files")).is_ok());
+        assert!(validate_escalation_args(
+            Some(WorkspaceWrite),
+            Some("need to write workspace files")
+        )
+        .is_ok());
         assert!(validate_escalation_args(None, None).is_ok());
     }
 
     #[test]
     fn no_approver_fails_closed() {
-        let e = approve_escalation(ReadOnly, EscalationRequest { requested_mode: WorkspaceWrite, justification: "need".into() }, None)
-            .unwrap_err();
+        let e = approve_escalation(
+            ReadOnly,
+            EscalationRequest {
+                requested_mode: WorkspaceWrite,
+                justification: "need".into(),
+            },
+            None,
+        )
+        .unwrap_err();
         assert_eq!(e.code, ErrorCode::ApprovalRejected);
     }
 
@@ -132,7 +143,10 @@ mod tests {
     fn rejection_keeps_current_mode() {
         let e = approve_escalation(
             ReadOnly,
-            EscalationRequest { requested_mode: DangerFullAccess, justification: "need".into() },
+            EscalationRequest {
+                requested_mode: DangerFullAccess,
+                justification: "need".into(),
+            },
             Some(&Fixed(Decision::Rejected)),
         )
         .unwrap_err();
@@ -143,7 +157,10 @@ mod tests {
     fn narrowing_attempt_rejected_even_with_approver() {
         let e = approve_escalation(
             WorkspaceWrite,
-            EscalationRequest { requested_mode: ReadOnly, justification: "narrow".into() },
+            EscalationRequest {
+                requested_mode: ReadOnly,
+                justification: "narrow".into(),
+            },
             Some(&Fixed(Decision::Approved)),
         )
         .unwrap_err();
@@ -154,7 +171,10 @@ mod tests {
     fn approved_escalation_returns_new_mode() {
         let m = approve_escalation(
             ReadOnly,
-            EscalationRequest { requested_mode: WorkspaceWrite, justification: "need write".into() },
+            EscalationRequest {
+                requested_mode: WorkspaceWrite,
+                justification: "need write".into(),
+            },
             Some(&Fixed(Decision::Approved)),
         )
         .unwrap();

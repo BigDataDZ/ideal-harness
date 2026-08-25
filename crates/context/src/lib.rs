@@ -45,7 +45,10 @@ mod tests {
 
     #[test]
     fn pressure_triggers_at_threshold() {
-        let b = ContextBudget { context_window: 1000, threshold_ratio: 0.8 };
+        let b = ContextBudget {
+            context_window: 1000,
+            threshold_ratio: 0.8,
+        };
         assert!(!b.needs_compaction(TokenUsage { total: 799 }));
         assert!(b.needs_compaction(TokenUsage { total: 800 }));
     }
