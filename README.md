@@ -6,15 +6,16 @@
 > 取其共识（事件溯源、ErrorCode 路由、OS 级沙箱），避其教训（巨石 core / 过度碎片化）。
 > 每个决策的对标记录见 [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md)。
 
-## 当前状态：可对话 MVP 推进中（P1）
+## 当前状态：可对话 MVP 已达成（v0.2）✅
 
 ✅ 已实现：协议层（含流式事件契约）/ 三档沙箱抽象 / fail-closed 审批 / 工具注册与调度 /
 JSONL 事件溯源（append/replay/fork）/ 状态机主循环 / 双触发压缩判定 /
-OpenAI 兼容流式模型客户端（故障注入测试覆盖超时/截断/断连）
+OpenAI 兼容流式模型客户端（故障注入测试）/ 工具调用闭环 / `ideal-harness chat` 多轮对话
+（会话持久化 + 崩溃恢复）——真实 API key 端到端冒烟通过（[记录](tests/manual/chat-smoke.md)）
 
-⏳ 进行中（P1 收尾）：工具调用闭环（TASK-103）、CLI chat 子命令（TASK-104）
+⏳ 进行中（P2 安全纵深）：受限执行进程池、网络白名单代理、人工审批通道
 
-测试基线：42 passed · CI：GitHub Actions（fmt / clippy -D warnings / test，Ubuntu + Windows 双平台）
+测试基线：55 passed · CI：GitHub Actions（fmt / clippy -D warnings / test，Ubuntu + Windows 双平台）
 
 ## 快速开始
 
