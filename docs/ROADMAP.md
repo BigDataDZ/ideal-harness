@@ -40,7 +40,7 @@
 - 验收：mock provider 测试「文本→工具→文本」三段序列；超过 max_tool_rounds 强制终结并留 Event
 - 依赖：TASK-101
 
-### TASK-104: cli chat 子命令
+### TASK-104: cli chat 子命令 ✅（commit `e454107`，冒烟记录 tests/manual/chat-smoke.md）
 - 目标 crate: harness-cli
 - 内容：`ideal-harness chat` 进入交互循环（stdin 读行）；`--session <path>` 复用既有 JSONL；Ctrl+C 优雅中止当前 turn 留 TurnAborted
 - 验收：手动冒烟脚本记录到 tests/manual/chat-smoke.md

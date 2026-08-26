@@ -7,6 +7,8 @@
 
 ### Added
 
+- **harness-cli（TASK-104）**：`ideal-harness chat` 交互子命令——stdin 多轮对话、`--session/--base-url/--model` 参数、会话复用（seq 续接 + 事件流重建历史）、悬空 turn 崩溃恢复（补记 TurnAborted）、无 key fail-closed 拒启动；冒烟记录见 `tests/manual/chat-smoke.md`
+- **agent-loop（TASK-104 配套）**：`chat_history` 跨轮对话记忆（含最终答复回填历史的修复，由多轮记忆测试锁定）
 - **agent-loop（TASK-103）**：工具调用闭环——采样返回 tool_call → registry.dispatch → ToolResultAdded 回填 → 继续采样直至文本答复；`max_tool_rounds` 超限强制终结并落 `TurnAborted`；tool_call/result 严格配对由测试锁定；未知工具与非法 JSON 参数均回 `ToolArgsInvalid` 自纠码且不触发 handler
 - **model-provider（TASK-103 配套）**：SSE 流式 `tool_calls` 分片按 index 聚合（id/name 取首见、arguments 拼接）；`ChatMessage` 支持 assistant 工具调用与 tool 结果回填消息；`ChatModel::stream_chat` 增加 tools 广告参数
 - **protocol（TASK-101）**：`Event::ModelChunkReceived` 流式增量事件、`ModelCallSpec` 调用规格（无认证字段，属 provider 层）；旧版 JSONL 向后兼容由测试锁定
