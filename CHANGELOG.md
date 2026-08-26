@@ -7,6 +7,8 @@
 
 ### Added
 
+- **agent-loop（TASK-103）**：工具调用闭环——采样返回 tool_call → registry.dispatch → ToolResultAdded 回填 → 继续采样直至文本答复；`max_tool_rounds` 超限强制终结并落 `TurnAborted`；tool_call/result 严格配对由测试锁定；未知工具与非法 JSON 参数均回 `ToolArgsInvalid` 自纠码且不触发 handler
+- **model-provider（TASK-103 配套）**：SSE 流式 `tool_calls` 分片按 index 聚合（id/name 取首见、arguments 拼接）；`ChatMessage` 支持 assistant 工具调用与 tool 结果回填消息；`ChatModel::stream_chat` 增加 tools 广告参数
 - **protocol（TASK-101）**：`Event::ModelChunkReceived` 流式增量事件、`ModelCallSpec` 调用规格（无认证字段，属 provider 层）；旧版 JSONL 向后兼容由测试锁定
 - **model-provider（TASK-102）**：OpenAI 兼容阻塞式 `chat/completions` SSE 客户端（reqwest + rustls，离线缓存可解析）；纯解析层 `parse_sse_line` / `extract_delta` 可独立测试；错误仅按结构化字段映射稳定码（超限→ContextWindowExceeded、超时/断流/截断→ModelStreamBroken）；API key 读 `IDEAL_HARNESS_API_KEY`，缺失即 fail-closed 拒绝；本地 TcpListener 故障注入测试覆盖超时/截断/非 JSON 行/半途断连
 

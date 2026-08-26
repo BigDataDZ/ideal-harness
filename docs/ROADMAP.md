@@ -34,7 +34,7 @@
 - 验收：mock HTTP server 三种故障注入测试（超时/截断/非 JSON 行）
 - 明确不做：不做多 provider 抽象层（一个够用，接口留 trait）
 
-### TASK-103: agent-loop 工具调用闭环
+### TASK-103: agent-loop 工具调用闭环 ✅（commit `c312abd`）
 - 目标 crate: agent-loop（依赖 model-provider 加入地图）
 - 内容：采样返回 tool_call → registry.dispatch → ToolResultAdded 追加 → 继续采样直至模型给出文本答复（最大轮次保护，防死循环）
 - 验收：mock provider 测试「文本→工具→文本」三段序列；超过 max_tool_rounds 强制终结并留 Event
