@@ -1,9 +1,13 @@
 //! P3：显式状态机 + Inbox 唤醒的 Agent 主循环（同步骨架）。
 //! 生产版把执行器换成 tokio 不改协议：事件流即契约。
 
-use protocol::{ErrorCode, Event};
+use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use session::JsonlSession;
 use tools::ToolRegistry;
+
+use model_provider::ChatMessage;
+use model_provider::ChatModel;
+use protocol::ModelCallSpec;
 
 /// 单活跃 turn 的显式状态机。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,12 +40,41 @@ pub trait ModelProvider {
     fn complete(&self, user_text: &str) -> Result<String, protocol::ErrorEnvelope>;
 }
 
+/// chat 路径启用时占位的 legacy Provider：绝不应被调度（fail-fast 暴露误用）。
+struct ChatPathActive;
+
+impl ModelProvider for ChatPathActive {
+    fn complete(&self, _: &str) -> Result<String, ErrorEnvelope> {
+        Err(ErrorEnvelope::new(
+            ErrorCode::Internal,
+            "chat 路径已启用；legacy ModelProvider 不应被调用",
+        ))
+    }
+}
+
+static CHAT_PATH_ACTIVE: ChatPathActive = ChatPathActive;
+
+/// 一次 chat 工具闭环 turn 的采样配置（聚拢参数，避免超长参数列表）。
+struct ChatTurnConfig<'a> {
+    spec: &'a ModelCallSpec,
+    tool_definitions: Option<&'a serde_json::Value>,
+    max_tool_rounds: u32,
+}
+
 pub struct AgentLoop<'a> {
     pub phase: Phase,
     pub inbox: Inbox,
     pub session: &'a mut JsonlSession,
     pub tools: &'a ToolRegistry,
     pub model: &'a dyn ModelProvider,
+    /// TASK-103：真实模型路径（工具调用闭环）。与 `call_spec` 同时就位时启用。
+    pub chat: Option<&'a dyn ChatModel>,
+    /// 一次采样的调用规格（模型名 / base_url / 温度）。
+    pub call_spec: Option<ModelCallSpec>,
+    /// 广告给模型的 tools 数组（OpenAI 格式原始 JSON；None = 不广告工具）。
+    pub tool_definitions: Option<serde_json::Value>,
+    /// 单个用户消息内允许的最大采样轮次（防工具调用死循环）。
+    pub max_tool_rounds: u32,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -56,12 +89,37 @@ impl<'a> AgentLoop<'a> {
             session,
             tools,
             model,
+            chat: None,
+            call_spec: None,
+            tool_definitions: None,
+            max_tool_rounds: 8,
+        }
+    }
+
+    /// TASK-103：接入真实模型（工具调用闭环路径）。
+    pub fn with_chat(
+        session: &'a mut JsonlSession,
+        tools: &'a ToolRegistry,
+        chat: &'a dyn ChatModel,
+        call_spec: ModelCallSpec,
+    ) -> Self {
+        Self {
+            phase: Phase::Idle,
+            inbox: Inbox::new(),
+            session,
+            tools,
+            model: &CHAT_PATH_ACTIVE,
+            chat: Some(chat),
+            call_spec: Some(call_spec),
+            tool_definitions: None,
+            max_tool_rounds: 8,
         }
     }
 
     /// 一个 turn：drain inbox → 逐条采样 → 终结事件。
     /// 错误按 code 路由：窗口超限留给 context 触发强制压缩后重试；
     /// 其余错误中止 turn 并留痕——绝不静默。
+    /// `with_chat` 就位时走工具调用闭环路径（TASK-103），否则走 legacy 演示路径。
     pub fn run_turn(&mut self) -> u64 {
         assert_ne!(
             self.phase,
@@ -76,14 +134,30 @@ impl<'a> AgentLoop<'a> {
 
         let mut completed = 0u64;
         for text in self.inbox.drain() {
-            self.session.append(Event::UserMessage { text }).ok();
-            match self.model.complete("") {
-                Ok(reply) => {
-                    self.session
-                        .append(Event::AssistantMessage { text: reply })
-                        .ok();
-                    completed += 1;
+            let result = match (self.chat, self.call_spec.clone()) {
+                (Some(chat), Some(spec)) => Self::run_chat_turn(
+                    self.session,
+                    self.tools,
+                    chat,
+                    &ChatTurnConfig {
+                        spec: &spec,
+                        tool_definitions: self.tool_definitions.as_ref(),
+                        max_tool_rounds: self.max_tool_rounds,
+                    },
+                    turn_id,
+                    &text,
+                ),
+                _ => {
+                    self.session.append(Event::UserMessage { text }).ok();
+                    self.model.complete("").map(|reply| {
+                        self.session
+                            .append(Event::AssistantMessage { text: reply })
+                            .ok();
+                    })
                 }
+            };
+            match result {
+                Ok(()) => completed += 1,
                 Err(e) if e.code == ErrorCode::ContextWindowExceeded => {
                     // TODO(context): 接入强制压缩后自动重试（P4 双触发之二）
                     self.abort(turn_id, e.message);
@@ -101,6 +175,105 @@ impl<'a> AgentLoop<'a> {
         completed
     }
 
+    /// 工具调用闭环（TASK-103）：采样 → 有 tool_call 则调度并回填 →
+    /// 继续采样直至模型给出文本答复；超过 `max_tool_rounds` 强制终结。
+    /// 一切自动行为落 Event（红线 5）：ModelChunkReceived / ToolCallRequested /
+    /// ToolResultAdded / AssistantMessage，tool_call 与 result 严格配对（红线 4）。
+    fn run_chat_turn(
+        session: &mut JsonlSession,
+        registry: &ToolRegistry,
+        chat: &dyn ChatModel,
+        cfg: &ChatTurnConfig<'_>,
+        turn_id: u64,
+        user_text: &str,
+    ) -> Result<(), ErrorEnvelope> {
+        let call_id = format!("turn-{turn_id}");
+        session
+            .append(Event::UserMessage {
+                text: user_text.to_string(),
+            })
+            .ok();
+        let mut messages = vec![ChatMessage::user(user_text)];
+
+        for _round in 0..cfg.max_tool_rounds {
+            let reply = chat.stream_chat(cfg.spec, &messages, cfg.tool_definitions)?;
+
+            if !reply.text.is_empty() {
+                session
+                    .append(Event::ModelChunkReceived {
+                        call_id: call_id.clone(),
+                        delta_text: reply.text.clone(),
+                    })
+                    .ok();
+            }
+
+            if reply.tool_calls.is_empty() {
+                session
+                    .append(Event::AssistantMessage {
+                        text: reply.text.clone(),
+                    })
+                    .ok();
+                return Ok(());
+            }
+
+            messages.push(ChatMessage::assistant_with_tool_calls(
+                reply.tool_calls.clone(),
+            ));
+            for tc in &reply.tool_calls {
+                // 参数必须是合法 JSON：非法则不触发 handler，直接回自纠码
+                // （配对完整：ToolCallRequested 先落盘，结果随后必达）。
+                let (args, parse_err) =
+                    match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                        Ok(v) => (v, None),
+                        Err(e) => (serde_json::Value::String(tc.arguments.clone()), Some(e)),
+                    };
+                session
+                    .append(Event::ToolCallRequested {
+                        call_id: tc.id.clone(),
+                        tool: tc.name.clone(),
+                        args: args.clone(),
+                    })
+                    .ok();
+
+                let outcome = if let Some(e) = parse_err {
+                    ToolOutcome::Failure {
+                        error: ErrorEnvelope::new(
+                            ErrorCode::ToolArgsInvalid,
+                            format!("tool arguments 不是合法 JSON: {e}"),
+                        ),
+                    }
+                } else {
+                    registry
+                        .dispatch(&tc.name, &args)
+                        .unwrap_or_else(|| ToolOutcome::Failure {
+                            error: ErrorEnvelope::new(
+                                ErrorCode::ToolArgsInvalid,
+                                format!("unknown tool: {}", tc.name),
+                            ),
+                        })
+                };
+                session
+                    .append(Event::ToolResultAdded {
+                        call_id: tc.id.clone(),
+                        outcome: outcome.clone(),
+                    })
+                    .ok();
+                messages.push(ChatMessage::tool_result(
+                    tc.id.clone(),
+                    serde_json::to_string(&outcome).unwrap_or_default(),
+                ));
+            }
+        }
+
+        Err(ErrorEnvelope::new(
+            ErrorCode::Internal,
+            format!(
+                "超过 max_tool_rounds={}，强制终结以防死循环",
+                cfg.max_tool_rounds
+            ),
+        ))
+    }
+
     fn abort(&mut self, turn_id: u64, reason: String) {
         self.session
             .append(Event::TurnAborted { turn_id, reason })
@@ -112,9 +285,11 @@ impl<'a> AgentLoop<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use model_provider::{ChatReply, ToolCallRequest};
     use protocol::{ErrorEnvelope, SequencedEvent};
     use session::JsonlSession;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
 
     struct Echo;
     impl ModelProvider for Echo {
@@ -137,7 +312,7 @@ mod tests {
         std::env::temp_dir().join(format!("ih-loop-{}-{name}", std::process::id()))
     }
 
-    fn events(path: &PathBuf) -> Vec<SequencedEvent> {
+    fn events(path: &Path) -> Vec<SequencedEvent> {
         session::replay(path).unwrap()
     }
 
@@ -190,6 +365,261 @@ mod tests {
         lp.phase = Phase::Running; // 模拟非法重入
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lp.run_turn()));
         assert!(result.is_err(), "单活跃 turn 契约必须显式暴露违约");
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- TASK-103：工具调用闭环（验收：三段序列 + 超轮次强制终结）----
+
+    fn echo_spec() -> tools::ToolSpec {
+        tools::ToolSpec {
+            name: "echo".into(),
+            description: "demo".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "required": ["text"],
+                "properties": { "text": { "type": "string" } }
+            }),
+            escalation_capable: false,
+        }
+    }
+
+    fn chat_spec() -> ModelCallSpec {
+        ModelCallSpec {
+            model: "mock-model".into(),
+            base_url: "http://localhost".into(),
+            temperature: None,
+        }
+    }
+
+    /// 脚本化 mock：按序返回预置回复（「文本→工具→文本」三段序列）。
+    struct Scripted(Mutex<Vec<ChatReply>>);
+
+    impl ChatModel for Scripted {
+        fn stream_chat(
+            &self,
+            _: &ModelCallSpec,
+            _: &[ChatMessage],
+            _: Option<&serde_json::Value>,
+        ) -> Result<ChatReply, ErrorEnvelope> {
+            let mut q = self.0.lock().unwrap();
+            if q.is_empty() {
+                panic!("脚本回复耗尽");
+            }
+            Ok(q.remove(0))
+        }
+    }
+
+    /// 恒定返回工具调用的 mock：验证 max_tool_rounds 强制终结。
+    struct AlwaysTool;
+
+    impl ChatModel for AlwaysTool {
+        fn stream_chat(
+            &self,
+            _: &ModelCallSpec,
+            _: &[ChatMessage],
+            _: Option<&serde_json::Value>,
+        ) -> Result<ChatReply, ErrorEnvelope> {
+            Ok(ChatReply {
+                text: String::new(),
+                finish_reason: Some("tool_calls".into()),
+                tool_calls: vec![ToolCallRequest {
+                    id: "call_x".into(),
+                    name: "echo".into(),
+                    arguments: r#"{"text":"hi"}"#.into(),
+                }],
+            })
+        }
+    }
+
+    fn tool_reply() -> ChatReply {
+        ChatReply {
+            text: "让我查一下".into(),
+            finish_reason: Some("tool_calls".into()),
+            tool_calls: vec![ToolCallRequest {
+                id: "call_1".into(),
+                name: "echo".into(),
+                arguments: r#"{"text":"hi"}"#.into(),
+            }],
+        }
+    }
+
+    fn text_reply() -> ChatReply {
+        ChatReply {
+            text: "结果是 hi".into(),
+            finish_reason: Some("stop".into()),
+            tool_calls: vec![],
+        }
+    }
+
+    fn event_kind(e: &Event) -> &'static str {
+        match e {
+            Event::TurnStarted { .. } => "turn_started",
+            Event::UserMessage { .. } => "user_message",
+            Event::AssistantMessage { .. } => "assistant_message",
+            Event::ModelChunkReceived { .. } => "model_chunk",
+            Event::ToolCallRequested { .. } => "tool_call_requested",
+            Event::ToolResultAdded { .. } => "tool_result_added",
+            Event::CompactionApplied { .. } => "compaction",
+            Event::ApprovalDecided { .. } => "approval",
+            Event::TurnCompleted { .. } => "turn_completed",
+            Event::TurnAborted { .. } => "turn_aborted",
+        }
+    }
+
+    #[test]
+    fn chat_loop_text_tool_text_full_sequence() {
+        let path = tmp("chat-loop.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut js = JsonlSession::create(path.clone()).unwrap();
+        let mut reg = ToolRegistry::default();
+        reg.register(
+            echo_spec(),
+            Box::new(|args| ToolOutcome::Success {
+                value: args["text"].clone(),
+            }),
+        );
+        let scripted = Scripted(Mutex::new(vec![tool_reply(), text_reply()]));
+        let mut lp = AgentLoop::with_chat(&mut js, &reg, &scripted, chat_spec());
+        lp.inbox.push("查一下");
+        assert_eq!(lp.run_turn(), 1);
+        assert_eq!(lp.phase, Phase::Idle);
+
+        let evs = events(&path);
+        let kinds: Vec<_> = evs.iter().map(|e| event_kind(&e.event)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "turn_started",
+                "user_message",
+                "model_chunk", // 第 1 轮采样文本留痕
+                "tool_call_requested",
+                "tool_result_added", // 与调用严格配对
+                "model_chunk",       // 第 2 轮采样文本
+                "assistant_message", // 最终文本答复
+                "turn_completed",
+            ]
+        );
+        match &evs[4].event {
+            Event::ToolResultAdded { outcome, .. } => match outcome {
+                ToolOutcome::Success { value } => assert_eq!(value, "hi"),
+                other => panic!("expected success outcome, got {other:?}"),
+            },
+            other => panic!("expected tool_result_added, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn exceeding_max_tool_rounds_forces_abort_and_keeps_pairing() {
+        let path = tmp("chat-maxrounds.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut js = JsonlSession::create(path.clone()).unwrap();
+        let mut reg = ToolRegistry::default();
+        reg.register(
+            echo_spec(),
+            Box::new(|args| ToolOutcome::Success {
+                value: args["text"].clone(),
+            }),
+        );
+        let mut lp = AgentLoop::with_chat(&mut js, &reg, &AlwaysTool, chat_spec());
+        lp.max_tool_rounds = 3;
+        lp.inbox.push("x");
+        assert_eq!(lp.run_turn(), 0);
+        assert_eq!(lp.phase, Phase::Idle);
+
+        let evs = events(&path);
+        match &evs.last().unwrap().event {
+            Event::TurnAborted { reason, .. } => assert!(
+                reason.contains("max_tool_rounds"),
+                "abort 原因应说明超轮次: {reason}"
+            ),
+            other => panic!("expected turn_aborted, got {other:?}"),
+        }
+        // 配对完整：3 轮 → 3 次调用 + 3 次结果，一次不缺
+        let requested = evs
+            .iter()
+            .filter(|e| matches!(e.event, Event::ToolCallRequested { .. }))
+            .count();
+        let answered = evs
+            .iter()
+            .filter(|e| matches!(e.event, Event::ToolResultAdded { .. }))
+            .count();
+        assert_eq!(requested, 3);
+        assert_eq!(answered, 3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn unknown_tool_yields_failure_result_and_loop_continues() {
+        let path = tmp("chat-unknown.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut js = JsonlSession::create(path.clone()).unwrap();
+        let reg = ToolRegistry::default(); // 空注册表：任何调用都是未知工具
+        let scripted = Scripted(Mutex::new(vec![
+            ChatReply {
+                text: String::new(),
+                finish_reason: Some("tool_calls".into()),
+                tool_calls: vec![ToolCallRequest {
+                    id: "call_u".into(),
+                    name: "nope".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+            text_reply(),
+        ]));
+        let mut lp = AgentLoop::with_chat(&mut js, &reg, &scripted, chat_spec());
+        lp.inbox.push("hi");
+        assert_eq!(lp.run_turn(), 1);
+
+        let evs = events(&path);
+        match &evs[3].event {
+            Event::ToolResultAdded { outcome, .. } => match outcome {
+                ToolOutcome::Failure { error } => {
+                    assert_eq!(error.code, ErrorCode::ToolArgsInvalid)
+                }
+                other => panic!("expected failure, got {other:?}"),
+            },
+            other => panic!("expected tool_result_added, got {other:?}"),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn malformed_args_fail_without_invoking_handler() {
+        let path = tmp("chat-badargs.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut js = JsonlSession::create(path.clone()).unwrap();
+        let mut reg = ToolRegistry::default();
+        reg.register(
+            echo_spec(),
+            Box::new(|_| panic!("handler must not run on malformed args")),
+        );
+        let scripted = Scripted(Mutex::new(vec![
+            ChatReply {
+                text: String::new(),
+                finish_reason: Some("tool_calls".into()),
+                tool_calls: vec![ToolCallRequest {
+                    id: "call_b".into(),
+                    name: "echo".into(),
+                    arguments: "{oops".into(),
+                }],
+            },
+            text_reply(),
+        ]));
+        let mut lp = AgentLoop::with_chat(&mut js, &reg, &scripted, chat_spec());
+        lp.inbox.push("hi");
+        assert_eq!(lp.run_turn(), 1);
+
+        let evs = events(&path);
+        match &evs[3].event {
+            Event::ToolResultAdded { outcome, .. } => match outcome {
+                ToolOutcome::Failure { error } => {
+                    assert_eq!(error.code, ErrorCode::ToolArgsInvalid)
+                }
+                other => panic!("expected failure, got {other:?}"),
+            },
+            other => panic!("expected tool_result_added, got {other:?}"),
+        }
         std::fs::remove_file(&path).ok();
     }
 }
