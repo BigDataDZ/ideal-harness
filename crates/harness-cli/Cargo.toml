@@ -15,3 +15,4 @@ sandbox-policy = { workspace = true }
 session = { workspace = true }
 tools = { workspace = true }
 agent-loop = { workspace = true }
+model-provider = { workspace = true }
