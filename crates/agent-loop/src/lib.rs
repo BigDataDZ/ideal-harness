@@ -75,6 +75,9 @@ pub struct AgentLoop<'a> {
     pub tool_definitions: Option<serde_json::Value>,
     /// 单个用户消息内允许的最大采样轮次（防工具调用死循环）。
     pub max_tool_rounds: u32,
+    /// 多轮对话记忆（TASK-104）：跨 turn 累积、模型可见的消息历史。
+    /// 会话重开时可由事件流重建后注入。
+    pub chat_history: Vec<ChatMessage>,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -93,6 +96,7 @@ impl<'a> AgentLoop<'a> {
             call_spec: None,
             tool_definitions: None,
             max_tool_rounds: 8,
+            chat_history: Vec::new(),
         }
     }
 
@@ -113,6 +117,7 @@ impl<'a> AgentLoop<'a> {
             call_spec: Some(call_spec),
             tool_definitions: None,
             max_tool_rounds: 8,
+            chat_history: Vec::new(),
         }
     }
 
@@ -144,6 +149,7 @@ impl<'a> AgentLoop<'a> {
                         tool_definitions: self.tool_definitions.as_ref(),
                         max_tool_rounds: self.max_tool_rounds,
                     },
+                    &mut self.chat_history,
                     turn_id,
                     &text,
                 ),
@@ -184,6 +190,7 @@ impl<'a> AgentLoop<'a> {
         registry: &ToolRegistry,
         chat: &dyn ChatModel,
         cfg: &ChatTurnConfig<'_>,
+        history: &mut Vec<ChatMessage>,
         turn_id: u64,
         user_text: &str,
     ) -> Result<(), ErrorEnvelope> {
@@ -193,10 +200,10 @@ impl<'a> AgentLoop<'a> {
                 text: user_text.to_string(),
             })
             .ok();
-        let mut messages = vec![ChatMessage::user(user_text)];
+        history.push(ChatMessage::user(user_text));
 
         for _round in 0..cfg.max_tool_rounds {
-            let reply = chat.stream_chat(cfg.spec, &messages, cfg.tool_definitions)?;
+            let reply = chat.stream_chat(cfg.spec, history, cfg.tool_definitions)?;
 
             if !reply.text.is_empty() {
                 session
@@ -208,6 +215,8 @@ impl<'a> AgentLoop<'a> {
             }
 
             if reply.tool_calls.is_empty() {
+                // 最终文本答复必须进历史：这是下一轮模型能看到本轮结论的唯一途径
+                history.push(ChatMessage::assistant(reply.text.clone()));
                 session
                     .append(Event::AssistantMessage {
                         text: reply.text.clone(),
@@ -216,7 +225,7 @@ impl<'a> AgentLoop<'a> {
                 return Ok(());
             }
 
-            messages.push(ChatMessage::assistant_with_tool_calls(
+            history.push(ChatMessage::assistant_with_tool_calls(
                 reply.tool_calls.clone(),
             ));
             for tc in &reply.tool_calls {
@@ -258,7 +267,7 @@ impl<'a> AgentLoop<'a> {
                         outcome: outcome.clone(),
                     })
                     .ok();
-                messages.push(ChatMessage::tool_result(
+                history.push(ChatMessage::tool_result(
                     tc.id.clone(),
                     serde_json::to_string(&outcome).unwrap_or_default(),
                 ));
@@ -451,6 +460,36 @@ mod tests {
         }
     }
 
+    fn r2_reply() -> ChatReply {
+        ChatReply {
+            text: "r2".into(),
+            finish_reason: Some("stop".into()),
+            tool_calls: vec![],
+        }
+    }
+
+    /// 捕获每次采样所见消息的 mock：验证多轮记忆（TASK-104 前置）。
+    struct Capturing {
+        replies: Mutex<Vec<ChatReply>>,
+        seen: Mutex<Vec<Vec<ChatMessage>>>,
+    }
+
+    impl ChatModel for Capturing {
+        fn stream_chat(
+            &self,
+            _: &ModelCallSpec,
+            msgs: &[ChatMessage],
+            _: Option<&serde_json::Value>,
+        ) -> Result<ChatReply, ErrorEnvelope> {
+            self.seen.lock().unwrap().push(msgs.to_vec());
+            let mut q = self.replies.lock().unwrap();
+            if q.is_empty() {
+                panic!("脚本回复耗尽");
+            }
+            Ok(q.remove(0))
+        }
+    }
+
     fn event_kind(e: &Event) -> &'static str {
         match e {
             Event::TurnStarted { .. } => "turn_started",
@@ -620,6 +659,31 @@ mod tests {
             },
             other => panic!("expected tool_result_added, got {other:?}"),
         }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn chat_history_spans_turns_for_multi_turn_memory() {
+        let path = tmp("chat-memory.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut js = JsonlSession::create(path.clone()).unwrap();
+        let reg = ToolRegistry::default();
+        let capturing = Capturing {
+            replies: Mutex::new(vec![text_reply(), r2_reply()]),
+            seen: Mutex::new(vec![]),
+        };
+        let mut lp = AgentLoop::with_chat(&mut js, &reg, &capturing, chat_spec());
+        lp.inbox.push("a");
+        assert_eq!(lp.run_turn(), 1);
+        lp.inbox.push("b");
+        assert_eq!(lp.run_turn(), 1);
+
+        let seen = capturing.seen.lock().unwrap();
+        assert_eq!(seen[0].len(), 1, "首轮只有当前用户消息");
+        assert_eq!(seen[1].len(), 3, "次轮必须携带首轮完整对话");
+        assert_eq!(seen[1][0], ChatMessage::user("a"));
+        assert_eq!(seen[1][1], ChatMessage::assistant("结果是 hi"));
+        assert_eq!(seen[1][2], ChatMessage::user("b"));
         std::fs::remove_file(&path).ok();
     }
 }
