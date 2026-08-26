@@ -21,23 +21,36 @@ Error: 环境变量 IDEAL_HARNESS_API_KEY 未设置；拒绝以匿名方式调�
 （退出码 1）
 ```
 
-## 2. 真实 key 多轮对话 + 工具调用（MVP 出口判据，待执行）
+## 2. ✅ 真实 key 多轮对话 + 工具调用（已验证 2026-08-25，OpenRouter + minimax/minimax-m3:free）
 
 ```powershell
-$env:IDEAL_HARNESS_API_KEY = "sk-..."   # DeepSeek 或任意 OpenAI 兼容端点
-.\target\release\ideal-harness.exe chat --session D:\tmp\chat1.jsonl
+$env:IDEAL_HARNESS_API_KEY = "sk-or-..."   # OpenRouter key（不写入仓库）
+.\target\release\ideal-harness.exe chat --session $env:TEMP\mvp-smoke.jsonl `
+    --base-url https://openrouter.ai/api/v1 --model minimax/minimax-m3:free
 ```
 
-对话脚本与期望：
+实际终端记录：
 
-| 输入 | 期望 |
-|---|---|
-| `现在几点了？` | 打印 `⚙ 调用 now(...)` 后给出当前时间（工具闭环） |
-| `把 "hello" 原样返回给我` | 打印 `⚙ 调用 echo(...)`，答复含 hello |
-| `我刚才让你返回什么？` | 答复引用 "hello"——**多轮记忆生效** |
-| `/exit` | 退出并打印会话保存路径 |
+```
+> 请调用 now 工具查询当前时间
+  ⚙ 调用 now({})
+assistant: 当前 Unix 时间戳为：1787745074
+对应的日期时间大约为 2026 年 5 月 25 日…
+> 请调用 echo 工具把 hello 原样返回
+  ⚙ 调用 echo({"text":"hello"})
+assistant: 已原样返回：hello
+> 我上一条让你把什么原样返回？
+assistant: 您上一条让我把 "hello" 原样返回。
+> /exit
+会话已保存：C:\Users\<uid>\AppData\Local\Temp\mvp-smoke7.jsonl
+```
 
-执行后把完整终端记录粘贴到本节（含时间戳与事件投影行）。
+三项出口判据全部命中：① 工具调用闭环（now/echo 各一次，调用→执行→回填→二次采样）
+② 工具结果进入模型上下文 ③ 跨轮记忆（第三问引用首轮结果）。
+
+**冒烟过程中发现并修复一个真实协议 bug**：assistant 工具调用消息的序列化形状
+（扁平 → OpenAI 嵌套 `type:"function"` 形状），由
+`assistant_tool_calls_serialize_to_nested_wire_shape` 测试锁定。
 
 ## 3. ✅ 会话复用与中断恢复（已验证，单测锁定）
 

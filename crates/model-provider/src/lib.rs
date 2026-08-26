@@ -25,7 +25,11 @@ const MAX_ERROR_BODY: u64 = 64 * 1024;
 /// 对话消息：OpenAI `messages` 数组的元素。
 /// `tool_calls` / `tool_call_id` 仅在工具调用闭环（TASK-103）中使用，
 /// 缺省时从线上格式省略，普通对话路径的序列化结果与 TASK-102 完全一致。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 序列化为手工实现：`tool_calls` 的线上形状是嵌套的
+/// `{"id","type":"function","function":{name,arguments}}`（与流式分片的扁平
+/// 形状不同），内部统一用扁平的 [`ToolCallRequest`] 承载。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
@@ -35,6 +39,51 @@ pub struct ChatMessage {
     /// role = "tool" 的回填消息携带，对应被应答的调用 id。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+/// assistant 消息里 tool_calls 的线上形状（嵌套 function 对象）。
+#[derive(Serialize)]
+struct ToolCallWire<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    call_type: &'a str,
+    function: FunctionWire<'a>,
+}
+
+#[derive(Serialize)]
+struct FunctionWire<'a> {
+    name: &'a str,
+    arguments: &'a str,
+}
+
+impl Serialize for ChatMessage {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("ChatMessage", 4)?;
+        st.serialize_field("role", &self.role)?;
+        st.serialize_field("content", &self.content)?;
+        if let Some(tcs) = &self.tool_calls {
+            let wire: Vec<ToolCallWire<'_>> = tcs
+                .iter()
+                .map(|t| ToolCallWire {
+                    id: &t.id,
+                    call_type: "function",
+                    function: FunctionWire {
+                        name: &t.name,
+                        arguments: &t.arguments,
+                    },
+                })
+                .collect();
+            st.serialize_field("tool_calls", &wire)?;
+        }
+        if let Some(id) = &self.tool_call_id {
+            st.serialize_field("tool_call_id", id)?;
+        }
+        st.end()
+    }
 }
 
 impl ChatMessage {
@@ -508,5 +557,27 @@ mod tests {
         let err = OpenAiCompatClient::with_key("   ").unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
         assert!(err.message.contains("为空"));
+    }
+
+    #[test]
+    fn assistant_tool_calls_serialize_to_nested_wire_shape() {
+        let msg = ChatMessage::assistant_with_tool_calls(vec![ToolCallRequest {
+            id: "call_1".into(),
+            name: "now".into(),
+            arguments: "{}".into(),
+        }]);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains(r#""type":"function""#),
+            "tool_calls 线上形状必须含 type 字段: {json}"
+        );
+        assert!(
+            json.contains(r#""function":{"name":"now","arguments":"{}"}"#),
+            "function 必须是嵌套对象: {json}"
+        );
+
+        let tool = ChatMessage::tool_result("call_1", r#"{"ok":true}"#);
+        let jt = serde_json::to_string(&tool).unwrap();
+        assert!(jt.contains(r#""tool_call_id":"call_1""#), "{jt}");
     }
 }
