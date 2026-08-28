@@ -1,9 +1,13 @@
 //! P2-3：fail-closed 审批流。
 //! 铁律：审批服务不存在 => 一律拒绝；拒绝时给出的信息要能教育模型正确重试。
 
+mod terminal;
+
 use protocol::{ErrorCode, ErrorEnvelope};
 use sandbox_policy::SandboxMode;
 use serde::{Deserialize, Serialize};
+
+pub use terminal::TerminalApprover;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
