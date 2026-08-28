@@ -5,6 +5,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- **protocol（TASK-203）**：新增 `NetworkAccessDenied` 稳定审计事件，记录被白名单代理拒绝的 host、port 与结构化原因
+- **network-proxy（TASK-203）**：默认断网的 HTTP CONNECT 白名单代理；provider 主机精确放行，拒绝与审计服务失败均 fail-closed
+
 ## [0.2.0] - 2026-08-25
 
 P1「可对话 MVP」达成：真实 API key 端到端冒烟通过
