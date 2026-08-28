@@ -3,7 +3,7 @@
 
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use session::JsonlSession;
-use tools::ToolRegistry;
+use tools::{ToolAudit, ToolExecution, ToolRegistry};
 
 use model_provider::ChatMessage;
 use model_provider::ChatModel;
@@ -59,6 +59,7 @@ struct ChatTurnConfig<'a> {
     spec: &'a ModelCallSpec,
     tool_definitions: Option<&'a serde_json::Value>,
     max_tool_rounds: u32,
+    external_events: Option<&'a dyn Fn() -> Vec<Event>>,
 }
 
 pub struct AgentLoop<'a> {
@@ -78,6 +79,8 @@ pub struct AgentLoop<'a> {
     /// 多轮对话记忆（TASK-104）：跨 turn 累积、模型可见的消息历史。
     /// 会话重开时可由事件流重建后注入。
     pub chat_history: Vec<ChatMessage>,
+    /// 代理等进程边界组件产生的事件，由主循环在模型调用后按序吸收入会话。
+    pub external_events: Option<&'a dyn Fn() -> Vec<Event>>,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -97,6 +100,7 @@ impl<'a> AgentLoop<'a> {
             tool_definitions: None,
             max_tool_rounds: 8,
             chat_history: Vec::new(),
+            external_events: None,
         }
     }
 
@@ -118,6 +122,7 @@ impl<'a> AgentLoop<'a> {
             tool_definitions: None,
             max_tool_rounds: 8,
             chat_history: Vec::new(),
+            external_events: None,
         }
     }
 
@@ -148,6 +153,7 @@ impl<'a> AgentLoop<'a> {
                         spec: &spec,
                         tool_definitions: self.tool_definitions.as_ref(),
                         max_tool_rounds: self.max_tool_rounds,
+                        external_events: self.external_events,
                     },
                     &mut self.chat_history,
                     turn_id,
@@ -203,7 +209,13 @@ impl<'a> AgentLoop<'a> {
         history.push(ChatMessage::user(user_text));
 
         for _round in 0..cfg.max_tool_rounds {
-            let reply = chat.stream_chat(cfg.spec, history, cfg.tool_definitions)?;
+            let reply = chat.stream_chat(cfg.spec, history, cfg.tool_definitions);
+            if let Some(source) = cfg.external_events {
+                for event in source() {
+                    session.append(event).ok();
+                }
+            }
+            let reply = reply?;
 
             if !reply.text.is_empty() {
                 session
@@ -244,23 +256,38 @@ impl<'a> AgentLoop<'a> {
                     })
                     .ok();
 
-                let outcome = if let Some(e) = parse_err {
-                    ToolOutcome::Failure {
+                let execution = if let Some(e) = parse_err {
+                    ToolExecution::new(ToolOutcome::Failure {
                         error: ErrorEnvelope::new(
                             ErrorCode::ToolArgsInvalid,
                             format!("tool arguments 不是合法 JSON: {e}"),
                         ),
-                    }
+                    })
                 } else {
                     registry
-                        .dispatch(&tc.name, &args)
-                        .unwrap_or_else(|| ToolOutcome::Failure {
-                            error: ErrorEnvelope::new(
-                                ErrorCode::ToolArgsInvalid,
-                                format!("unknown tool: {}", tc.name),
-                            ),
+                        .dispatch_with_audit(&tc.name, &args)
+                        .unwrap_or_else(|| {
+                            ToolExecution::new(ToolOutcome::Failure {
+                                error: ErrorEnvelope::new(
+                                    ErrorCode::ToolArgsInvalid,
+                                    format!("unknown tool: {}", tc.name),
+                                ),
+                            })
                         })
                 };
+                for audit in execution.audits {
+                    match audit {
+                        ToolAudit::ApprovalDecided { approved } => {
+                            session
+                                .append(Event::ApprovalDecided {
+                                    call_id: tc.id.clone(),
+                                    approved,
+                                })
+                                .ok();
+                        }
+                    }
+                }
+                let outcome = execution.outcome;
                 session
                     .append(Event::ToolResultAdded {
                         call_id: tc.id.clone(),
@@ -685,6 +712,86 @@ mod tests {
         assert_eq!(seen[1][0], ChatMessage::user("a"));
         assert_eq!(seen[1][1], ChatMessage::assistant("结果是 hi"));
         assert_eq!(seen[1][2], ChatMessage::user("b"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn audited_tool_decision_is_recorded_before_tool_result() {
+        let path = tmp("chat-approval-audit.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut js = JsonlSession::create(path.clone()).unwrap();
+        let mut reg = ToolRegistry::default();
+        reg.register_audited(
+            echo_spec(),
+            Box::new(|args| ToolExecution {
+                outcome: ToolOutcome::Success {
+                    value: args["text"].clone(),
+                },
+                audits: vec![ToolAudit::ApprovalDecided { approved: true }],
+            }),
+        );
+        let scripted = Scripted(Mutex::new(vec![tool_reply(), text_reply()]));
+        let mut lp = AgentLoop::with_chat(&mut js, &reg, &scripted, chat_spec());
+        lp.inbox.push("run");
+        assert_eq!(lp.run_turn(), 1);
+
+        let evs = events(&path);
+        let approval_index = evs
+            .iter()
+            .position(|entry| matches!(entry.event, Event::ApprovalDecided { .. }))
+            .unwrap();
+        let result_index = evs
+            .iter()
+            .position(|entry| matches!(entry.event, Event::ToolResultAdded { .. }))
+            .unwrap();
+        assert!(approval_index < result_index);
+        match &evs[approval_index].event {
+            Event::ApprovalDecided { call_id, approved } => {
+                assert_eq!(call_id, "call_1");
+                assert!(*approved);
+            }
+            _ => unreachable!(),
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    struct NetworkRejected;
+
+    impl ChatModel for NetworkRejected {
+        fn stream_chat(
+            &self,
+            _: &ModelCallSpec,
+            _: &[ChatMessage],
+            _: Option<&serde_json::Value>,
+        ) -> Result<ChatReply, ErrorEnvelope> {
+            Err(ErrorEnvelope::new(ErrorCode::Internal, "proxy rejected"))
+        }
+    }
+
+    #[test]
+    fn external_proxy_event_is_recorded_before_model_failure_abort() {
+        let path = tmp("network-audit.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut js = JsonlSession::create(path.clone()).unwrap();
+        let reg = ToolRegistry::default();
+        let source = || {
+            vec![Event::NetworkAccessDenied {
+                host: "blocked.example".into(),
+                port: 443,
+                reason: "host_not_allowlisted".into(),
+            }]
+        };
+        let mut lp = AgentLoop::with_chat(&mut js, &reg, &NetworkRejected, chat_spec());
+        lp.external_events = Some(&source);
+        lp.inbox.push("connect");
+        assert_eq!(lp.run_turn(), 0);
+
+        let evs = events(&path);
+        assert!(matches!(evs[2].event, Event::NetworkAccessDenied { .. }));
+        assert!(matches!(
+            evs.last().unwrap().event,
+            Event::TurnAborted { .. }
+        ));
         std::fs::remove_file(&path).ok();
     }
 }

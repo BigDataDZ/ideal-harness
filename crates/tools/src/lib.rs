@@ -35,25 +35,86 @@ impl ToolSpec {
 }
 
 pub type ToolFn = dyn Fn(&serde_json::Value) -> ToolOutcome + Send + Sync;
+pub type AuditedToolFn = dyn Fn(&serde_json::Value) -> ToolExecution + Send + Sync;
+
+/// 工具执行期间需要由 agent-loop 绑定真实 call_id 后落盘的审计事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolAudit {
+    ApprovalDecided { approved: bool },
+}
+
+/// 调度结果与其伴随审计事实。工具层不伪造协议 call_id。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolExecution {
+    pub outcome: ToolOutcome,
+    pub audits: Vec<ToolAudit>,
+}
+
+impl ToolExecution {
+    pub fn new(outcome: ToolOutcome) -> Self {
+        Self {
+            outcome,
+            audits: Vec::new(),
+        }
+    }
+}
+
+enum ToolHandler {
+    Plain(Box<ToolFn>),
+    Audited(Box<AuditedToolFn>),
+}
 
 struct RegisteredTool {
     spec: ToolSpec,
-    handler: Box<ToolFn>,
+    handler: ToolHandler,
 }
 
-#[derive(Default)]
 pub struct ToolRegistry {
     tools: Vec<RegisteredTool>,
+    escalation_availability: EscalationAvailability,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self {
+            tools: Vec::new(),
+            escalation_availability: EscalationAvailability::Unavailable,
+        }
+    }
 }
 
 impl ToolRegistry {
+    pub fn set_escalation_availability(&mut self, availability: EscalationAvailability) {
+        self.escalation_availability = availability;
+    }
+
+    pub fn escalation_availability(&self) -> EscalationAvailability {
+        self.escalation_availability
+    }
+
     pub fn register(&mut self, spec: ToolSpec, handler: Box<ToolFn>) {
         assert!(
             self.get(&spec.name).is_none(),
             "duplicate tool name: {}",
             spec.name
         );
-        self.tools.push(RegisteredTool { spec, handler });
+        self.tools.push(RegisteredTool {
+            spec,
+            handler: ToolHandler::Plain(handler),
+        });
+    }
+
+    /// 注册会产生审批等审计事实的工具。
+    pub fn register_audited(&mut self, spec: ToolSpec, handler: Box<AuditedToolFn>) {
+        assert!(
+            self.get(&spec.name).is_none(),
+            "duplicate tool name: {}",
+            spec.name
+        );
+        self.tools.push(RegisteredTool {
+            spec,
+            handler: ToolHandler::Audited(handler),
+        });
     }
 
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
@@ -66,11 +127,40 @@ impl ToolRegistry {
     /// 调度：先校验后执行；未知工具与参数错误都归一为 Failure 事件而非错误通道，
     /// 保证 tool_call/result 配对永不断裂（P4）。
     pub fn dispatch(&self, name: &str, args: &serde_json::Value) -> Option<ToolOutcome> {
-        let t = self.tools.iter().find(|t| t.spec.name == name)?;
-        if let Err(e) = validate_args(&t.spec, args) {
-            return Some(ToolOutcome::Failure { error: e });
+        let tool = self.tools.iter().find(|tool| tool.spec.name == name)?;
+        if matches!(&tool.handler, ToolHandler::Audited(_)) {
+            return Some(ToolOutcome::Failure {
+                error: protocol::ErrorEnvelope::new(
+                    protocol::ErrorCode::Internal,
+                    "audited tool requires dispatch_with_audit; refusing to drop audit facts",
+                ),
+            });
         }
-        Some((t.handler)(args))
+        self.dispatch_with_audit(name, args).map(|run| run.outcome)
+    }
+
+    /// 带审计事实调度；agent-loop 必须使用此入口，确保自动审批行为留痕。
+    pub fn dispatch_with_audit(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> Option<ToolExecution> {
+        let t = self.tools.iter().find(|t| t.spec.name == name)?;
+        let mut validation_spec = t.spec.clone();
+        match t
+            .spec
+            .advertised_parameters_schema(self.escalation_availability)
+        {
+            Ok(schema) => validation_spec.parameters_schema = schema,
+            Err(error) => return Some(ToolExecution::new(ToolOutcome::Failure { error })),
+        }
+        if let Err(e) = validate_args(&validation_spec, args) {
+            return Some(ToolExecution::new(ToolOutcome::Failure { error: e }));
+        }
+        Some(match &t.handler {
+            ToolHandler::Plain(handler) => ToolExecution::new(handler(args)),
+            ToolHandler::Audited(handler) => handler(args),
+        })
     }
 }
 
@@ -142,5 +232,38 @@ mod tests {
             )
         }));
         assert!(result.is_err(), "重复注册必须在开发期暴露");
+    }
+
+    #[test]
+    fn audited_dispatch_preserves_approval_fact() {
+        let mut reg = ToolRegistry::default();
+        reg.register_audited(
+            echo_spec(),
+            Box::new(|args| ToolExecution {
+                outcome: ToolOutcome::Success {
+                    value: args["text"].clone(),
+                },
+                audits: vec![ToolAudit::ApprovalDecided { approved: true }],
+            }),
+        );
+        let run = reg
+            .dispatch_with_audit("echo", &serde_json::json!({ "text": "hi" }))
+            .unwrap();
+        assert_eq!(run.audits, [ToolAudit::ApprovalDecided { approved: true }]);
+    }
+
+    #[test]
+    fn plain_dispatch_refuses_to_drop_audited_tool_facts() {
+        let mut reg = ToolRegistry::default();
+        reg.register_audited(
+            echo_spec(),
+            Box::new(|_| panic!("audited handler must not run through plain dispatch")),
+        );
+        match reg.dispatch("echo", &serde_json::json!({ "text": "hi" })) {
+            Some(ToolOutcome::Failure { error }) => {
+                assert_eq!(error.code, protocol::ErrorCode::Internal)
+            }
+            other => panic!("expected fail-closed dispatch, got {other:?}"),
+        }
     }
 }

@@ -316,49 +316,102 @@ struct ChatRequest<'a> {
 pub struct OpenAiCompatClient {
     api_key: String,
     http: reqwest::blocking::Client,
+    route: NetworkRoute,
+}
+
+#[derive(Clone, Debug)]
+enum NetworkRoute {
+    LocalProxy,
+    LoopbackOnly,
 }
 
 impl OpenAiCompatClient {
     /// 从环境变量 [`API_KEY_ENV`] 构造。缺失或为空 → fail-closed 拒绝，
     /// 绝不静默降级为匿名请求。
-    pub fn from_env() -> Result<Self, ErrorEnvelope> {
+    pub fn from_env_via_proxy(proxy_url: &str) -> Result<Self, ErrorEnvelope> {
         let key = std::env::var(API_KEY_ENV).map_err(|_| {
             ErrorEnvelope::new(
                 ErrorCode::Internal,
                 format!("环境变量 {API_KEY_ENV} 未设置；拒绝以匿名方式调用上游"),
             )
         })?;
-        Self::with_key(key)
+        Self::with_key_via_proxy(key, proxy_url)
     }
 
-    /// 默认超时构造。
-    pub fn with_key(api_key: impl Into<String>) -> Result<Self, ErrorEnvelope> {
-        Self::with_key_and_timeout(api_key, DEFAULT_TIMEOUT)
+    /// 生产构造器：仅接受回环地址上的显式代理，外部 provider 不存在直连路径。
+    pub fn with_key_via_proxy(
+        api_key: impl Into<String>,
+        proxy_url: &str,
+    ) -> Result<Self, ErrorEnvelope> {
+        Self::with_key_via_proxy_and_timeout(api_key, proxy_url, DEFAULT_TIMEOUT)
     }
 
-    /// 显式超时构造（测试用短超时注入挂起故障）。
-    pub fn with_key_and_timeout(
+    /// 显式超时的代理构造器。
+    pub fn with_key_via_proxy_and_timeout(
+        api_key: impl Into<String>,
+        proxy_url: &str,
+        timeout: Duration,
+    ) -> Result<Self, ErrorEnvelope> {
+        let key = validate_key(api_key.into())?;
+        let proxy = reqwest::Url::parse(proxy_url)
+            .map_err(|e| ErrorEnvelope::new(ErrorCode::Internal, format!("代理 URL 非法: {e}")))?;
+        if proxy.scheme() != "http" || !url_is_loopback(&proxy) {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::SandboxDenied,
+                "模型代理必须是本机回环地址上的 http:// 端点",
+            ));
+        }
+        let configured_proxy = reqwest::Proxy::all(proxy.as_str())
+            .map_err(|e| ErrorEnvelope::new(ErrorCode::Internal, format!("代理配置失败: {e}")))?;
+        let http = reqwest::blocking::Client::builder()
+            .timeout(timeout)
+            .proxy(configured_proxy)
+            .build()
+            .map_err(|e| {
+                ErrorEnvelope::new(ErrorCode::Internal, format!("HTTP 客户端初始化失败: {e}"))
+            })?;
+        Ok(Self {
+            api_key: key,
+            http,
+            route: NetworkRoute::LocalProxy,
+        })
+    }
+
+    /// 故障注入专用：只允许请求回环地址，不能借此直连外部 provider。
+    pub fn with_key_for_loopback_test(
         api_key: impl Into<String>,
         timeout: Duration,
     ) -> Result<Self, ErrorEnvelope> {
-        let key = api_key.into();
-        if key.trim().is_empty() {
-            return Err(ErrorEnvelope::new(
-                ErrorCode::Internal,
-                "API key 为空；拒绝发起无认证请求",
-            ));
-        }
+        let key = validate_key(api_key.into())?;
         let http = reqwest::blocking::Client::builder()
             .timeout(timeout)
-            // 绕过环境代理：harness 场景代理变量常指向受限出口，且 mock 测试的
-            // 127.0.0.1 不应经过任何代理。
             .no_proxy()
             .build()
             .map_err(|e| {
                 ErrorEnvelope::new(ErrorCode::Internal, format!("HTTP 客户端初始化失败: {e}"))
             })?;
-        Ok(Self { api_key: key, http })
+        Ok(Self {
+            api_key: key,
+            http,
+            route: NetworkRoute::LoopbackOnly,
+        })
     }
+}
+
+fn validate_key(key: String) -> Result<String, ErrorEnvelope> {
+    if key.trim().is_empty() {
+        return Err(ErrorEnvelope::new(
+            ErrorCode::Internal,
+            "API key 为空；拒绝发起无认证请求",
+        ));
+    }
+    Ok(key)
+}
+
+fn url_is_loopback(url: &reqwest::Url) -> bool {
+    url.host_str()
+        .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        .is_some_and(|address| address.is_loopback())
 }
 
 impl ChatModel for OpenAiCompatClient {
@@ -368,6 +421,24 @@ impl ChatModel for OpenAiCompatClient {
         messages: &[ChatMessage],
         tools: Option<&serde_json::Value>,
     ) -> Result<ChatReply, ErrorEnvelope> {
+        let base = reqwest::Url::parse(&spec.base_url).map_err(|e| {
+            ErrorEnvelope::new(ErrorCode::Internal, format!("provider base_url 非法: {e}"))
+        })?;
+        match self.route {
+            NetworkRoute::LocalProxy if base.scheme() != "https" => {
+                return Err(ErrorEnvelope::new(
+                    ErrorCode::SandboxDenied,
+                    "代理模式只允许 HTTPS provider，禁止降级或绕过 CONNECT",
+                ));
+            }
+            NetworkRoute::LoopbackOnly if !url_is_loopback(&base) => {
+                return Err(ErrorEnvelope::new(
+                    ErrorCode::SandboxDenied,
+                    "回环测试客户端拒绝访问外部 provider",
+                ));
+            }
+            _ => {}
+        }
         let url = format!("{}/chat/completions", spec.base_url.trim_end_matches('/'));
         let request = ChatRequest {
             model: &spec.model,
@@ -554,9 +625,39 @@ mod tests {
 
     #[test]
     fn client_rejects_blank_key_fail_closed() {
-        let err = OpenAiCompatClient::with_key("   ").unwrap_err();
+        let err = OpenAiCompatClient::with_key_via_proxy("   ", "http://127.0.0.1:1").unwrap_err();
         assert_eq!(err.code, ErrorCode::Internal);
         assert!(err.message.contains("为空"));
+    }
+
+    #[test]
+    fn production_client_rejects_non_loopback_or_missing_proxy() {
+        for proxy in [
+            "",
+            "https://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://proxy.example:8080",
+        ] {
+            assert!(OpenAiCompatClient::with_key_via_proxy("key", proxy).is_err());
+        }
+    }
+
+    #[test]
+    fn loopback_test_route_rejects_external_provider() {
+        let client =
+            OpenAiCompatClient::with_key_for_loopback_test("key", DEFAULT_TIMEOUT).unwrap();
+        let error = client
+            .stream_chat(
+                &ModelCallSpec {
+                    model: "m".into(),
+                    base_url: "https://api.example.com/v1".into(),
+                    temperature: None,
+                },
+                &[ChatMessage::user("hi")],
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::SandboxDenied);
     }
 
     #[test]

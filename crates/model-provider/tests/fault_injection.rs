@@ -22,7 +22,7 @@ fn spec(base_url: &str) -> ModelCallSpec {
 }
 
 fn client() -> OpenAiCompatClient {
-    OpenAiCompatClient::with_key_and_timeout("test-key", SHORT_TIMEOUT).unwrap()
+    OpenAiCompatClient::with_key_for_loopback_test("test-key", SHORT_TIMEOUT).unwrap()
 }
 
 /// 启动一次性 mock server：接受单个连接、排空请求头+体后执行 handler。

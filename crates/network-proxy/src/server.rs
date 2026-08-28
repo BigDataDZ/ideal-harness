@@ -5,6 +5,7 @@ use protocol::Event;
 use std::{
     io::{self, Read, Write},
     net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     thread,
     time::Duration,
@@ -46,31 +47,66 @@ impl<S: AuditSink + 'static> ProxyServer<S> {
 
     /// 处理一个连接，供独立代理进程的 accept loop 调用。
     pub fn serve_once(&self) -> io::Result<()> {
-        let (mut client, _) = self.listener.accept()?;
-        client.set_read_timeout(Some(Duration::from_secs(10)))?;
-        client.set_write_timeout(Some(Duration::from_secs(10)))?;
-        let request = read_connect_request(&mut client)?;
-
-        if !self.policy.allows(&request.host) {
-            client.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")?;
-            self.audit.record(Event::NetworkAccessDenied {
-                host: request.host,
-                port: request.port,
-                reason: "host_not_allowlisted".into(),
-            })?;
-            return Ok(());
-        }
-
-        let upstream = match TcpStream::connect((request.host.as_str(), request.port)) {
-            Ok(upstream) => upstream,
-            Err(error) => {
-                client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")?;
-                return Err(error);
-            }
-        };
-        client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
-        tunnel(client, upstream)
+        let (client, _) = self.listener.accept()?;
+        handle_client(client, &self.policy, self.audit.as_ref())
     }
+
+    /// 持续处理连接直到收到停止信号。每条隧道独立线程处理，accept loop 保持可停止。
+    pub fn serve_until(&self, stop: &AtomicBool) -> io::Result<()> {
+        self.listener.set_nonblocking(true)?;
+        let mut workers = Vec::new();
+        while !stop.load(Ordering::Acquire) {
+            match self.listener.accept() {
+                Ok((client, _)) => {
+                    let policy = self.policy.clone();
+                    let audit = Arc::clone(&self.audit);
+                    workers.push(thread::spawn(move || {
+                        handle_client(client, &policy, audit.as_ref())
+                    }));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("proxy connection thread panicked"))??;
+        }
+        Ok(())
+    }
+}
+
+fn handle_client<S: AuditSink>(
+    mut client: TcpStream,
+    policy: &ProxyPolicy,
+    audit: &S,
+) -> io::Result<()> {
+    client.set_read_timeout(Some(Duration::from_secs(10)))?;
+    client.set_write_timeout(Some(Duration::from_secs(10)))?;
+    let request = read_connect_request(&mut client)?;
+
+    if !policy.allows(&request.host) {
+        client.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")?;
+        audit.record(Event::NetworkAccessDenied {
+            host: request.host,
+            port: request.port,
+            reason: "host_not_allowlisted".into(),
+        })?;
+        return Ok(());
+    }
+
+    let upstream = match TcpStream::connect((request.host.as_str(), request.port)) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")?;
+            return Err(error);
+        }
+    };
+    client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")?;
+    tunnel(client, upstream)
 }
 
 struct ConnectRequest {

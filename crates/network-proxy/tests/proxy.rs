@@ -5,7 +5,10 @@ use protocol::Event;
 use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     thread,
 };
 
@@ -101,4 +104,30 @@ fn audit_sink_failure_does_not_turn_denial_into_access() {
     client.read_to_string(&mut response).unwrap();
     assert!(response.starts_with("HTTP/1.1 403"));
     assert!(worker.join().unwrap().is_err());
+}
+
+#[test]
+fn continuous_server_stops_after_handling_multiple_connections() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    let server = ProxyServer::bind(localhost(0), ProxyPolicy::deny_all(), move |event| {
+        captured.lock().unwrap().push(event);
+        Ok(())
+    })
+    .unwrap();
+    let address = server.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let worker = thread::spawn(move || server.serve_until(&worker_stop));
+
+    for host in ["one.example", "two.example"] {
+        let mut client = TcpStream::connect(address).unwrap();
+        write!(client, "CONNECT {host}:443 HTTP/1.1\r\n\r\n").unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403"));
+    }
+    stop.store(true, Ordering::Release);
+    worker.join().unwrap().unwrap();
+    assert_eq!(events.lock().unwrap().len(), 2);
 }

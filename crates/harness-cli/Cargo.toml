@@ -16,3 +16,7 @@ session = { workspace = true }
 tools = { workspace = true }
 agent-loop = { workspace = true }
 model-provider = { workspace = true }
+approval = { workspace = true }
+sandbox-exec = { workspace = true }
+network-proxy = { workspace = true }
+reqwest = { workspace = true }

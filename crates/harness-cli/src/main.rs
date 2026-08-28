@@ -3,13 +3,19 @@
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use agent_loop::{AgentLoop, ModelProvider};
+use approval::TerminalApprover;
 use model_provider::{ChatMessage, OpenAiCompatClient};
-use protocol::{Event, ModelCallSpec, ToolOutcome};
+use protocol::{ErrorEnvelope, Event, ModelCallSpec, ToolOutcome};
+use sandbox_exec::PlatformRestrictedBackend;
 use sandbox_policy::{SandboxMode, SandboxPolicy};
 use session::{replay as session_replay, JsonlSession};
-use tools::{ToolRegistry, ToolSpec};
+use tools::{EscalationAvailability, ToolRegistry, ToolSpec};
+
+mod security;
+use security::{register_exec_tool, ProviderProxy};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -64,8 +70,10 @@ fn parse_chat_args(args: &[String]) -> anyhow::Result<ChatArgs> {
 
 fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
     let cfg = parse_chat_args(args)?;
+    let proxy_events = Arc::new(Mutex::new(Vec::<Event>::new()));
+    let mut proxy = ProviderProxy::start(&cfg.base_url, Arc::clone(&proxy_events))?;
     // fail-closed：无 key 直接拒绝启动（红线 3），绝不匿名调用上游。
-    let client = OpenAiCompatClient::from_env().map_err(|e| {
+    let client = OpenAiCompatClient::from_env_via_proxy(&proxy.url).map_err(|e| {
         anyhow::anyhow!(
             "{}（请先设置环境变量 IDEAL_HARNESS_API_KEY 后重试）",
             e.message
@@ -79,6 +87,16 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
 
     let mut registry = ToolRegistry::default();
     register_demo_tools(&mut registry);
+    registry.set_escalation_availability(EscalationAvailability::RestrictedBackendMounted);
+    let terminal_approver = Arc::new(TerminalApprover::new(
+        std::io::BufReader::new(std::io::stdin()),
+        std::io::stderr(),
+    ));
+    register_exec_tool(
+        &mut registry,
+        PlatformRestrictedBackend,
+        Some(terminal_approver),
+    );
 
     // 会话复用：create 即 append 模式，seq 自动续接（崩溃安全）。
     let mut js = JsonlSession::create(cfg.session.clone())?;
@@ -88,8 +106,17 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
     let history = rebuild_history(js.path())?;
 
     let mut lp = AgentLoop::with_chat(&mut js, &registry, &client, spec);
-    lp.tool_definitions = Some(openai_tools_json(&registry, &["echo", "now"]));
+    lp.tool_definitions = Some(
+        openai_tools_json(&registry, &["echo", "now", "exec"])
+            .map_err(|error| anyhow::anyhow!(error.message))?,
+    );
     lp.chat_history = history;
+    let event_source_queue = Arc::clone(&proxy_events);
+    let event_source = move || match event_source_queue.lock() {
+        Ok(mut events) => std::mem::take(&mut *events),
+        Err(_) => Vec::new(),
+    };
+    lp.external_events = Some(&event_source);
 
     println!("== ideal-harness chat ==");
     println!(
@@ -115,7 +142,7 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         match text {
             "/exit" | "/quit" => break,
             "/tools" => {
-                for name in ["echo", "now"] {
+                for name in ["echo", "now", "exec"] {
                     if let Some(s) = registry.get(name) {
                         println!("  {} — {}", s.name, s.description);
                     }
@@ -144,6 +171,9 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         }
     }
     println!("会话已保存：{}", lp.session.path().display());
+    drop(lp);
+    drop(client);
+    proxy.shutdown()?;
     Ok(())
 }
 
@@ -183,23 +213,28 @@ fn register_demo_tools(registry: &mut ToolRegistry) {
 }
 
 /// 把注册表中的指定工具包装为 OpenAI tools 数组（chat 请求的 tools 广告）。
-fn openai_tools_json(registry: &ToolRegistry, names: &[&str]) -> serde_json::Value {
-    serde_json::Value::Array(
+fn openai_tools_json(
+    registry: &ToolRegistry,
+    names: &[&str],
+) -> Result<serde_json::Value, ErrorEnvelope> {
+    Ok(serde_json::Value::Array(
         names
             .iter()
             .filter_map(|n| registry.get(n))
             .map(|s| {
-                serde_json::json!({
+                Ok(serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": s.name,
                         "description": s.description,
-                        "parameters": s.parameters_schema,
+                        "parameters": s.advertised_parameters_schema(
+                            registry.escalation_availability()
+                        )?,
                     },
-                })
+                }))
             })
-            .collect(),
-    )
+            .collect::<Result<Vec<_>, ErrorEnvelope>>()?,
+    ))
 }
 
 /// 事件溯源原生的中断恢复：悬空 turn（有 Started、无 Completed/Aborted）
@@ -394,7 +429,7 @@ mod tests {
     fn openai_tools_json_wraps_registered_specs() {
         let mut reg = ToolRegistry::default();
         register_demo_tools(&mut reg);
-        let v = openai_tools_json(&reg, &["echo", "now"]);
+        let v = openai_tools_json(&reg, &["echo", "now"]).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 2);
         assert_eq!(v[0]["type"], "function");
         assert_eq!(v[0]["function"]["name"], "echo");
