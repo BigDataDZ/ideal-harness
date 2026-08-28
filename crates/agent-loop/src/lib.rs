@@ -500,6 +500,7 @@ mod tests {
             Event::ToolResultAdded { .. } => "tool_result_added",
             Event::CompactionApplied { .. } => "compaction",
             Event::ApprovalDecided { .. } => "approval",
+            Event::NetworkAccessDenied { .. } => "network_access_denied",
             Event::TurnCompleted { .. } => "turn_completed",
             Event::TurnAborted { .. } => "turn_aborted",
         }

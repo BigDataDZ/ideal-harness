@@ -20,7 +20,7 @@
 
 见 `AGENTS.md §1` 所有权地图。补充细则：
 
-- 依赖只允许"下游引上游"：{protocol, sandbox-policy, sandbox-exec} ← {tools, session, context} ← agent-loop ← harness-cli
+- 依赖只允许"下游引上游"：{protocol, sandbox-policy, sandbox-exec} ← {network-proxy, tools, session, context} ← agent-loop ← harness-cli
 - `harness-cli` 是唯一含 `fn main` 的 crate
 - crate 内部结构约定：
   ```

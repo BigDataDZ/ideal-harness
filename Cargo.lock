@@ -480,6 +480,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "network-proxy"
+version = "0.2.0"
+dependencies = [
+ "protocol",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
