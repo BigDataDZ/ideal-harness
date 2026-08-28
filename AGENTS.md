@@ -15,6 +15,7 @@ Rust 实现的 LLM Agent Harness 原型：protocol-first、事件溯源、三层
 |---|---|---|---|
 | `crates/protocol` | wire 协议：Event/ErrorCode/ErrorEnvelope，**唯一契约** | P-arch | serde |
 | `crates/sandbox-policy` | SandboxMode 单一抽象 + 词法栅栏 + 加宽表 | P2 | — |
+| `crates/sandbox-exec` | OS 受限子进程池：Windows Restricted Token + Landlock 后端接口 | P2 | — |
 | `crates/approval` | fail-closed 审批 + 提权参数成对校验 | P2 | protocol, sandbox-policy |
 | `crates/tools` | 工具注册表 + schema 校验 + 调度 | P3/P4 | protocol |
 | `crates/session` | JSONL 事件溯源：append/replay/fork | P5 | protocol |
