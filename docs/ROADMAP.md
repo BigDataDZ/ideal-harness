@@ -52,7 +52,7 @@
 
 | 任务卡 | 目标 crate | 核心内容 | 关键验收 |
 |---|---|---|---|
-| TASK-201 | tools | 完整 JSON Schema 校验器（type/enum/items/additionalProperties） | 对 DSH 风格 schema 的兼容测试集 |
+| TASK-201 ✅（commit `826b2c2`） | tools | 完整 JSON Schema 校验器（type/enum/items/additionalProperties） | 对 DSH 风格 schema 的兼容测试集 |
 | TASK-202 | sandbox-exec(新) | 受限执行进程池：Windows CreateRestrictedToken 优先，预留 Landlock trait 位 | 外部命令不在主进程内执行的架构测试 |
 | TASK-203 | network-proxy(新) | 白名单代理进程；provider 域名默认放行，其余默认拒绝 | 断网默认态测试；白名单外连接被拒且落审计事件 |
 | TASK-204 | approval | CLI 人工审批通道（终端 y/n）+ Approver trait 实现 | fail-closed 全分支已有测试基础上补集成测试 |
