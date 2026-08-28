@@ -57,9 +57,9 @@
 | TASK-203 ✅（commit `8d74044`） | network-proxy(新) | 白名单代理进程；provider 域名默认放行，其余默认拒绝 | 断网默认态测试；白名单外连接被拒且落审计事件 |
 | TASK-204 ✅（commit `ad502ce`） | approval | CLI 人工审批通道（终端 y/n）+ Approver trait 实现 | fail-closed 全分支已有测试基础上补集成测试 |
 | TASK-205 ✅（commit `f040860`） | tools | 提权出口动态广告：仅受限后端挂载时注入 escalation 字段 | 只读模式下 schema 含提权字段、全开放模式不含 |
-| TASK-206 | harness-cli+model-provider+tools+agent-loop | P2 安全链路端到端装配：命令仅走受限进程池，模型仅走白名单代理，提权决策写入事件流（D5/D7/D8/D9） | 外部 provider 无代理不可直连；命令子进程受限；无审批器提权失败；审批/拒网/结果均留痕 |
+| TASK-206 ✅（commit `dd09f37`） | harness-cli+model-provider+tools+agent-loop | P2 安全链路端到端装配：命令仅走受限进程池，模型仅走白名单代理，提权决策写入事件流（D5/D7/D8/D9） | 外部 provider 无代理不可直连；命令子进程受限；无审批器提权失败；审批/拒网/结果均留痕 |
 
-### TASK-206: P2 安全链路端到端装配
+### TASK-206: P2 安全链路端到端装配 ✅（commit `dd09f37`）
 - 目标 crate: harness-cli、model-provider、tools、agent-loop（复用 approval、sandbox-exec、network-proxy）
 - 验收标准:
   1. chat 的模型请求只能通过本地 CONNECT 白名单代理；生产构造器不存在外部域名直连路径，空白/非本地代理 fail-closed
