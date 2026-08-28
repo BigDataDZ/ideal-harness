@@ -1,18 +1,37 @@
 //! 工具注册表（P3）：schema 定义 + 参数校验 + 统一调度。
 //! 错误一律以稳定 ErrorCode 回传，供模型自纠，绝不 panic。
 
-use protocol::{ErrorCode, ErrorEnvelope, ToolOutcome};
+mod advertisement;
+mod schema;
+
+use protocol::ToolOutcome;
 use serde::{Deserialize, Serialize};
+
+pub use advertisement::EscalationAvailability;
+pub use schema::validate_args;
 
 /// 工具规格：schema 即文档，schema 即校验器输入。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
-    /// JSON Schema 形式的参数定义（骨架版只消费 required；生产替换为完整校验器）。
+    /// JSON Schema 形式的参数定义。
+    ///
+    /// TASK-201 支持工具协议使用的核心关键字：`type`、`enum`、`properties`、
+    /// `required`、`items` 与 `additionalProperties`。描述性关键字保持透传。
     pub parameters_schema: serde_json::Value,
     /// 仅当受限沙箱后端挂载时才向模型广告提权出口（P2-4 动态 schema）。
     pub escalation_capable: bool,
+}
+
+impl ToolSpec {
+    /// 生成模型可见的参数 schema；仅在受限执行后端已挂载时广告提权出口。
+    pub fn advertised_parameters_schema(
+        &self,
+        availability: EscalationAvailability,
+    ) -> Result<serde_json::Value, protocol::ErrorEnvelope> {
+        advertisement::advertised_parameters_schema(self, availability)
+    }
 }
 
 pub type ToolFn = dyn Fn(&serde_json::Value) -> ToolOutcome + Send + Sync;
@@ -55,44 +74,10 @@ impl ToolRegistry {
     }
 }
 
-/// 骨架版校验：object 类型 + required 键存在性。
-pub fn validate_args(spec: &ToolSpec, args: &serde_json::Value) -> Result<(), ErrorEnvelope> {
-    if !spec.parameters_schema.is_object() {
-        return Err(ErrorEnvelope::new(
-            ErrorCode::Internal,
-            "tool schema must be an object",
-        ));
-    }
-    let obj = match args.as_object() {
-        Some(o) => o,
-        None => {
-            return Err(ErrorEnvelope::new(
-                ErrorCode::ToolArgsInvalid,
-                "args must be a JSON object",
-            ))
-        }
-    };
-    if let Some(required) = spec
-        .parameters_schema
-        .get("required")
-        .and_then(|v| v.as_array())
-    {
-        for r in required {
-            let key = r.as_str().unwrap_or_default();
-            if !obj.contains_key(key) {
-                return Err(ErrorEnvelope::new(
-                    ErrorCode::ToolArgsInvalid,
-                    format!("missing required arg: {key}"),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protocol::ErrorCode;
 
     fn echo_spec() -> ToolSpec {
         ToolSpec {
