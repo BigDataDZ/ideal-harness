@@ -79,6 +79,12 @@ pub enum Event {
         call_id: String,
         approved: bool,
     },
+    /// P2/TASK-203：白名单代理拒绝外连时的稳定审计事件。
+    NetworkAccessDenied {
+        host: String,
+        port: u16,
+        reason: String,
+    },
     TurnCompleted {
         turn_id: u64,
     },
@@ -156,6 +162,21 @@ mod tests {
         );
         let back: Event = serde_json::from_str(&json).unwrap();
         assert_eq!(e, back);
+    }
+
+    #[test]
+    fn network_access_denied_roundtrip_with_stable_fields() {
+        let event = Event::NetworkAccessDenied {
+            host: "untrusted.example".into(),
+            port: 443,
+            reason: "host_not_allowlisted".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"network_access_denied","host":"untrusted.example","port":443,"reason":"host_not_allowlisted"}"#
+        );
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
     }
 
     #[test]
