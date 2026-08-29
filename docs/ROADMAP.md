@@ -12,7 +12,7 @@
 | P0 | v0.1 ✅ | 架构骨架 + 协同规范 | 8 crate / 29 测试全绿（已完成） |
 | P1 | v0.2 ✅ | **可对话 MVP**：接真实 LLM + 工具调用闭环 | 出口判据已达成：真实 API key 端到端冒烟通过（`tests/manual/chat-smoke.md`） |
 | P2 | v0.3 ✅ | **安全纵深**：OS 沙箱 + 网络代理 + 人工审批 | 出口判据已由 TASK-206 端到端测试证明，并经人类守护者确认 |
-| P3 | v0.4 | **上下文工程**：压缩/spill/token 计量 | 长会话不触顶；溢出自动恢复有测试 |
+| P3 | v0.4 ✅ | **上下文工程**：压缩/spill/token 计量 | 长会话不触顶；溢出自动恢复有测试 |
 | P4 | v0.5 | **会话产品化**：resume/fork/投影存储 | 断点续聊；fork 分支独立演化 |
 | P5 | v0.6+ | **扩展生态**：MCP/skill/hooks/Web UI | 第三方工具经 MCP 接入 |
 
@@ -82,7 +82,7 @@
 
 | 任务卡 | 目标 crate | 核心内容 | 关键验收 |
 |---|---|---|---|
-| TASK-401 | harness-cli | `resume` / `fork` 子命令 | fork 后两会话独立追加互不影响 |
+| TASK-401 ✅（commit `e3e507b`） | harness-cli | `resume` / `fork` 子命令 | fork 后两会话独立追加互不影响 |
 | TASK-402 | session | SQLite 投影 + write-behind 编排 | 投影查询与 JSONL 重放一致性测试 |
 | TASK-403 | session | zstd 帧压缩（可选依赖，任务卡批准后引入） | 新旧格式互读迁移测试 |
 | TASK-404 | agent-loop(子模块) | 进程内 subagent 骨架 + report 回传事件 | 子代理失败不污染父会话 |
