@@ -3,10 +3,12 @@
 
 mod compaction;
 mod subagent;
+mod subagent_lifecycle;
 mod subagent_policy;
 
 pub use compaction::{HistoryCompaction, OverflowRecovery};
 pub use subagent::{SubagentReport, SubagentRunner, SubagentTask, SubagentTrace};
+pub use subagent_lifecycle::{SubagentCancellation, SubagentDelegation};
 pub use subagent_policy::{SubagentPolicy, SubagentRequest};
 
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
@@ -29,6 +31,7 @@ pub enum Phase {
 #[derive(Default)]
 pub struct Inbox {
     messages: Vec<String>,
+    boundary_reports: Vec<String>,
 }
 
 impl Inbox {
@@ -39,7 +42,16 @@ impl Inbox {
         self.messages.push(text.into());
     }
     pub fn drain(&mut self) -> Vec<String> {
+        self.messages.append(&mut self.boundary_reports);
         std::mem::take(&mut self.messages)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    fn queue_boundary_report(&mut self, text: String) {
+        self.boundary_reports.push(text);
     }
 }
 
@@ -147,7 +159,15 @@ impl<'a> AgentLoop<'a> {
     ) -> Result<SubagentReport, ErrorEnvelope> {
         let policy = SubagentPolicy::local_default();
         let request = SubagentRequest::local_default();
-        subagent::run(self.session, task, &request, &policy, &policy, runner)
+        let cancellation = SubagentCancellation::new();
+        let delegation = SubagentDelegation::new(
+            &request,
+            &policy,
+            &policy,
+            protocol::SubagentReportDelivery::Quiet,
+            &cancellation,
+        );
+        self.run_subagent_lifecycle(task, &delegation, runner)
     }
 
     /// TASK-409：在 runner 前应用父/子策略与本次资源请求。
@@ -159,14 +179,31 @@ impl<'a> AgentLoop<'a> {
         child_policy: &SubagentPolicy,
         runner: &dyn SubagentRunner,
     ) -> Result<SubagentReport, ErrorEnvelope> {
-        subagent::run(
-            self.session,
-            task,
+        let cancellation = SubagentCancellation::new();
+        let delegation = SubagentDelegation::new(
             request,
             parent_policy,
             child_policy,
-            runner,
-        )
+            protocol::SubagentReportDelivery::Quiet,
+            &cancellation,
+        );
+        self.run_subagent_lifecycle(task, &delegation, runner)
+    }
+
+    /// TASK-410：运行带 lineage、取消传播和显式报告投递方式的子代理。
+    pub fn run_subagent_lifecycle(
+        &mut self,
+        task: &SubagentTask,
+        delegation: &SubagentDelegation<'_>,
+        runner: &dyn SubagentRunner,
+    ) -> Result<SubagentReport, ErrorEnvelope> {
+        let result = subagent_lifecycle::run(self.session, task, delegation, runner);
+        if let Ok(report) = &result {
+            if delegation.delivery() == protocol::SubagentReportDelivery::NextStep {
+                self.inbox.queue_boundary_report(report.text.clone());
+            }
+        }
+        result
     }
 
     /// 一个 turn：drain inbox → 逐条采样 → 终结事件。
@@ -641,6 +678,10 @@ mod tests {
             Event::CompactionApplied { .. } => "compaction",
             Event::ApprovalDecided { .. } => "approval",
             Event::NetworkAccessDenied { .. } => "network_access_denied",
+            Event::SubagentStarted { .. } => "subagent_started",
+            Event::SubagentCancellationRequested { .. } => "subagent_cancel_requested",
+            Event::SubagentReportDelivered { .. } => "subagent_report_delivered",
+            Event::SubagentStopped { .. } => "subagent_stopped",
             Event::TurnCompleted { .. } => "turn_completed",
             Event::TurnAborted { .. } => "turn_aborted",
         }

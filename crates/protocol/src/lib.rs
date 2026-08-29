@@ -17,6 +17,7 @@ pub enum ErrorCode {
     ApprovalRejected,
     ContextWindowExceeded,
     ModelStreamBroken,
+    SubagentCancelled,
     Internal,
 }
 
@@ -42,6 +43,25 @@ impl ErrorEnvelope {
 pub enum ToolOutcome {
     Success { value: serde_json::Value },
     Failure { error: ErrorEnvelope },
+}
+
+/// 子代理的闭合终态；Started 必须恰好对应一个 Stopped。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentOutcome {
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// 子代理报告的父级投递方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentReportDelivery {
+    /// 在下一个 turn 边界进入父 inbox。
+    NextStep,
+    /// 只留事件，不唤醒父 inbox。
+    Quiet,
 }
 
 /// 会话事件流：append-only，事件溯源的唯一载体（P5）。
@@ -84,6 +104,30 @@ pub enum Event {
         host: String,
         port: u16,
         reason: String,
+    },
+    /// TASK-410：子代理启动与 parent/child lineage 的唯一事实记录。
+    SubagentStarted {
+        task_id: String,
+        parent_id: String,
+        child_id: String,
+    },
+    /// 父级取消请求；必须由 cancelled 的 SubagentStopped 收口。
+    SubagentCancellationRequested {
+        task_id: String,
+        child_id: String,
+        reason: String,
+    },
+    /// 成功报告的投递审计；quiet/next_step 均必须留痕。
+    SubagentReportDelivered {
+        task_id: String,
+        child_id: String,
+        delivery: SubagentReportDelivery,
+        text: String,
+    },
+    SubagentStopped {
+        task_id: String,
+        child_id: String,
+        outcome: SubagentOutcome,
     },
     TurnCompleted {
         turn_id: u64,
@@ -134,6 +178,44 @@ mod tests {
         assert!(
             json.contains("sandbox_denied"),
             "error code 必须序列化为稳定 snake_case"
+        );
+    }
+
+    #[test]
+    fn subagent_lifecycle_events_roundtrip() {
+        let events = [
+            Event::SubagentStarted {
+                task_id: "task-1".into(),
+                parent_id: "root".into(),
+                child_id: "child-1".into(),
+            },
+            Event::SubagentReportDelivered {
+                task_id: "task-1".into(),
+                child_id: "child-1".into(),
+                delivery: SubagentReportDelivery::NextStep,
+                text: "done".into(),
+            },
+            Event::SubagentStopped {
+                task_id: "task-1".into(),
+                child_id: "child-1".into(),
+                outcome: SubagentOutcome::Succeeded,
+            },
+        ];
+        for event in events {
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn pre_task_410_event_json_remains_readable() {
+        let old = r#"{"type":"turn_aborted","turn_id":7,"reason":"old session"}"#;
+        assert_eq!(
+            serde_json::from_str::<Event>(old).unwrap(),
+            Event::TurnAborted {
+                turn_id: 7,
+                reason: "old session".into(),
+            }
         );
     }
 

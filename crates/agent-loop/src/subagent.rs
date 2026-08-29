@@ -1,29 +1,53 @@
-//! P3 / TASK-404：进程内子代理骨架；内部 trace 隔离，父会话只接收最终报告。
+//! P3 / TASK-404：进程内子代理数据模型；内部 trace 与父会话隔离。
 
-use crate::subagent_policy::{validate_delegation, SubagentPolicy, SubagentRequest};
-use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
-use session::SessionStore;
-
-const SUBAGENT_TOOL: &str = "subagent";
+use crate::subagent_lifecycle::SubagentCancellation;
+use protocol::{ErrorCode, ErrorEnvelope, Event};
 
 /// 一次子代理委派。ID 用于父事件流中的稳定配对。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubagentTask {
     id: String,
     prompt: String,
+    parent_id: String,
+    child_id: String,
 }
 
 impl SubagentTask {
     pub fn new(id: impl Into<String>, prompt: impl Into<String>) -> Result<Self, ErrorEnvelope> {
         let id = id.into();
+        Self::with_lineage(id.clone(), prompt, "root", id)
+    }
+
+    pub fn with_lineage(
+        id: impl Into<String>,
+        prompt: impl Into<String>,
+        parent_id: impl Into<String>,
+        child_id: impl Into<String>,
+    ) -> Result<Self, ErrorEnvelope> {
+        let id = id.into();
         let prompt = prompt.into();
-        if id.trim().is_empty() || prompt.trim().is_empty() {
+        let parent_id = parent_id.into();
+        let child_id = child_id.into();
+        if [
+            id.as_str(),
+            prompt.as_str(),
+            parent_id.as_str(),
+            child_id.as_str(),
+        ]
+        .iter()
+        .any(|value| value.trim().is_empty())
+        {
             return Err(ErrorEnvelope::new(
                 ErrorCode::ToolArgsInvalid,
-                "subagent id and prompt must be non-empty",
+                "subagent id, prompt, parent id and child id must be non-empty",
             ));
         }
-        Ok(Self { id, prompt })
+        Ok(Self {
+            id,
+            prompt,
+            parent_id,
+            child_id,
+        })
     }
 
     pub fn id(&self) -> &str {
@@ -32,6 +56,14 @@ impl SubagentTask {
 
     pub fn prompt(&self) -> &str {
         &self.prompt
+    }
+
+    pub fn parent_id(&self) -> &str {
+        &self.parent_id
+    }
+
+    pub fn child_id(&self) -> &str {
+        &self.child_id
     }
 }
 
@@ -69,102 +101,19 @@ impl SubagentTrace {
 
 /// 可注入的进程内子代理执行器；故障测试可在隔离 trace 中制造半截执行。
 pub trait SubagentRunner {
-    fn run(&self, task: &SubagentTask, trace: &mut SubagentTrace) -> Result<String, ErrorEnvelope>;
-}
-
-pub(crate) fn run(
-    parent: &mut dyn SessionStore,
-    task: &SubagentTask,
-    request: &SubagentRequest,
-    parent_policy: &SubagentPolicy,
-    child_policy: &SubagentPolicy,
-    runner: &dyn SubagentRunner,
-) -> Result<SubagentReport, ErrorEnvelope> {
-    append_parent_event(
-        parent,
-        Event::ToolCallRequested {
-            call_id: task.id.clone(),
-            tool: SUBAGENT_TOOL.to_string(),
-            args: serde_json::json!({
-                "prompt": task.prompt,
-                "depth": request.depth(),
-                "active_children": request.active_children(),
-                "turn_budget": request.turn_budget(),
-                "token_budget": request.token_budget(),
-                "model": request.model(),
-                "tools": request.tools(),
-            }),
-        },
-    )?;
-
-    if let Err(error) = validate_delegation(parent_policy, child_policy, request) {
-        append_failure(parent, task, &error)?;
-        return Err(error);
-    }
-
-    let mut trace = SubagentTrace::default();
-    let result = runner.run(task, &mut trace);
-
-    match result {
-        Ok(text) => {
-            let report = SubagentReport {
-                task_id: task.id.clone(),
-                text,
-                child_event_count: trace.len(),
-            };
-            append_parent_event(
-                parent,
-                Event::ToolResultAdded {
-                    call_id: task.id.clone(),
-                    outcome: ToolOutcome::Success {
-                        value: serde_json::json!({
-                            "kind": "subagent_report",
-                            "task_id": report.task_id,
-                            "text": report.text,
-                            "child_event_count": report.child_event_count,
-                        }),
-                    },
-                },
-            )?;
-            Ok(report)
-        }
-        Err(error) => {
-            append_failure(parent, task, &error)?;
-            Err(error)
-        }
-    }
-}
-
-fn append_failure(
-    parent: &mut dyn SessionStore,
-    task: &SubagentTask,
-    error: &ErrorEnvelope,
-) -> Result<(), ErrorEnvelope> {
-    append_parent_event(
-        parent,
-        Event::ToolResultAdded {
-            call_id: task.id.clone(),
-            outcome: ToolOutcome::Failure {
-                error: error.clone(),
-            },
-        },
-    )
-}
-
-fn append_parent_event(parent: &mut dyn SessionStore, event: Event) -> Result<(), ErrorEnvelope> {
-    parent.append(event).map(|_| ()).map_err(|error| {
-        ErrorEnvelope::new(
-            ErrorCode::Internal,
-            format!("failed to append subagent report event: {error}"),
-        )
-    })
+    fn run(
+        &self,
+        task: &SubagentTask,
+        trace: &mut SubagentTrace,
+        cancellation: &SubagentCancellation,
+    ) -> Result<String, ErrorEnvelope>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentLoop, ModelProvider};
-    use protocol::SequencedEvent;
+    use crate::{AgentLoop, ModelProvider, SubagentPolicy, SubagentRequest};
+    use protocol::{SequencedEvent, SubagentOutcome, SubagentReportDelivery, ToolOutcome};
     use session::JsonlSession;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -193,6 +142,7 @@ mod tests {
             &self,
             task: &SubagentTask,
             trace: &mut SubagentTrace,
+            _: &SubagentCancellation,
         ) -> Result<String, ErrorEnvelope> {
             trace.record(Event::UserMessage {
                 text: task.prompt().to_string(),
@@ -218,12 +168,27 @@ mod tests {
         assert_eq!(report.child_event_count, 2);
 
         let events = replay(&path);
-        assert_eq!(events.len(), 2);
+        assert_eq!(events.len(), 5);
         assert!(matches!(
             events[0].event,
-            Event::ToolCallRequested { ref tool, .. } if tool == SUBAGENT_TOOL
+            Event::ToolCallRequested { ref tool, .. } if tool == "subagent"
         ));
-        match &events[1].event {
+        assert!(matches!(events[1].event, Event::SubagentStarted { .. }));
+        assert!(matches!(
+            events[2].event,
+            Event::SubagentReportDelivered {
+                delivery: SubagentReportDelivery::Quiet,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[3].event,
+            Event::SubagentStopped {
+                outcome: SubagentOutcome::Succeeded,
+                ..
+            }
+        ));
+        match &events[4].event {
             Event::ToolResultAdded {
                 call_id,
                 outcome: ToolOutcome::Success { value },
@@ -247,6 +212,7 @@ mod tests {
             &self,
             _: &SubagentTask,
             trace: &mut SubagentTrace,
+            _: &SubagentCancellation,
         ) -> Result<String, ErrorEnvelope> {
             trace.record(Event::AssistantMessage {
                 text: "partial child output".into(),
@@ -273,10 +239,22 @@ mod tests {
         assert_eq!(error.code, ErrorCode::ModelStreamBroken);
 
         let events = replay(&path);
-        assert_eq!(events.len(), 2, "parent receives one complete audit pair");
+        assert_eq!(
+            events.len(),
+            4,
+            "parent receives a closed lifecycle and audit pair"
+        );
         assert!(matches!(events[0].event, Event::ToolCallRequested { .. }));
+        assert!(matches!(events[1].event, Event::SubagentStarted { .. }));
         assert!(matches!(
-            events[1].event,
+            events[2].event,
+            Event::SubagentStopped {
+                outcome: SubagentOutcome::Failed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[3].event,
             Event::ToolResultAdded {
                 outcome: ToolOutcome::Failure {
                     error: ErrorEnvelope {
@@ -308,7 +286,12 @@ mod tests {
     struct CountingRunner<'a>(&'a AtomicUsize);
 
     impl SubagentRunner for CountingRunner<'_> {
-        fn run(&self, _: &SubagentTask, _: &mut SubagentTrace) -> Result<String, ErrorEnvelope> {
+        fn run(
+            &self,
+            _: &SubagentTask,
+            _: &mut SubagentTrace,
+            _: &SubagentCancellation,
+        ) -> Result<String, ErrorEnvelope> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("must not run".into())
         }
