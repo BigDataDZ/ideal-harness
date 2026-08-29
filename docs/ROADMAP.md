@@ -74,7 +74,7 @@
 | 任务卡 | 目标 crate | 核心内容 | 关键验收 |
 |---|---|---|---|
 | TASK-301 ✅（commit `ccbc6d8`） | context | TokenMeter：以 provider usage 为锚，启发式兜底 | usage 缺失时降级路径测试 |
-| TASK-302 | context+agent-loop | 两段式压缩：ToolResultPruner → LLM 摘要替换区间 | **配对完整性属性测试**（随机裁剪不拆对） |
+| TASK-302 ✅（commit `08c1526`） | context+agent-loop | 两段式压缩：ToolResultPruner → LLM 摘要替换区间 | **配对完整性属性测试**（随机裁剪不拆对） |
 | TASK-303 | agent-loop | 溢出强制压缩后自动重试（填现有 TODO 挂点） | 注入 ContextWindowExceeded 后观察压缩事件+成功重试 |
 | TASK-304 | session | spill：超长工具结果全文落盘，事件中只存预览+locator | 取回句柄 roundtrip 测试 |
 
