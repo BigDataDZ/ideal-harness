@@ -83,7 +83,7 @@
 | 任务卡 | 目标 crate | 核心内容 | 关键验收 |
 |---|---|---|---|
 | TASK-401 ✅（commit `e3e507b`） | harness-cli | `resume` / `fork` 子命令 | fork 后两会话独立追加互不影响 |
-| TASK-402 | session | SQLite 投影 + write-behind 编排 | 投影查询与 JSONL 重放一致性测试 |
+| TASK-402 ✅（commit `d0f22f4`） | session | SQLite 投影 + write-behind 编排 | 投影查询与 JSONL 重放一致性测试 |
 | TASK-403 | session | zstd 帧压缩（可选依赖，任务卡批准后引入） | 新旧格式互读迁移测试 |
 | TASK-404 | agent-loop(子模块) | 进程内 subagent 骨架 + report 回传事件 | 子代理失败不污染父会话 |
 
