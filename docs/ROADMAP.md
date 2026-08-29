@@ -11,7 +11,7 @@
 |---|---|---|---|
 | P0 | v0.1 ✅ | 架构骨架 + 协同规范 | 8 crate / 29 测试全绿（已完成） |
 | P1 | v0.2 ✅ | **可对话 MVP**：接真实 LLM + 工具调用闭环 | 出口判据已达成：真实 API key 端到端冒烟通过（`tests/manual/chat-smoke.md`） |
-| P2 | v0.3 | **安全纵深**：OS 沙箱 + 网络代理 + 人工审批 | 外部命令全部经受限进程池执行；默认断网 |
+| P2 | v0.3 ✅ | **安全纵深**：OS 沙箱 + 网络代理 + 人工审批 | 出口判据已由 TASK-206 端到端测试证明，并经人类守护者确认 |
 | P3 | v0.4 | **上下文工程**：压缩/spill/token 计量 | 长会话不触顶；溢出自动恢复有测试 |
 | P4 | v0.5 | **会话产品化**：resume/fork/投影存储 | 断点续聊；fork 分支独立演化 |
 | P5 | v0.6+ | **扩展生态**：MCP/skill/hooks/Web UI | 第三方工具经 MCP 接入 |
@@ -73,7 +73,7 @@
 
 | 任务卡 | 目标 crate | 核心内容 | 关键验收 |
 |---|---|---|---|
-| TASK-301 | context | TokenMeter：以 provider usage 为锚，启发式兜底 | usage 缺失时降级路径测试 |
+| TASK-301 ✅（commit `ccbc6d8`） | context | TokenMeter：以 provider usage 为锚，启发式兜底 | usage 缺失时降级路径测试 |
 | TASK-302 | context+agent-loop | 两段式压缩：ToolResultPruner → LLM 摘要替换区间 | **配对完整性属性测试**（随机裁剪不拆对） |
 | TASK-303 | agent-loop | 溢出强制压缩后自动重试（填现有 TODO 挂点） | 注入 ContextWindowExceeded 后观察压缩事件+成功重试 |
 | TASK-304 | session | spill：超长工具结果全文落盘，事件中只存预览+locator | 取回句柄 roundtrip 测试 |
