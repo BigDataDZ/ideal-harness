@@ -3,7 +3,7 @@
 
 mod compaction;
 
-pub use compaction::HistoryCompaction;
+pub use compaction::{HistoryCompaction, OverflowRecovery};
 
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use session::JsonlSession;
@@ -64,6 +64,7 @@ struct ChatTurnConfig<'a> {
     tool_definitions: Option<&'a serde_json::Value>,
     max_tool_rounds: u32,
     external_events: Option<&'a dyn Fn() -> Vec<Event>>,
+    overflow_recovery: Option<OverflowRecovery<'a>>,
 }
 
 pub struct AgentLoop<'a> {
@@ -85,6 +86,8 @@ pub struct AgentLoop<'a> {
     pub chat_history: Vec<ChatMessage>,
     /// 代理等进程边界组件产生的事件，由主循环在模型调用后按序吸收入会话。
     pub external_events: Option<&'a dyn Fn() -> Vec<Event>>,
+    /// TASK-303：窗口溢出时的强制压缩与有限自动重试配置。
+    pub overflow_recovery: Option<OverflowRecovery<'a>>,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -105,6 +108,7 @@ impl<'a> AgentLoop<'a> {
             max_tool_rounds: 8,
             chat_history: Vec::new(),
             external_events: None,
+            overflow_recovery: None,
         }
     }
 
@@ -127,6 +131,7 @@ impl<'a> AgentLoop<'a> {
             max_tool_rounds: 8,
             chat_history: Vec::new(),
             external_events: None,
+            overflow_recovery: None,
         }
     }
 
@@ -158,6 +163,7 @@ impl<'a> AgentLoop<'a> {
                         tool_definitions: self.tool_definitions.as_ref(),
                         max_tool_rounds: self.max_tool_rounds,
                         external_events: self.external_events,
+                        overflow_recovery: self.overflow_recovery,
                     },
                     &mut self.chat_history,
                     turn_id,
@@ -174,11 +180,6 @@ impl<'a> AgentLoop<'a> {
             };
             match result {
                 Ok(()) => completed += 1,
-                Err(e) if e.code == ErrorCode::ContextWindowExceeded => {
-                    // TODO(context): 接入强制压缩后自动重试（P4 双触发之二）
-                    self.abort(turn_id, e.message);
-                    return completed;
-                }
                 Err(e) => {
                     self.abort(turn_id, e.message);
                     return completed;
@@ -213,13 +214,37 @@ impl<'a> AgentLoop<'a> {
         history.push(ChatMessage::user(user_text));
 
         for _round in 0..cfg.max_tool_rounds {
-            let reply = chat.stream_chat(cfg.spec, history, cfg.tool_definitions);
-            if let Some(source) = cfg.external_events {
-                for event in source() {
-                    session.append(event).ok();
+            let mut overflow_retries = 0;
+            let reply = loop {
+                let reply = chat.stream_chat(cfg.spec, history, cfg.tool_definitions);
+                if let Some(source) = cfg.external_events {
+                    for event in source() {
+                        session.append(event).ok();
+                    }
                 }
-            }
-            let reply = reply?;
+                match reply {
+                    Err(error) if error.code == ErrorCode::ContextWindowExceeded => {
+                        let Some(recovery) = cfg.overflow_recovery else {
+                            return Err(error);
+                        };
+                        if overflow_retries >= recovery.max_retries {
+                            return Err(error);
+                        }
+                        if compaction::compact_history(
+                            session,
+                            history,
+                            recovery.compactor,
+                            recovery.summarizer,
+                        )?
+                        .is_none()
+                        {
+                            return Err(error);
+                        }
+                        overflow_retries += 1;
+                    }
+                    other => break other?,
+                }
+            };
 
             if !reply.text.is_empty() {
                 session
