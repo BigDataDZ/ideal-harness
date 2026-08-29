@@ -14,7 +14,8 @@
 | P2 | v0.3 ✅ | **安全纵深**：OS 沙箱 + 网络代理 + 人工审批 | 出口判据已由 TASK-206 端到端测试证明，并经人类守护者确认 |
 | P3 | v0.4 ✅ | **上下文工程**：压缩/spill/token 计量 | 长会话不触顶；溢出自动恢复有测试 |
 | P4 | v0.5 ✅ | **会话产品化**：resume/fork/投影存储 | 断点续聊；fork 分支独立演化 |
-| P5 | v0.6+ | **扩展生态**：MCP/skill/hooks/Web UI | 第三方工具经 MCP 接入 |
+| P4.1 | v0.5.1 | **可靠性收口**：统一存储、崩溃恢复、subagent 治理 | 压缩会话可恢复；子代理资源与权限不越界 |
+| P5 | v0.6 | **扩展生态**：MCP/skill/hooks/Web 投影 | 第三方工具可控接入；客户端断线可按 seq 补洞 |
 
 并行规则：**同一阶段内不同 crate 的任务卡可由多个智能体并行认领；涉及 protocol 的任务串行**（契约冻结原则）。
 
@@ -87,16 +88,85 @@
 | TASK-403 ✅（commit `a7b79d2`） | session | zstd 帧压缩（可选依赖，任务卡批准后引入） | 新旧格式互读迁移测试 |
 | TASK-404 ✅（commit `4395c97`） | agent-loop(子模块) | 进程内 subagent 骨架 + report 回传事件 | 子代理失败不污染父会话 |
 
-## 六、P5 扩展生态（v0.6+，方向性）
+## 六、P4.1 可靠性收口（v0.5.1）
 
-- MCP client：第三方工具经 stdio 接入 ToolRegistry（TASK-501）
-- Skill 目录发现：`.harness/skills` YAML frontmatter + 热重载（TASK-502）
-- Hook 生命周期点：pre/post_tool_use 最小集（TASK-503）
-- Web 投影客户端：RPC+SSE，UI 零业务逻辑（TASK-504）
+### TASK-405: 统一 SessionStore 抽象
+- 目标 crate: session、agent-loop、harness-cli
+- 内容: 以对象安全接口统一 append/len/path；JsonlSession、zstd 会话与投影编排实现同一抽象；主循环和 CLI 不再硬绑定 JsonlSession
+- 验收标准: 同一 AgentLoop 测试分别在 JSONL 与内存测试存储运行；CLI 恢复路径经统一 replay 入口；默认 feature 与 zstd feature 均编译
+- 明确不做: 不改 protocol；不引入异步运行时；不改变现有 JSONL 线上格式
+
+### TASK-406: 可恢复的 zstd 帧写入
+- 目标 crate: session
+- 内容: 增加存储 header/格式版本、带校验帧、批量 append、sync durability、失败回滚及撕裂尾部恢复
+- 验收标准: 注入半帧/坏 checksum/同步失败；只修复未提交尾部，提交前缀损坏必须拒绝；旧 TASK-403 文件仍可迁移读取
+- 明确不做: 不过滤或重编号 Event；不把 SQLite 变成真相源；仅使用任务卡已批准的 zstd 依赖
+
+### TASK-407: SQLite 增量投影与水位
+- 目标 crate: session
+- 内容: 投影记录 source watermark 与 schema version；打开时只补齐缺失后缀，检测缺口/冲突后由 JSONL 原子重建
+- 验收标准: 长日志 reopen 不全表重写；模拟 JSONL 领先、SQLite 领先和中间缺口；查询始终与 replay 一致
+- 明确不做: 不在 SQLite 接受独立业务写入；不改变 Event 契约
+
+### TASK-408: 会话 timeline 与非破坏性 revert
+- 目标 crate: session、harness-cli
+- 内容: 从事件流派生 turn 边界索引；提供分页 timeline；revert 默认 fork 到指定 turn 之前而不改源会话
+- 验收标准: 多 turn 分页无重无漏；revert 后源/目标独立追加；非法 turn/cursor fail-closed
+- 明确不做: 不回滚工作区文件；不原地截断源日志；不新增 UI
+
+### TASK-409: subagent 资源与选择策略
+- 目标 crate: agent-loop
+- 内容: 最大深度/并发、turn/token 预算、允许模型与工具 allow/deny；所有限制在运行器调用前检查
+- 验收标准: 每种超限均返回稳定 ErrorCode 并形成完整父事件对；拒绝时 runner 零调用；子策略不得扩大父策略
+- 明确不做: 不并行执行；不新增模型 provider；不改沙箱抽象
+
+### TASK-410: subagent 生命周期、lineage 与 report 投递
+- 目标 crate: protocol ⚠️串行、agent-loop、session
+- 内容: 增加向后兼容的子代理生命周期/报告事件；父取消传播；记录 parent/child lineage；支持 next-step 与 quiet 报告投递
+- 验收标准: 成功/失败/取消均有闭合事件序列；quiet 不唤醒父 inbox；next-step 仅在边界唤醒；旧 JSONL 可重放
+- 明确不做: 不做跨进程 agent；不允许子代理继承外的权限；不删除现有事件变体
+
+### TASK-411: 严格 Agent Role 配置
+- 目标 crate: agent-loop
+- 内容: 定义角色描述、instructions、模型与工具约束；未知字段/空字段/重复昵称拒绝；角色覆盖不得扩大父策略
+- 验收标准: 内置与用户角色解析测试；恶意/未知配置 fail-closed；角色能生成确定性的子任务配置
+- 明确不做: 不引入 TOML/YAML 外部依赖；不实现远端角色市场
+
+### TASK-412: 场景级事件轨迹快照
+- 目标 crate: session、agent-loop、harness-cli（tests only）
+- 内容: 建立无第三方快照依赖的 canonical JSONL 场景夹具，覆盖 resume/fork/zstd/SQLite/subagent 组合
+- 验收标准: 至少 6 条端到端轨迹；差异输出可读；Windows 路径与并发端口不影响结果
+- 明确不做: 不替代单元测试；不录制真实 API key/网络响应；不自动更新期望值
+
+## 七、P5 扩展生态（v0.6）
+
+### TASK-501: stdio MCP client 最小闭环
+- 目标 crate: tools、agent-loop
+- 内容: stdio JSON-RPC 初始化/工具发现/调用；工具来源与每工具输出上限；结果复用现有 spill 与审批审计
+- 验收标准: fixture server 完成发现与调用；超限输出被裁剪并可取回；协议错误/子进程退出 fail-closed 且不留未配对调用
+- 明确不做: 不做 HTTP MCP/OAuth；不引入异步运行时；不信任服务端 message 做控制流
+
+### TASK-502: 可信 Skill 目录发现
+- 目标 crate: tools
+- 内容: 发现 `.harness/skills/*/SKILL.md`；解析受限 YAML frontmatter；可信根 canonical 校验、指纹刷新与确定性目录
+- 验收标准: 新增/修改/删除可刷新；遍历/软链接逃逸/重复名称拒绝；子代理只能继承父级已验证 skill
+- 明确不做: 不引入 YAML 依赖；不执行 skill 内任意代码；不做远端下载
+
+### TASK-503: Hook 生命周期最小集
+- 目标 crate: agent-loop
+- 内容: pre/post_tool_use、turn_completed/failed/interrupted、subagent_stopped；Hook 结果留 Event，安全 Hook 缺席或失败时 fail-closed
+- 验收标准: 正常/工具失败/turn 中断/子代理取消均按序触发；Hook 不得递归触发自身；失败不会拆散工具配对
+- 明确不做: 不执行 shell hook；不做第三方插件加载；不允许 Hook 直接写 session
+
+### TASK-504: 只读 RPC+SSE 会话投影
+- 目标 crate: protocol ⚠️串行、harness-cli
+- 内容: loopback-only 只读服务，提供 session timeline 查询与按 seq SSE 补洞；所有线上 DTO 定义在 protocol
+- 验收标准: 非 loopback 绑定拒绝；断线重连从 last_seq 无重无漏；坏 cursor/未知 session fail-closed；客户端不持有第二真相源
+- 明确不做: 不做完整 Web UI、认证、多用户、远程写操作或公网监听
 
 ---
 
-## 七、质量门禁演进（随阶段收紧）
+## 八、质量门禁演进（随阶段收紧）
 
 | 门禁 | P0 现在 | P1 起 | P2 起 | P3 起 |
 |---|---|---|---|---|
@@ -106,14 +176,14 @@
 | 属性测试 | — | — | — | 配对完整性必须 |
 | 审计事件覆盖 | — | — | 网络拒绝必须落事件 | 自动压缩必须落事件 |
 
-## 八、规范自身的演进规则
+## 九、规范自身的演进规则
 
 1. 改 `DEVELOPMENT.md`/`AGENTS.md` 的 PR 必须在标题加 `[spec]` 前缀，人工 review
 2. 新 crate 入册：PR 同时更新所有权地图（AGENTS.md §1）与本文档依赖图
 3. 任务卡完成后：在本文件对应卡片打 ✅ 并附 PR 链接，禁止删除历史卡片
 4. 阶段出口评审：人类守护者按「出口判据」逐条打勾后才开下一阶段的卡
 
-## 九、给协调者的并行调度建议
+## 十、给协调者的并行调度建议
 
 - **可并行组**：{102, 104} 与 {201} 与 {403} 互不触碰
 - **串行链**：101 → 103 → 303（协议→闭环→自愈，一条线一个人/代理跟到底）

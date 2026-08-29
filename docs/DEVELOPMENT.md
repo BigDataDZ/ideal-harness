@@ -116,5 +116,5 @@
 | TASK-101~104 | protocol/model-provider/agent-loop/cli | P1 可对话 MVP | 见 ROADMAP |
 | TASK-201~205 | tools/sandbox-exec/network-proxy/approval | P2 安全纵深 | 见 ROADMAP |
 | TASK-301~304 | context/session/agent-loop | P3 上下文工程 | 见 ROADMAP |
-| TASK-401~404 | harness-cli/session/agent-loop | P4 会话产品化 | 见 ROADMAP |
-| TASK-501+ | 待建 | P5 扩展生态 | 方向性 |
+| TASK-401~412 | harness-cli/session/agent-loop/protocol | P4/P4.1 会话产品化与可靠性收口 | 见 ROADMAP |
+| TASK-501~504 | tools/agent-loop/protocol/harness-cli | P5 扩展生态 | 见 ROADMAP |
