@@ -140,7 +140,7 @@
 
 ## 七、P5 扩展生态（v0.6）
 
-### TASK-501: stdio MCP client 最小闭环
+### TASK-501: stdio MCP client 最小闭环 ✅（commit `f28bac7`）
 - 目标 crate: tools、agent-loop
 - 内容: stdio JSON-RPC 初始化/工具发现/调用；工具来源与每工具输出上限；结果复用现有 spill 与审批审计
 - 验收标准: fixture server 完成发现与调用；超限输出被裁剪并可取回；协议错误/子进程退出 fail-closed 且不留未配对调用
