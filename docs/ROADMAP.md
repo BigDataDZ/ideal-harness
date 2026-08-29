@@ -152,7 +152,7 @@
 - 验收标准: 新增/修改/删除可刷新；遍历/软链接逃逸/重复名称拒绝；子代理只能继承父级已验证 skill
 - 明确不做: 不引入 YAML 依赖；不执行 skill 内任意代码；不做远端下载
 
-### TASK-503: Hook 生命周期最小集
+### TASK-503: Hook 生命周期最小集 ✅（commit `6904645`）
 - 目标 crate: agent-loop
 - 内容: pre/post_tool_use、turn_completed/failed/interrupted、subagent_stopped；Hook 结果留 Event，安全 Hook 缺席或失败时 fail-closed
 - 验收标准: 正常/工具失败/turn 中断/子代理取消均按序触发；Hook 不得递归触发自身；失败不会拆散工具配对
