@@ -126,7 +126,7 @@
 - 验收标准: 成功/失败/取消均有闭合事件序列；quiet 不唤醒父 inbox；next-step 仅在边界唤醒；旧 JSONL 可重放
 - 明确不做: 不做跨进程 agent；不允许子代理继承外的权限；不删除现有事件变体
 
-### TASK-411: 严格 Agent Role 配置
+### TASK-411: 严格 Agent Role 配置 ✅（commit `680a034`）
 - 目标 crate: agent-loop
 - 内容: 定义角色描述、instructions、模型与工具约束；未知字段/空字段/重复昵称拒绝；角色覆盖不得扩大父策略
 - 验收标准: 内置与用户角色解析测试；恶意/未知配置 fail-closed；角色能生成确定性的子任务配置
