@@ -14,10 +14,12 @@ use sandbox_policy::{SandboxMode, SandboxPolicy};
 use session::{replay_session, JsonlSession, SessionStore};
 use tools::{EscalationAvailability, ToolRegistry, ToolSpec};
 
+mod readonly_server;
 #[cfg(test)]
 mod scenario_snapshots;
 mod security;
 mod session_commands;
+use readonly_server::cmd_serve;
 use security::{register_exec_tool, ProviderProxy};
 use session_commands::{cmd_fork, cmd_resume, cmd_revert, cmd_timeline};
 
@@ -29,6 +31,7 @@ fn main() -> anyhow::Result<()> {
         Some("fork") => cmd_fork(&args[1..]),
         Some("timeline") => cmd_timeline(&args[1..]),
         Some("revert") => cmd_revert(&args[1..]),
+        Some("serve") => cmd_serve(&args[1..]),
         _ => demo(),
     }
 }
