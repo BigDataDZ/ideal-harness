@@ -5,4 +5,5 @@ edition.workspace = true
 
 [dependencies]
 serde_json = { workspace = true }
+rusqlite = { workspace = true }
 protocol = { workspace = true }
