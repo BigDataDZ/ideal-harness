@@ -1,7 +1,7 @@
 //! P4/TASK-401：显式 resume / fork 会话命令。
 
 use crate::{cmd_chat, parse_chat_args, ChatArgs};
-use session::{fork as session_fork, replay};
+use session::{fork as session_fork, replay_session};
 use std::path::PathBuf;
 
 pub(crate) fn cmd_resume(args: &[String]) -> anyhow::Result<()> {
@@ -17,7 +17,7 @@ fn parse_resume_args(args: &[String]) -> anyhow::Result<ChatArgs> {
     if !config.session.is_file() {
         anyhow::bail!("待恢复会话不存在：{}", config.session.display());
     }
-    replay(&config.session)?;
+    replay_session(&config.session)?;
     Ok(config)
 }
 
@@ -77,7 +77,7 @@ pub(crate) fn cmd_fork(args: &[String]) -> anyhow::Result<()> {
     if config.target.exists() {
         anyhow::bail!("目标会话已存在，拒绝覆盖：{}", config.target.display());
     }
-    let source_events = replay(&config.source)?;
+    let source_events = replay_session(&config.source)?;
     let boundary = config.boundary.unwrap_or(source_events.len());
     if boundary > source_events.len() {
         anyhow::bail!(
@@ -165,13 +165,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            replay(&source).unwrap().last().unwrap().event,
+            replay_session(&source).unwrap().last().unwrap().event,
             Event::UserMessage {
                 text: "parent".into()
             }
         );
         assert_eq!(
-            replay(&target).unwrap().last().unwrap().event,
+            replay_session(&target).unwrap().last().unwrap().event,
             Event::UserMessage {
                 text: "child".into()
             }

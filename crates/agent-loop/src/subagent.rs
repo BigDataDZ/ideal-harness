@@ -1,7 +1,7 @@
 //! P3 / TASK-404：进程内子代理骨架；内部 trace 隔离，父会话只接收最终报告。
 
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
-use session::JsonlSession;
+use session::SessionStore;
 
 const SUBAGENT_TOOL: &str = "subagent";
 
@@ -72,7 +72,7 @@ pub trait SubagentRunner {
 }
 
 pub(crate) fn run(
-    parent: &mut JsonlSession,
+    parent: &mut dyn SessionStore,
     task: &SubagentTask,
     runner: &dyn SubagentRunner,
 ) -> Result<SubagentReport, ErrorEnvelope> {
@@ -126,7 +126,7 @@ pub(crate) fn run(
     }
 }
 
-fn append_parent_event(parent: &mut JsonlSession, event: Event) -> Result<(), ErrorEnvelope> {
+fn append_parent_event(parent: &mut dyn SessionStore, event: Event) -> Result<(), ErrorEnvelope> {
     parent.append(event).map(|_| ()).map_err(|error| {
         ErrorEnvelope::new(
             ErrorCode::Internal,
@@ -140,6 +140,7 @@ mod tests {
     use super::*;
     use crate::{AgentLoop, ModelProvider};
     use protocol::SequencedEvent;
+    use session::JsonlSession;
     use std::path::{Path, PathBuf};
     use tools::ToolRegistry;
 

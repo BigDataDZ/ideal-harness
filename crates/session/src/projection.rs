@@ -1,6 +1,6 @@
 //! P5 / D10：SQLite 只做 JSONL 事件流的可重建投影。
 
-use crate::{replay, JsonlSession};
+use crate::{replay, JsonlSession, SessionStore};
 use protocol::{Event, SequencedEvent};
 use rusqlite::{params, Connection, Transaction};
 use std::io;
@@ -112,6 +112,20 @@ impl ProjectedSession {
 
     pub fn source_path(&self) -> &Path {
         self.source.path()
+    }
+}
+
+impl SessionStore for ProjectedSession {
+    fn append(&mut self, event: Event) -> io::Result<SequencedEvent> {
+        ProjectedSession::append(self, event)
+    }
+
+    fn len(&self) -> u64 {
+        self.source.len()
+    }
+
+    fn path(&self) -> &Path {
+        self.source_path()
     }
 }
 

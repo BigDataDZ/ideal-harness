@@ -8,7 +8,7 @@ pub use compaction::{HistoryCompaction, OverflowRecovery};
 pub use subagent::{SubagentReport, SubagentRunner, SubagentTask, SubagentTrace};
 
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
-use session::JsonlSession;
+use session::SessionStore;
 use tools::{ToolAudit, ToolExecution, ToolRegistry};
 
 use model_provider::ChatMessage;
@@ -72,7 +72,7 @@ struct ChatTurnConfig<'a> {
 pub struct AgentLoop<'a> {
     pub phase: Phase,
     pub inbox: Inbox,
-    pub session: &'a mut JsonlSession,
+    pub session: &'a mut dyn SessionStore,
     pub tools: &'a ToolRegistry,
     pub model: &'a dyn ModelProvider,
     /// TASK-103：真实模型路径（工具调用闭环）。与 `call_spec` 同时就位时启用。
@@ -94,7 +94,7 @@ pub struct AgentLoop<'a> {
 
 impl<'a> AgentLoop<'a> {
     pub fn new(
-        session: &'a mut JsonlSession,
+        session: &'a mut dyn SessionStore,
         tools: &'a ToolRegistry,
         model: &'a dyn ModelProvider,
     ) -> Self {
@@ -116,7 +116,7 @@ impl<'a> AgentLoop<'a> {
 
     /// TASK-103：接入真实模型（工具调用闭环路径）。
     pub fn with_chat(
-        session: &'a mut JsonlSession,
+        session: &'a mut dyn SessionStore,
         tools: &'a ToolRegistry,
         chat: &'a dyn ChatModel,
         call_spec: ModelCallSpec,
@@ -208,7 +208,7 @@ impl<'a> AgentLoop<'a> {
     /// 一切自动行为落 Event（红线 5）：ModelChunkReceived / ToolCallRequested /
     /// ToolResultAdded / AssistantMessage，tool_call 与 result 严格配对（红线 4）。
     fn run_chat_turn(
-        session: &mut JsonlSession,
+        session: &mut dyn SessionStore,
         registry: &ToolRegistry,
         chat: &dyn ChatModel,
         cfg: &ChatTurnConfig<'_>,
@@ -392,6 +392,39 @@ mod tests {
         session::replay(path).unwrap()
     }
 
+    struct MemorySession {
+        path: PathBuf,
+        events: Vec<SequencedEvent>,
+    }
+
+    impl MemorySession {
+        fn new() -> Self {
+            Self {
+                path: PathBuf::from("memory://agent-loop"),
+                events: Vec::new(),
+            }
+        }
+    }
+
+    impl SessionStore for MemorySession {
+        fn append(&mut self, event: Event) -> std::io::Result<SequencedEvent> {
+            let sequenced = SequencedEvent {
+                seq: self.events.len() as u64,
+                event,
+            };
+            self.events.push(sequenced.clone());
+            Ok(sequenced)
+        }
+
+        fn len(&self) -> u64 {
+            self.events.len() as u64
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
     #[test]
     fn happy_turn_appends_full_lifecycle() {
         let path = tmp("happy.jsonl");
@@ -411,6 +444,23 @@ mod tests {
             Event::TurnCompleted { turn_id: 0 }
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn happy_turn_uses_the_same_loop_with_an_in_memory_store() {
+        let mut memory = MemorySession::new();
+        let reg = ToolRegistry::default();
+        let mut lp = AgentLoop::new(&mut memory, &reg, &Echo);
+        lp.inbox.push("你好");
+        assert_eq!(lp.run_turn(), 1);
+        assert_eq!(lp.phase, Phase::Idle);
+        drop(lp);
+
+        assert_eq!(memory.events.len(), 4);
+        assert_eq!(
+            memory.events.last().unwrap().event,
+            Event::TurnCompleted { turn_id: 0 }
+        );
     }
 
     #[test]

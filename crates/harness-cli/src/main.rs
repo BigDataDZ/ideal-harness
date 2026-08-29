@@ -11,7 +11,7 @@ use model_provider::{ChatMessage, OpenAiCompatClient};
 use protocol::{ErrorEnvelope, Event, ModelCallSpec, ToolOutcome};
 use sandbox_exec::PlatformRestrictedBackend;
 use sandbox_policy::{SandboxMode, SandboxPolicy};
-use session::{replay as session_replay, JsonlSession};
+use session::{replay_session, JsonlSession, SessionStore};
 use tools::{EscalationAvailability, ToolRegistry, ToolSpec};
 
 mod security;
@@ -160,7 +160,7 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         let before = lp.session.len();
         lp.run_turn();
         // 一切留痕（红线 5）：把本 turn 新增事件投影到终端。
-        for se in session_replay(lp.session.path())?
+        for se in replay_session(lp.session.path())?
             .into_iter()
             .skip(before as usize)
         {
@@ -243,8 +243,8 @@ fn openai_tools_json(
 
 /// 事件溯源原生的中断恢复：悬空 turn（有 Started、无 Completed/Aborted）
 /// 补记 TurnAborted——Ctrl+C 硬退出的下次启动自动收口（红线 5：一切留痕）。
-fn recover_dangling_turn(session: &mut JsonlSession) -> anyhow::Result<bool> {
-    let events = session_replay(session.path())?;
+fn recover_dangling_turn(session: &mut dyn SessionStore) -> anyhow::Result<bool> {
+    let events = replay_session(session.path())?;
     let Some(last_start) = events.iter().rev().find_map(|se| match se.event {
         Event::TurnStarted { turn_id } => Some(turn_id),
         _ => None,
@@ -272,7 +272,7 @@ fn recover_dangling_turn(session: &mut JsonlSession) -> anyhow::Result<bool> {
 /// 工具调用中间态由该 turn 的最终 assistant 文本概括（MVP 语义，P3 压缩接管）。
 fn rebuild_history(path: &Path) -> anyhow::Result<Vec<ChatMessage>> {
     let mut out = Vec::new();
-    for se in session_replay(path)? {
+    for se in replay_session(path)? {
         match se.event {
             Event::UserMessage { text } => out.push(ChatMessage::user(text)),
             Event::AssistantMessage { text } if !text.is_empty() => {
@@ -331,7 +331,7 @@ fn demo() -> anyhow::Result<()> {
     println!("turn completed exchanges = {n}");
 
     println!("---- 事件流回放 ----");
-    for se in session_replay(&path)? {
+    for se in replay_session(&path)? {
         println!("{:>3}  {}", se.seq, serde_json::to_string(&se.event)?);
     }
     Ok(())
@@ -380,7 +380,7 @@ mod tests {
             recover_dangling_turn(&mut js).unwrap(),
             "悬空 turn 必须被补记"
         );
-        let evs = session_replay(&path).unwrap();
+        let evs = replay_session(&path).unwrap();
         match &evs.last().unwrap().event {
             Event::TurnAborted { turn_id, reason } => {
                 assert_eq!(*turn_id, 0);

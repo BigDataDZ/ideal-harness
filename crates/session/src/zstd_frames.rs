@@ -1,6 +1,6 @@
 //! P5 / D10：每条事件独立 zstd 帧，保留 append-only 与坏数据即报错语义。
 
-use crate::replay;
+use crate::{replay, SessionStore};
 use protocol::{Event, SequencedEvent};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
@@ -57,6 +57,20 @@ impl ZstdSession {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl SessionStore for ZstdSession {
+    fn append(&mut self, event: Event) -> io::Result<SequencedEvent> {
+        ZstdSession::append(self, event)
+    }
+
+    fn len(&self) -> u64 {
+        ZstdSession::len(self)
+    }
+
+    fn path(&self) -> &Path {
+        ZstdSession::path(self)
     }
 }
 
@@ -203,6 +217,7 @@ mod tests {
             .unwrap();
         assert_eq!(event.seq, 2);
         assert_eq!(replay_zstd(&path).unwrap().len(), 3);
+        assert_eq!(crate::replay_session(&path).unwrap().len(), 3);
         remove(&[&path]);
     }
 

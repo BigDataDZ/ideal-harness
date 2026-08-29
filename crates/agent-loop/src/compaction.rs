@@ -48,7 +48,7 @@ impl AgentLoop<'_> {
 }
 
 pub(crate) fn compact_history(
-    session: &mut session::JsonlSession,
+    session: &mut dyn session::SessionStore,
     history: &mut Vec<ChatMessage>,
     compactor: &TwoStageCompactor,
     summarizer: &dyn SummaryProvider,

@@ -16,6 +16,19 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+/// 会话真相源的最小对象安全接口（TASK-405）。
+///
+/// AgentLoop 只依赖追加、序号和物理定位，不感知 JSONL/zstd/投影实现。
+pub trait SessionStore {
+    fn append(&mut self, event: Event) -> std::io::Result<SequencedEvent>;
+    fn len(&self) -> u64;
+    fn path(&self) -> &Path;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// 追加式会话日志。
 pub struct JsonlSession {
     path: PathBuf,
@@ -57,6 +70,20 @@ impl JsonlSession {
     }
 }
 
+impl SessionStore for JsonlSession {
+    fn append(&mut self, event: Event) -> std::io::Result<SequencedEvent> {
+        JsonlSession::append(self, event)
+    }
+
+    fn len(&self) -> u64 {
+        JsonlSession::len(self)
+    }
+
+    fn path(&self) -> &Path {
+        JsonlSession::path(self)
+    }
+}
+
 /// 重放：从磁盘读回全部有序事件。坏行立即报错（不静默跳过——审计优先）。
 pub fn replay(path: &Path) -> std::io::Result<Vec<SequencedEvent>> {
     if !path.exists() {
@@ -74,9 +101,21 @@ pub fn replay(path: &Path) -> std::io::Result<Vec<SequencedEvent>> {
     Ok(out)
 }
 
+/// 统一重放入口：启用 zstd feature 时自动识别压缩格式，否则读取传统 JSONL。
+#[cfg(feature = "zstd")]
+pub fn replay_session(path: &Path) -> std::io::Result<Vec<SequencedEvent>> {
+    replay_auto(path)
+}
+
+/// 统一重放入口的无压缩构建版本。
+#[cfg(not(feature = "zstd"))]
+pub fn replay_session(path: &Path) -> std::io::Result<Vec<SequencedEvent>> {
+    replay(path)
+}
+
 /// fork（P5）：把源会话前 boundary 个事件复制为种子。
 pub fn fork(source: &Path, target: PathBuf, boundary: usize) -> std::io::Result<JsonlSession> {
-    let events = replay(source)?;
+    let events = replay_session(source)?;
     let mut child = JsonlSession::create(target)?;
     for se in events.into_iter().take(boundary) {
         child.append(se.event)?;
@@ -101,7 +140,7 @@ mod tests {
         s.append(Event::TurnStarted { turn_id: 1 }).unwrap();
         s.append(Event::UserMessage { text: "hi".into() }).unwrap();
 
-        let events = replay(&path).unwrap();
+        let events = replay_session(&path).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].seq, 0);
         assert_eq!(events[1].seq, 1);
