@@ -14,6 +14,8 @@ use sandbox_policy::{SandboxMode, SandboxPolicy};
 use session::{replay_session, JsonlSession, SessionStore};
 use tools::{EscalationAvailability, ToolRegistry, ToolSpec};
 
+#[cfg(test)]
+mod scenario_snapshots;
 mod security;
 mod session_commands;
 use security::{register_exec_tool, ProviderProxy};

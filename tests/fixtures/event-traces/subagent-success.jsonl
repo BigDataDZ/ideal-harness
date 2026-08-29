@@ -1,0 +1,5 @@
+{"seq":0,"event":{"type":"tool_call_requested","call_id":"task-ok","tool":"subagent","args":{"active_children":0,"child_id":"child-ok","depth":1,"model":null,"parent_id":"root","prompt":"work","token_budget":8192,"tools":[],"turn_budget":8}}}
+{"seq":1,"event":{"type":"subagent_started","task_id":"task-ok","parent_id":"root","child_id":"child-ok"}}
+{"seq":2,"event":{"type":"subagent_report_delivered","task_id":"task-ok","child_id":"child-ok","delivery":"quiet","text":"report"}}
+{"seq":3,"event":{"type":"subagent_stopped","task_id":"task-ok","child_id":"child-ok","outcome":"succeeded"}}
+{"seq":4,"event":{"type":"tool_result_added","call_id":"task-ok","outcome":{"success":{"value":{"child_event_count":1,"kind":"subagent_report","task_id":"task-ok","text":"report"}}}}}

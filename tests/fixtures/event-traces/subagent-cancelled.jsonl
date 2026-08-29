@@ -1,0 +1,5 @@
+{"seq":0,"event":{"type":"tool_call_requested","call_id":"task-cancel","tool":"subagent","args":{"active_children":0,"child_id":"child-cancel","depth":1,"model":null,"parent_id":"root","prompt":"work","token_budget":8192,"tools":[],"turn_budget":8}}}
+{"seq":1,"event":{"type":"subagent_started","task_id":"task-cancel","parent_id":"root","child_id":"child-cancel"}}
+{"seq":2,"event":{"type":"subagent_cancellation_requested","task_id":"task-cancel","child_id":"child-cancel","reason":"parent stopped"}}
+{"seq":3,"event":{"type":"subagent_stopped","task_id":"task-cancel","child_id":"child-cancel","outcome":"cancelled"}}
+{"seq":4,"event":{"type":"tool_result_added","call_id":"task-cancel","outcome":{"failure":{"error":{"code":"subagent_cancelled","message":"subagent cancelled by parent"}}}}}
