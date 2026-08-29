@@ -3,7 +3,11 @@ name = "session"
 version.workspace = true
 edition.workspace = true
 
+[features]
+zstd = ["dep:zstd"]
+
 [dependencies]
 serde_json = { workspace = true }
 rusqlite = { workspace = true }
+zstd = { workspace = true, optional = true }
 protocol = { workspace = true }

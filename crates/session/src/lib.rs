@@ -3,9 +3,13 @@
 
 mod projection;
 mod spill;
+#[cfg(feature = "zstd")]
+mod zstd_frames;
 
 pub use projection::{ProjectedSession, SqliteProjection};
 pub use spill::{SpillLocator, SpillStore, StoredToolResult};
+#[cfg(feature = "zstd")]
+pub use zstd_frames::{migrate_session, replay_auto, replay_zstd, SessionEncoding, ZstdSession};
 
 use protocol::{Event, SequencedEvent};
 use std::fs::{File, OpenOptions};
