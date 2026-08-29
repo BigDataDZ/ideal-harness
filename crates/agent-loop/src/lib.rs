@@ -2,8 +2,10 @@
 //! 生产版把执行器换成 tokio 不改协议：事件流即契约。
 
 mod compaction;
+mod subagent;
 
 pub use compaction::{HistoryCompaction, OverflowRecovery};
+pub use subagent::{SubagentReport, SubagentRunner, SubagentTask, SubagentTrace};
 
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use session::JsonlSession;
@@ -133,6 +135,15 @@ impl<'a> AgentLoop<'a> {
             external_events: None,
             overflow_recovery: None,
         }
+    }
+
+    /// TASK-404：在进程内运行隔离子代理，只把最终 report 成对回传父事件流。
+    pub fn run_subagent(
+        &mut self,
+        task: &SubagentTask,
+        runner: &dyn SubagentRunner,
+    ) -> Result<SubagentReport, ErrorEnvelope> {
+        subagent::run(self.session, task, runner)
     }
 
     /// 一个 turn：drain inbox → 逐条采样 → 终结事件。
