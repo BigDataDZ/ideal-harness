@@ -90,7 +90,7 @@
 
 ## 六、P4.1 可靠性收口（v0.5.1）
 
-### TASK-405: 统一 SessionStore 抽象
+### TASK-405: 统一 SessionStore 抽象 ✅（commit `dbd8ca8`）
 - 目标 crate: session、agent-loop、harness-cli
 - 内容: 以对象安全接口统一 append/len/path；JsonlSession、zstd 会话与投影编排实现同一抽象；主循环和 CLI 不再硬绑定 JsonlSession
 - 验收标准: 同一 AgentLoop 测试分别在 JSONL 与内存测试存储运行；CLI 恢复路径经统一 replay 入口；默认 feature 与 zstd feature 均编译
