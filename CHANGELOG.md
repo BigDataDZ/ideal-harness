@@ -7,6 +7,8 @@
 
 ### Added
 
+- **protocol（TASK-504）**：新增只读会话 timeline、SSE event frame、查询参数与统一 RPC 错误 DTO，并增加 `SessionNotFound` / `CursorInvalid` 稳定错误码
+- **harness-cli（TASK-504）**：新增 loopback-only `serve` 子命令；按请求重放 JSONL 真相源，支持 timeline 分页与 `last_seq` SSE 无重无漏补洞；非本机监听、写方法、路径穿越、坏 cursor 和未知会话均 fail-closed
 - **protocol（TASK-203）**：新增 `NetworkAccessDenied` 稳定审计事件，记录被白名单代理拒绝的 host、port 与结构化原因
 - **network-proxy（TASK-203）**：默认断网的 HTTP CONNECT 白名单代理；provider 主机精确放行，拒绝与审计服务失败均 fail-closed
 

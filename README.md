@@ -6,16 +6,11 @@
 > 取其共识（事件溯源、ErrorCode 路由、OS 级沙箱），避其教训（巨石 core / 过度碎片化）。
 > 每个决策的对标记录见 [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md)。
 
-## 当前状态：可对话 MVP 已达成（v0.2）✅
+## 当前状态：路线图 P5 已完成 ✅
 
-✅ 已实现：协议层（含流式事件契约）/ 三档沙箱抽象 / fail-closed 审批 / 工具注册与调度 /
-JSONL 事件溯源（append/replay/fork）/ 状态机主循环 / 双触发压缩判定 /
-OpenAI 兼容流式模型客户端（故障注入测试）/ 工具调用闭环 / `ideal-harness chat` 多轮对话
-（会话持久化 + 崩溃恢复）——真实 API key 端到端冒烟通过（[记录](tests/manual/chat-smoke.md)）
-
-⏳ 进行中（P2 安全纵深）：受限执行进程池、网络白名单代理、人工审批通道
-
-测试基线：55 passed · CI：GitHub Actions（fmt / clippy -D warnings / test，Ubuntu + Windows 双平台）
+✅ 已实现：流式模型与工具闭环、三层沙箱与 fail-closed 审批、JSONL/zstd/SQLite 会话恢复、
+上下文压缩与 spill、subagent 生命周期与角色策略、stdio MCP、可信 Skill、可审计 Hook，
+以及 loopback-only 的只读 timeline RPC 与按事件序号补洞的 SSE 投影。
 
 ## 快速开始
 
@@ -29,7 +24,17 @@ cargo run -p harness-cli
 
 # 或直接使用编译产物（Windows）
 target\release\ideal-harness.exe
+
+# 启动只读会话投影；目录内会话名采用 <session-id>.jsonl
+cargo run -p harness-cli -- serve --root .\sessions --bind 127.0.0.1:8765
 ```
+
+只读接口：
+
+- `GET /v1/sessions/<id>/timeline?cursor=0&limit=20`
+- `GET /v1/sessions/<id>/events?last_seq=41`（SSE，仅返回 `seq > 41`）
+
+服务拒绝非 loopback 监听、写方法、非法会话 ID、未知会话和越界 cursor；每次查询均从会话事件日志重放，不维护第二真相源。
 
 要求：Rust 1.85+（edition 2021）。
 

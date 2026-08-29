@@ -14,8 +14,8 @@
 | P2 | v0.3 ✅ | **安全纵深**：OS 沙箱 + 网络代理 + 人工审批 | 出口判据已由 TASK-206 端到端测试证明，并经人类守护者确认 |
 | P3 | v0.4 ✅ | **上下文工程**：压缩/spill/token 计量 | 长会话不触顶；溢出自动恢复有测试 |
 | P4 | v0.5 ✅ | **会话产品化**：resume/fork/投影存储 | 断点续聊；fork 分支独立演化 |
-| P4.1 | v0.5.1 | **可靠性收口**：统一存储、崩溃恢复、subagent 治理 | 压缩会话可恢复；子代理资源与权限不越界 |
-| P5 | v0.6 | **扩展生态**：MCP/skill/hooks/Web 投影 | 第三方工具可控接入；客户端断线可按 seq 补洞 |
+| P4.1 | v0.5.1 ✅ | **可靠性收口**：统一存储、崩溃恢复、subagent 治理 | 压缩会话可恢复；子代理资源与权限不越界 |
+| P5 | v0.6 ✅ | **扩展生态**：MCP/skill/hooks/Web 投影 | 第三方工具可控接入；客户端断线可按 seq 补洞 |
 
 并行规则：**同一阶段内不同 crate 的任务卡可由多个智能体并行认领；涉及 protocol 的任务串行**（契约冻结原则）。
 
@@ -158,7 +158,7 @@
 - 验收标准: 正常/工具失败/turn 中断/子代理取消均按序触发；Hook 不得递归触发自身；失败不会拆散工具配对
 - 明确不做: 不执行 shell hook；不做第三方插件加载；不允许 Hook 直接写 session
 
-### TASK-504: 只读 RPC+SSE 会话投影
+### TASK-504: 只读 RPC+SSE 会话投影 ✅（commit `9a3df13`）
 - 目标 crate: protocol ⚠️串行、harness-cli
 - 内容: loopback-only 只读服务，提供 session timeline 查询与按 seq SSE 补洞；所有线上 DTO 定义在 protocol
 - 验收标准: 非 loopback 绑定拒绝；断线重连从 last_seq 无重无漏；坏 cursor/未知 session fail-closed；客户端不持有第二真相源
