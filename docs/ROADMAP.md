@@ -13,7 +13,7 @@
 | P1 | v0.2 ✅ | **可对话 MVP**：接真实 LLM + 工具调用闭环 | 出口判据已达成：真实 API key 端到端冒烟通过（`tests/manual/chat-smoke.md`） |
 | P2 | v0.3 ✅ | **安全纵深**：OS 沙箱 + 网络代理 + 人工审批 | 出口判据已由 TASK-206 端到端测试证明，并经人类守护者确认 |
 | P3 | v0.4 ✅ | **上下文工程**：压缩/spill/token 计量 | 长会话不触顶；溢出自动恢复有测试 |
-| P4 | v0.5 | **会话产品化**：resume/fork/投影存储 | 断点续聊；fork 分支独立演化 |
+| P4 | v0.5 ✅ | **会话产品化**：resume/fork/投影存储 | 断点续聊；fork 分支独立演化 |
 | P5 | v0.6+ | **扩展生态**：MCP/skill/hooks/Web UI | 第三方工具经 MCP 接入 |
 
 并行规则：**同一阶段内不同 crate 的任务卡可由多个智能体并行认领；涉及 protocol 的任务串行**（契约冻结原则）。
@@ -85,7 +85,7 @@
 | TASK-401 ✅（commit `e3e507b`） | harness-cli | `resume` / `fork` 子命令 | fork 后两会话独立追加互不影响 |
 | TASK-402 ✅（commit `d0f22f4`） | session | SQLite 投影 + write-behind 编排 | 投影查询与 JSONL 重放一致性测试 |
 | TASK-403 ✅（commit `a7b79d2`） | session | zstd 帧压缩（可选依赖，任务卡批准后引入） | 新旧格式互读迁移测试 |
-| TASK-404 | agent-loop(子模块) | 进程内 subagent 骨架 + report 回传事件 | 子代理失败不污染父会话 |
+| TASK-404 ✅（commit `4395c97`） | agent-loop(子模块) | 进程内 subagent 骨架 + report 回传事件 | 子代理失败不污染父会话 |
 
 ## 六、P5 扩展生态（v0.6+，方向性）
 
