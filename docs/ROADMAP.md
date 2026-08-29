@@ -108,7 +108,7 @@
 - 验收标准: 长日志 reopen 不全表重写；模拟 JSONL 领先、SQLite 领先和中间缺口；查询始终与 replay 一致
 - 明确不做: 不在 SQLite 接受独立业务写入；不改变 Event 契约
 
-### TASK-408: 会话 timeline 与非破坏性 revert
+### TASK-408: 会话 timeline 与非破坏性 revert ✅（commit `66ef6e5`）
 - 目标 crate: session、harness-cli
 - 内容: 从事件流派生 turn 边界索引；提供分页 timeline；revert 默认 fork 到指定 turn 之前而不改源会话
 - 验收标准: 多 turn 分页无重无漏；revert 后源/目标独立追加；非法 turn/cursor fail-closed
