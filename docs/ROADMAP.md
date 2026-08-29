@@ -96,7 +96,7 @@
 - 验收标准: 同一 AgentLoop 测试分别在 JSONL 与内存测试存储运行；CLI 恢复路径经统一 replay 入口；默认 feature 与 zstd feature 均编译
 - 明确不做: 不改 protocol；不引入异步运行时；不改变现有 JSONL 线上格式
 
-### TASK-406: 可恢复的 zstd 帧写入
+### TASK-406: 可恢复的 zstd 帧写入 ✅（commit `6317096`）
 - 目标 crate: session
 - 内容: 增加存储 header/格式版本、带校验帧、批量 append、sync durability、失败回滚及撕裂尾部恢复
 - 验收标准: 注入半帧/坏 checksum/同步失败；只修复未提交尾部，提交前缀损坏必须拒绝；旧 TASK-403 文件仍可迁移读取
