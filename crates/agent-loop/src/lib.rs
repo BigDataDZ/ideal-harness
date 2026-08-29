@@ -3,9 +3,11 @@
 
 mod compaction;
 mod subagent;
+mod subagent_policy;
 
 pub use compaction::{HistoryCompaction, OverflowRecovery};
 pub use subagent::{SubagentReport, SubagentRunner, SubagentTask, SubagentTrace};
+pub use subagent_policy::{SubagentPolicy, SubagentRequest};
 
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use session::SessionStore;
@@ -143,7 +145,28 @@ impl<'a> AgentLoop<'a> {
         task: &SubagentTask,
         runner: &dyn SubagentRunner,
     ) -> Result<SubagentReport, ErrorEnvelope> {
-        subagent::run(self.session, task, runner)
+        let policy = SubagentPolicy::local_default();
+        let request = SubagentRequest::local_default();
+        subagent::run(self.session, task, &request, &policy, &policy, runner)
+    }
+
+    /// TASK-409：在 runner 前应用父/子策略与本次资源请求。
+    pub fn run_subagent_with_policy(
+        &mut self,
+        task: &SubagentTask,
+        request: &SubagentRequest,
+        parent_policy: &SubagentPolicy,
+        child_policy: &SubagentPolicy,
+        runner: &dyn SubagentRunner,
+    ) -> Result<SubagentReport, ErrorEnvelope> {
+        subagent::run(
+            self.session,
+            task,
+            request,
+            parent_policy,
+            child_policy,
+            runner,
+        )
     }
 
     /// 一个 turn：drain inbox → 逐条采样 → 终结事件。

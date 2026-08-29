@@ -1,5 +1,6 @@
 //! P3 / TASK-404：进程内子代理骨架；内部 trace 隔离，父会话只接收最终报告。
 
+use crate::subagent_policy::{validate_delegation, SubagentPolicy, SubagentRequest};
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use session::SessionStore;
 
@@ -74,19 +75,35 @@ pub trait SubagentRunner {
 pub(crate) fn run(
     parent: &mut dyn SessionStore,
     task: &SubagentTask,
+    request: &SubagentRequest,
+    parent_policy: &SubagentPolicy,
+    child_policy: &SubagentPolicy,
     runner: &dyn SubagentRunner,
 ) -> Result<SubagentReport, ErrorEnvelope> {
-    let mut trace = SubagentTrace::default();
-    let result = runner.run(task, &mut trace);
-
     append_parent_event(
         parent,
         Event::ToolCallRequested {
             call_id: task.id.clone(),
             tool: SUBAGENT_TOOL.to_string(),
-            args: serde_json::json!({ "prompt": task.prompt }),
+            args: serde_json::json!({
+                "prompt": task.prompt,
+                "depth": request.depth(),
+                "active_children": request.active_children(),
+                "turn_budget": request.turn_budget(),
+                "token_budget": request.token_budget(),
+                "model": request.model(),
+                "tools": request.tools(),
+            }),
         },
     )?;
+
+    if let Err(error) = validate_delegation(parent_policy, child_policy, request) {
+        append_failure(parent, task, &error)?;
+        return Err(error);
+    }
+
+    let mut trace = SubagentTrace::default();
+    let result = runner.run(task, &mut trace);
 
     match result {
         Ok(text) => {
@@ -112,18 +129,26 @@ pub(crate) fn run(
             Ok(report)
         }
         Err(error) => {
-            append_parent_event(
-                parent,
-                Event::ToolResultAdded {
-                    call_id: task.id.clone(),
-                    outcome: ToolOutcome::Failure {
-                        error: error.clone(),
-                    },
-                },
-            )?;
+            append_failure(parent, task, &error)?;
             Err(error)
         }
     }
+}
+
+fn append_failure(
+    parent: &mut dyn SessionStore,
+    task: &SubagentTask,
+    error: &ErrorEnvelope,
+) -> Result<(), ErrorEnvelope> {
+    append_parent_event(
+        parent,
+        Event::ToolResultAdded {
+            call_id: task.id.clone(),
+            outcome: ToolOutcome::Failure {
+                error: error.clone(),
+            },
+        },
+    )
 }
 
 fn append_parent_event(parent: &mut dyn SessionStore, event: Event) -> Result<(), ErrorEnvelope> {
@@ -142,6 +167,7 @@ mod tests {
     use protocol::SequencedEvent;
     use session::JsonlSession;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tools::ToolRegistry;
 
     struct Unused;
@@ -276,6 +302,53 @@ mod tests {
         assert_eq!(error.code, ErrorCode::ToolArgsInvalid);
         drop(session);
         assert!(replay(&path).is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    struct CountingRunner<'a>(&'a AtomicUsize);
+
+    impl SubagentRunner for CountingRunner<'_> {
+        fn run(&self, _: &SubagentTask, _: &mut SubagentTrace) -> Result<String, ErrorEnvelope> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok("must not run".into())
+        }
+    }
+
+    #[test]
+    fn policy_rejection_is_a_complete_parent_pair_and_runner_is_not_called() {
+        let path = tmp("policy-reject");
+        std::fs::remove_file(&path).ok();
+        let mut session = JsonlSession::create(path.clone()).unwrap();
+        let tools = ToolRegistry::default();
+        let mut parent = AgentLoop::new(&mut session, &tools, &Unused);
+        let task = SubagentTask::new("research-3", "stay bounded").unwrap();
+        let policy =
+            SubagentPolicy::new(1, 1, 2, 100, ["model-a".into()], ["read".into()], []).unwrap();
+        let request =
+            SubagentRequest::new(2, 0, 2, 100, Some("model-a".into()), ["read".into()]).unwrap();
+        let calls = AtomicUsize::new(0);
+
+        let error = parent
+            .run_subagent_with_policy(&task, &request, &policy, &policy, &CountingRunner(&calls))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::SandboxDenied);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let events = replay(&path);
+        assert_eq!(events.len(), 2);
+        let call_id = match &events[0].event {
+            Event::ToolCallRequested { call_id, .. } => call_id,
+            other => panic!("expected call event, got {other:?}"),
+        };
+        match &events[1].event {
+            Event::ToolResultAdded {
+                call_id: result_id,
+                outcome: ToolOutcome::Failure { error },
+            } => {
+                assert_eq!(result_id, call_id);
+                assert_eq!(error.code, ErrorCode::SandboxDenied);
+            }
+            other => panic!("expected failed result event, got {other:?}"),
+        }
         std::fs::remove_file(&path).ok();
     }
 }
