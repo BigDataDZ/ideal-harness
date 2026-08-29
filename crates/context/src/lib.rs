@@ -1,7 +1,11 @@
-//! P4：token 计量与压缩触发（骨架）。
+//! P3：token 计量与压缩触发。
 //! 双触发：① 压力阈值主动压缩 ② 溢出错误强制压缩后重试。
 
+mod token_meter;
+
 use protocol::ErrorCode;
+
+pub use token_meter::{TokenMeasurement, TokenMeter, TokenSource};
 
 /// token 用量。生产版以 provider 真实 usage 为锚，启发式仅兜底。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
