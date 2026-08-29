@@ -2,9 +2,18 @@
 
 use crate::{replay, JsonlSession, SessionStore};
 use protocol::{Event, SequencedEvent};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use std::io;
 use std::path::{Path, PathBuf};
+
+const PROJECTION_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, PartialEq, Eq)]
+enum SyncOutcome {
+    UpToDate,
+    Extended { appended: usize },
+    Rebuilt,
+}
 
 /// 可由 JSONL 完整重建的 SQLite 会话投影。
 pub struct SqliteProjection {
@@ -21,7 +30,15 @@ impl SqliteProjection {
                  CREATE TABLE IF NOT EXISTS session_events (
                      seq INTEGER PRIMARY KEY,
                      event_json TEXT NOT NULL
-                 );",
+                 );
+                 CREATE TABLE IF NOT EXISTS projection_metadata (
+                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                     schema_version INTEGER NOT NULL,
+                     source_watermark INTEGER
+                 );
+                 INSERT INTO projection_metadata(singleton, schema_version, source_watermark)
+                 VALUES (1, 1, NULL)
+                 ON CONFLICT(singleton) DO NOTHING;",
             )
             .map_err(sqlite_error)?;
         Ok(Self { connection })
@@ -30,33 +47,43 @@ impl SqliteProjection {
     /// 用真相源内容原子替换当前投影。
     pub fn rebuild(&mut self, events: &[SequencedEvent]) -> io::Result<()> {
         let transaction = self.connection.transaction().map_err(sqlite_error)?;
-        transaction
-            .execute("DELETE FROM session_events", [])
-            .map_err(sqlite_error)?;
-        insert_events(&transaction, events)?;
+        replace_projection(&transaction, events)?;
         transaction.commit().map_err(sqlite_error)
     }
 
     /// 按序号幂等写入一条事件；同序号内容不一致会失败，避免掩盖损坏。
     pub fn append(&mut self, event: &SequencedEvent) -> io::Result<()> {
-        let event_json = serde_json::to_string(&event.event)?;
-        let changed = self
-            .connection
-            .execute(
-                "INSERT INTO session_events(seq, event_json) VALUES (?1, ?2)
-                 ON CONFLICT(seq) DO UPDATE SET event_json = excluded.event_json
-                 WHERE session_events.event_json = excluded.event_json",
-                params![event.seq, event_json],
+        let transaction = self.connection.transaction().map_err(sqlite_error)?;
+        let watermark = metadata(&transaction)?.1;
+        if let Some(existing_json) = transaction
+            .query_row(
+                "SELECT event_json FROM session_events WHERE seq = ?1",
+                params![event.seq],
+                |row| row.get::<_, String>(0),
             )
-            .map_err(sqlite_error)?;
-        if changed == 1 {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("projection conflict at sequence {}", event.seq),
-            ))
+            .optional()
+            .map_err(sqlite_error)?
+        {
+            let expected_json = serde_json::to_string(&event.event)?;
+            if existing_json == expected_json {
+                transaction.commit().map_err(sqlite_error)?;
+                return Ok(());
+            }
+            return Err(invalid_data(format!(
+                "projection conflict at sequence {}",
+                event.seq
+            )));
         }
+        let expected_seq = watermark.map_or(0, |seq| seq.saturating_add(1));
+        if event.seq != expected_seq {
+            return Err(invalid_data(format!(
+                "projection gap: expected sequence {expected_seq}, got {}",
+                event.seq
+            )));
+        }
+        insert_event(&transaction, event)?;
+        update_metadata(&transaction, Some(event.seq))?;
+        transaction.commit().map_err(sqlite_error)
     }
 
     /// 查询按序号排列的完整事件投影。
@@ -67,12 +94,9 @@ impl SqliteProjection {
             .map_err(sqlite_error)?;
         let rows = statement
             .query_map([], |row| {
-                let seq = row.get::<_, u64>(0)?;
-                let event_json = row.get::<_, String>(1)?;
-                Ok((seq, event_json))
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
             })
             .map_err(sqlite_error)?;
-
         rows.map(|row| {
             let (seq, event_json) = row.map_err(sqlite_error)?;
             let event = serde_json::from_str(&event_json)?;
@@ -80,11 +104,43 @@ impl SqliteProjection {
         })
         .collect()
     }
+
+    fn synchronize(&mut self, source: &[SequencedEvent]) -> io::Result<SyncOutcome> {
+        let (schema_version, watermark) = metadata(&self.connection)?;
+        let prefix_len = watermark
+            .and_then(|seq| usize::try_from(seq).ok())
+            .and_then(|seq| seq.checked_add(1))
+            .unwrap_or(0);
+        if schema_version != PROJECTION_SCHEMA_VERSION
+            || prefix_len > source.len()
+            || !self.prefix_matches(source, prefix_len)?
+        {
+            self.rebuild(source)?;
+            return Ok(SyncOutcome::Rebuilt);
+        }
+        if prefix_len == source.len() {
+            return Ok(SyncOutcome::UpToDate);
+        }
+        let suffix = &source[prefix_len..];
+        let transaction = self.connection.transaction().map_err(sqlite_error)?;
+        insert_events(&transaction, suffix)?;
+        update_metadata(&transaction, source.last().map(|event| event.seq))?;
+        transaction.commit().map_err(sqlite_error)?;
+        Ok(SyncOutcome::Extended {
+            appended: suffix.len(),
+        })
+    }
+
+    fn prefix_matches(&self, source: &[SequencedEvent], prefix_len: usize) -> io::Result<bool> {
+        let projected = self.query_events()?;
+        if projected.len() != prefix_len || source.len() < prefix_len {
+            return Ok(false);
+        }
+        Ok(projected == source[..prefix_len])
+    }
 }
 
 /// 先持久化 JSONL、后更新 SQLite 的 write-behind 编排器。
-///
-/// 打开时总是由 JSONL 重建投影，因此上次运行若在两次写入间崩溃也会自动修复。
 pub struct ProjectedSession {
     source: JsonlSession,
     projection: SqliteProjection,
@@ -95,7 +151,7 @@ impl ProjectedSession {
         let events = replay(&jsonl_path)?;
         let source = JsonlSession::create(jsonl_path)?;
         let mut projection = SqliteProjection::open(sqlite_path)?;
-        projection.rebuild(&events)?;
+        projection.synchronize(&events)?;
         Ok(Self { source, projection })
     }
 
@@ -129,17 +185,69 @@ impl SessionStore for ProjectedSession {
     }
 }
 
+fn replace_projection(transaction: &Transaction<'_>, events: &[SequencedEvent]) -> io::Result<()> {
+    transaction
+        .execute("DELETE FROM session_events", [])
+        .map_err(sqlite_error)?;
+    insert_events(transaction, events)?;
+    transaction
+        .execute(
+            "UPDATE projection_metadata
+             SET schema_version = ?1, source_watermark = ?2 WHERE singleton = 1",
+            params![
+                PROJECTION_SCHEMA_VERSION,
+                events.last().map(|event| event.seq)
+            ],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
 fn insert_events(transaction: &Transaction<'_>, events: &[SequencedEvent]) -> io::Result<()> {
     let mut statement = transaction
         .prepare("INSERT INTO session_events(seq, event_json) VALUES (?1, ?2)")
         .map_err(sqlite_error)?;
     for event in events {
-        let event_json = serde_json::to_string(&event.event)?;
         statement
-            .execute(params![event.seq, event_json])
+            .execute(params![event.seq, serde_json::to_string(&event.event)?])
             .map_err(sqlite_error)?;
     }
     Ok(())
+}
+
+fn insert_event(transaction: &Transaction<'_>, event: &SequencedEvent) -> io::Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO session_events(seq, event_json) VALUES (?1, ?2)",
+            params![event.seq, serde_json::to_string(&event.event)?],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn metadata(connection: &Connection) -> io::Result<(u32, Option<u64>)> {
+    connection
+        .query_row(
+            "SELECT schema_version, source_watermark
+             FROM projection_metadata WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(sqlite_error)
+}
+
+fn update_metadata(transaction: &Transaction<'_>, watermark: Option<u64>) -> io::Result<()> {
+    transaction
+        .execute(
+            "UPDATE projection_metadata SET source_watermark = ?1 WHERE singleton = 1",
+            params![watermark],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn invalid_data(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn sqlite_error(error: rusqlite::Error) -> io::Error {
@@ -161,7 +269,18 @@ mod tests {
     fn cleanup(paths: &(PathBuf, PathBuf)) {
         for path in [&paths.0, &paths.1] {
             std::fs::remove_file(path).ok();
+            std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+            std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         }
+    }
+
+    fn source_events(count: u64) -> Vec<SequencedEvent> {
+        (0..count)
+            .map(|seq| SequencedEvent {
+                seq,
+                event: Event::TurnStarted { turn_id: seq },
+            })
+            .collect()
     }
 
     #[test]
@@ -175,33 +294,112 @@ mod tests {
                 text: "hello".into(),
             })
             .unwrap();
-
         assert_eq!(session.query_events().unwrap(), replay(&paths.0).unwrap());
         cleanup(&paths);
     }
 
     #[test]
-    fn reopening_repairs_a_stale_projection_from_jsonl() {
-        let paths = paths("repair");
+    fn long_log_reopen_is_read_only_and_source_ahead_appends_only_suffix() {
+        let paths = paths("incremental");
         cleanup(&paths);
-        {
-            let mut source = JsonlSession::create(paths.0.clone()).unwrap();
-            source.append(Event::TurnStarted { turn_id: 3 }).unwrap();
-        }
-        {
-            let mut stale = SqliteProjection::open(&paths.1).unwrap();
-            stale.rebuild(&[]).unwrap();
-            assert!(stale.query_events().unwrap().is_empty());
-        }
-
-        let session = ProjectedSession::create(paths.0.clone(), &paths.1).unwrap();
-        assert_eq!(session.query_events().unwrap(), replay(&paths.0).unwrap());
+        let events = source_events(1_000);
+        let mut projection = SqliteProjection::open(&paths.1).unwrap();
+        projection.rebuild(&events).unwrap();
+        let before: u64 = projection
+            .connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            projection.synchronize(&events).unwrap(),
+            SyncOutcome::UpToDate
+        );
+        let after: u64 = projection
+            .connection
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, before);
+        let extended = source_events(1_003);
+        assert_eq!(
+            projection.synchronize(&extended).unwrap(),
+            SyncOutcome::Extended { appended: 3 }
+        );
+        assert_eq!(projection.query_events().unwrap(), extended);
         cleanup(&paths);
     }
 
     #[test]
-    fn projection_rejects_conflicting_sequence_content() {
-        let paths = paths("conflict");
+    fn sqlite_ahead_is_atomically_rebuilt_from_source() {
+        let paths = paths("ahead");
+        cleanup(&paths);
+        let source = source_events(2);
+        let mut projection = SqliteProjection::open(&paths.1).unwrap();
+        projection.rebuild(&source_events(3)).unwrap();
+        assert_eq!(
+            projection.synchronize(&source).unwrap(),
+            SyncOutcome::Rebuilt
+        );
+        assert_eq!(projection.query_events().unwrap(), source);
+        cleanup(&paths);
+    }
+
+    #[test]
+    fn middle_gap_and_conflict_each_trigger_rebuild() {
+        let paths = paths("gap-conflict");
+        cleanup(&paths);
+        let source = source_events(4);
+        let mut projection = SqliteProjection::open(&paths.1).unwrap();
+        projection.rebuild(&source).unwrap();
+        projection
+            .connection
+            .execute("DELETE FROM session_events WHERE seq = 1", [])
+            .unwrap();
+        assert_eq!(
+            projection.synchronize(&source).unwrap(),
+            SyncOutcome::Rebuilt
+        );
+        projection
+            .connection
+            .execute(
+                "UPDATE session_events SET event_json = ?1 WHERE seq = 2",
+                params![serde_json::to_string(&Event::TurnStarted { turn_id: 99 }).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            projection.synchronize(&source).unwrap(),
+            SyncOutcome::Rebuilt
+        );
+        assert_eq!(projection.query_events().unwrap(), source);
+        cleanup(&paths);
+    }
+
+    #[test]
+    fn schema_version_mismatch_triggers_rebuild() {
+        let paths = paths("schema");
+        cleanup(&paths);
+        let source = source_events(2);
+        let mut projection = SqliteProjection::open(&paths.1).unwrap();
+        projection.rebuild(&source).unwrap();
+        projection
+            .connection
+            .execute(
+                "UPDATE projection_metadata SET schema_version = 999 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            projection.synchronize(&source).unwrap(),
+            SyncOutcome::Rebuilt
+        );
+        assert_eq!(
+            metadata(&projection.connection).unwrap().0,
+            PROJECTION_SCHEMA_VERSION
+        );
+        cleanup(&paths);
+    }
+
+    #[test]
+    fn projection_rejects_conflicting_sequence_content_and_gaps() {
+        let paths = paths("invalid-append");
         cleanup(&paths);
         let mut projection = SqliteProjection::open(&paths.1).unwrap();
         projection
@@ -210,14 +408,20 @@ mod tests {
                 event: Event::TurnStarted { turn_id: 1 },
             })
             .unwrap();
-
-        let error = projection
+        let conflict = projection
             .append(&SequencedEvent {
                 seq: 0,
                 event: Event::TurnStarted { turn_id: 2 },
             })
             .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(conflict.kind(), io::ErrorKind::InvalidData);
+        let gap = projection
+            .append(&SequencedEvent {
+                seq: 2,
+                event: Event::TurnStarted { turn_id: 2 },
+            })
+            .unwrap_err();
+        assert_eq!(gap.kind(), io::ErrorKind::InvalidData);
         cleanup(&paths);
     }
 }
