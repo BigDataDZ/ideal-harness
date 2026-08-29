@@ -146,7 +146,7 @@
 - 验收标准: fixture server 完成发现与调用；超限输出被裁剪并可取回；协议错误/子进程退出 fail-closed 且不留未配对调用
 - 明确不做: 不做 HTTP MCP/OAuth；不引入异步运行时；不信任服务端 message 做控制流
 
-### TASK-502: 可信 Skill 目录发现
+### TASK-502: 可信 Skill 目录发现 ✅（commit `70e439b`）
 - 目标 crate: tools
 - 内容: 发现 `.harness/skills/*/SKILL.md`；解析受限 YAML frontmatter；可信根 canonical 校验、指纹刷新与确定性目录
 - 验收标准: 新增/修改/删除可刷新；遍历/软链接逃逸/重复名称拒绝；子代理只能继承父级已验证 skill
