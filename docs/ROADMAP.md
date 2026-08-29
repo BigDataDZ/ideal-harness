@@ -132,7 +132,7 @@
 - 验收标准: 内置与用户角色解析测试；恶意/未知配置 fail-closed；角色能生成确定性的子任务配置
 - 明确不做: 不引入 TOML/YAML 外部依赖；不实现远端角色市场
 
-### TASK-412: 场景级事件轨迹快照
+### TASK-412: 场景级事件轨迹快照 ✅（commit `8f04875`）
 - 目标 crate: session、agent-loop、harness-cli（tests only）
 - 内容: 建立无第三方快照依赖的 canonical JSONL 场景夹具，覆盖 resume/fork/zstd/SQLite/subagent 组合
 - 验收标准: 至少 6 条端到端轨迹；差异输出可读；Windows 路径与并发端口不影响结果
