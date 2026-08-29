@@ -8,4 +8,5 @@ protocol = { workspace = true }
 session = { workspace = true }
 tools = { workspace = true }
 model-provider = { workspace = true }
+context = { workspace = true }
 serde_json = { workspace = true }

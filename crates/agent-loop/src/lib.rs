@@ -1,6 +1,10 @@
 //! P3：显式状态机 + Inbox 唤醒的 Agent 主循环（同步骨架）。
 //! 生产版把执行器换成 tokio 不改协议：事件流即契约。
 
+mod compaction;
+
+pub use compaction::HistoryCompaction;
+
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use session::JsonlSession;
 use tools::{ToolAudit, ToolExecution, ToolRegistry};

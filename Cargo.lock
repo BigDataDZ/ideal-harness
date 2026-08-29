@@ -6,6 +6,7 @@ version = 4
 name = "agent-loop"
 version = "0.2.0"
 dependencies = [
+ "context",
  "model-provider",
  "protocol",
  "serde_json",

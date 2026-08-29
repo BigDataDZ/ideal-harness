@@ -1,10 +1,15 @@
 //! P3：token 计量与压缩触发。
 //! 双触发：① 压力阈值主动压缩 ② 溢出错误强制压缩后重试。
 
+mod compaction;
 mod token_meter;
 
 use protocol::ErrorCode;
 
+pub use compaction::{
+    safe_prefix_len, CompactionEntry, CompactionKind, CompactionPlan, SummaryProvider,
+    ToolResultPruner, TwoStageCompactor,
+};
 pub use token_meter::{TokenMeasurement, TokenMeter, TokenSource};
 
 /// token 用量。生产版以 provider 真实 usage 为锚，启发式仅兜底。
