@@ -1,6 +1,10 @@
 //! P5：事件溯源。JSONL append-only 是唯一真相源；
 //! 崩溃恢复、fork、time-travel 全部由重放派生。
 
+mod spill;
+
+pub use spill::{SpillLocator, SpillStore, StoredToolResult};
+
 use protocol::{Event, SequencedEvent};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
