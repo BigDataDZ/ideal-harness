@@ -5,6 +5,8 @@ mod projection;
 mod spill;
 #[cfg(feature = "zstd")]
 mod zstd_frames;
+#[cfg(feature = "zstd")]
+mod zstd_record;
 
 pub use projection::{ProjectedSession, SqliteProjection};
 pub use spill::{SpillLocator, SpillStore, StoredToolResult};
