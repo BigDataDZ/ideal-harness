@@ -1,7 +1,7 @@
 //! P4/TASK-401：显式 resume / fork 会话命令。
 
 use crate::{cmd_chat, parse_chat_args, ChatArgs};
-use session::{fork as session_fork, replay_session};
+use session::{fork as session_fork, replay_session, revert_before_turn, timeline_from_session};
 use std::path::PathBuf;
 
 pub(crate) fn cmd_resume(args: &[String]) -> anyhow::Result<()> {
@@ -91,6 +91,119 @@ pub(crate) fn cmd_fork(args: &[String]) -> anyhow::Result<()> {
         child.len(),
         config.source.display(),
         config.target.display()
+    );
+    Ok(())
+}
+
+struct TimelineArgs {
+    session: PathBuf,
+    cursor: Option<usize>,
+    limit: usize,
+}
+
+fn parse_timeline_args(args: &[String]) -> anyhow::Result<TimelineArgs> {
+    let mut session = None;
+    let mut cursor = None;
+    let mut limit = 20;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("{flag} 缺少取值"))?;
+        match flag {
+            "--session" => session = Some(PathBuf::from(value)),
+            "--cursor" => {
+                cursor = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--cursor 必须是非负整数"))?,
+                )
+            }
+            "--limit" => {
+                limit = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("--limit 必须是正整数"))?
+            }
+            other => anyhow::bail!("未知 timeline 参数：{other}"),
+        }
+        index += 2;
+    }
+    Ok(TimelineArgs {
+        session: session.ok_or_else(|| anyhow::anyhow!("timeline 缺少 --session <path>"))?,
+        cursor,
+        limit,
+    })
+}
+
+pub(crate) fn cmd_timeline(args: &[String]) -> anyhow::Result<()> {
+    let config = parse_timeline_args(args)?;
+    if !config.session.is_file() {
+        anyhow::bail!("会话不存在：{}", config.session.display());
+    }
+    let page = timeline_from_session(&config.session, config.cursor, config.limit)?;
+    for turn in page.turns {
+        println!(
+            "turn={} status={:?} seq={}..{}",
+            turn.turn_id,
+            turn.status,
+            turn.start_seq,
+            turn.end_seq
+                .map_or_else(|| "active".into(), |seq| seq.to_string())
+        );
+    }
+    if let Some(cursor) = page.next_cursor {
+        println!("next_cursor={cursor}");
+    }
+    Ok(())
+}
+
+struct RevertArgs {
+    source: PathBuf,
+    target: PathBuf,
+    turn_id: u64,
+}
+
+fn parse_revert_args(args: &[String]) -> anyhow::Result<RevertArgs> {
+    let mut source = None;
+    let mut target = None;
+    let mut turn_id = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| anyhow::anyhow!("{flag} 缺少取值"))?;
+        match flag {
+            "--session" => source = Some(PathBuf::from(value)),
+            "--target" => target = Some(PathBuf::from(value)),
+            "--turn" => {
+                turn_id = Some(
+                    value
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--turn 必须是非负整数"))?,
+                )
+            }
+            other => anyhow::bail!("未知 revert 参数：{other}"),
+        }
+        index += 2;
+    }
+    Ok(RevertArgs {
+        source: source.ok_or_else(|| anyhow::anyhow!("revert 缺少 --session <source>"))?,
+        target: target.ok_or_else(|| anyhow::anyhow!("revert 缺少 --target <path>"))?,
+        turn_id: turn_id.ok_or_else(|| anyhow::anyhow!("revert 缺少 --turn <id>"))?,
+    })
+}
+
+pub(crate) fn cmd_revert(args: &[String]) -> anyhow::Result<()> {
+    let config = parse_revert_args(args)?;
+    let child = revert_before_turn(&config.source, config.target.clone(), config.turn_id)?;
+    println!(
+        "已在 turn {} 之前创建非破坏性 revert：{} → {}（{} 个事件）",
+        config.turn_id,
+        config.source.display(),
+        config.target.display(),
+        child.len()
     );
     Ok(())
 }
@@ -199,5 +312,34 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.boundary, Some(2));
         assert!(parse_fork_args(&["--boundary".into(), "x".into()]).is_err());
+    }
+
+    #[test]
+    fn timeline_and_revert_arguments_fail_closed() {
+        assert!(parse_timeline_args(&[]).is_err());
+        assert!(parse_timeline_args(&[
+            "--session".into(),
+            "a".into(),
+            "--limit".into(),
+            "x".into(),
+        ])
+        .is_err());
+        assert!(parse_revert_args(&[
+            "--session".into(),
+            "a".into(),
+            "--target".into(),
+            "b".into(),
+        ])
+        .is_err());
+        let parsed = parse_revert_args(&[
+            "--session".into(),
+            "a".into(),
+            "--target".into(),
+            "b".into(),
+            "--turn".into(),
+            "7".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.turn_id, 7);
     }
 }

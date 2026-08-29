@@ -3,6 +3,7 @@
 
 mod projection;
 mod spill;
+mod timeline;
 #[cfg(feature = "zstd")]
 mod zstd_frames;
 #[cfg(feature = "zstd")]
@@ -10,6 +11,9 @@ mod zstd_record;
 
 pub use projection::{ProjectedSession, SqliteProjection};
 pub use spill::{SpillLocator, SpillStore, StoredToolResult};
+pub use timeline::{
+    revert_before_turn, timeline_from_session, timeline_page, TimelinePage, TurnStatus, TurnSummary,
+};
 #[cfg(feature = "zstd")]
 pub use zstd_frames::{migrate_session, replay_auto, replay_zstd, SessionEncoding, ZstdSession};
 

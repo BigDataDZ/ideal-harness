@@ -17,7 +17,7 @@ use tools::{EscalationAvailability, ToolRegistry, ToolSpec};
 mod security;
 mod session_commands;
 use security::{register_exec_tool, ProviderProxy};
-use session_commands::{cmd_fork, cmd_resume};
+use session_commands::{cmd_fork, cmd_resume, cmd_revert, cmd_timeline};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -25,6 +25,8 @@ fn main() -> anyhow::Result<()> {
         Some("chat") => cmd_chat(&args[1..]),
         Some("resume") => cmd_resume(&args[1..]),
         Some("fork") => cmd_fork(&args[1..]),
+        Some("timeline") => cmd_timeline(&args[1..]),
+        Some("revert") => cmd_revert(&args[1..]),
         _ => demo(),
     }
 }
