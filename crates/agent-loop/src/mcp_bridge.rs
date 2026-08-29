@@ -1,6 +1,6 @@
 //! P3/TASK-501：MCP 调用接入父事件流、审批审计与现有 spill 存储。
 
-use crate::AgentLoop;
+use crate::{AgentLoop, HookContext, HookPoint};
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use session::SpillStore;
 use std::path::{Path, PathBuf};
@@ -62,6 +62,17 @@ impl AgentLoop<'_> {
                 args: invocation.arguments.clone(),
             },
         )?;
+        let tool_name = format!("mcp:{}:{}", client.source(), invocation.tool);
+        if let Err(error) = self.execute_hook(HookContext::tool(
+            HookPoint::PreToolUse,
+            None,
+            &invocation.call_id,
+            &tool_name,
+            None,
+        )) {
+            append_failure(self.session, &invocation.call_id, &error)?;
+            return Err(error);
+        }
         append(
             self.session,
             Event::ApprovalDecided {
@@ -75,21 +86,21 @@ impl AgentLoop<'_> {
                 "MCP invocation rejected by approval policy",
             );
             append_failure(self.session, &invocation.call_id, &error)?;
-            return Err(error);
+            return self.finish_failed_mcp_hook(invocation, &tool_name, error);
         }
 
         let result = match client.call(&invocation.tool, &invocation.arguments) {
             Ok(result) => result,
             Err(error) => {
                 append_failure(self.session, &invocation.call_id, &error)?;
-                return Err(error);
+                return self.finish_failed_mcp_hook(invocation, &tool_name, error);
             }
         };
         let outcome = match project_result(&invocation.call_id, &invocation.spill_root, &result) {
             Ok(outcome) => outcome,
             Err(error) => {
                 append_failure(self.session, &invocation.call_id, &error)?;
-                return Err(error);
+                return self.finish_failed_mcp_hook(invocation, &tool_name, error);
             }
         };
         append(
@@ -99,7 +110,35 @@ impl AgentLoop<'_> {
                 outcome: outcome.clone(),
             },
         )?;
+        self.execute_hook(HookContext::tool(
+            HookPoint::PostToolUse,
+            None,
+            &invocation.call_id,
+            tool_name,
+            Some(outcome.clone()),
+        ))?;
         Ok(outcome)
+    }
+
+    fn finish_failed_mcp_hook(
+        &mut self,
+        invocation: &McpInvocation,
+        tool_name: &str,
+        error: ErrorEnvelope,
+    ) -> Result<ToolOutcome, ErrorEnvelope> {
+        let outcome = ToolOutcome::Failure {
+            error: error.clone(),
+        };
+        match self.execute_hook(HookContext::tool(
+            HookPoint::PostToolUse,
+            None,
+            &invocation.call_id,
+            tool_name,
+            Some(outcome),
+        )) {
+            Ok(()) => Err(error),
+            Err(hook_error) => Err(hook_error),
+        }
     }
 }
 

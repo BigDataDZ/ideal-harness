@@ -2,6 +2,11 @@
 //! 生产版把执行器换成 tokio 不改协议：事件流即契约。
 
 mod compaction;
+mod hooks;
+#[cfg(test)]
+mod hooks_subagent_tests;
+#[cfg(test)]
+mod hooks_tests;
 mod mcp_bridge;
 mod role_config;
 mod subagent;
@@ -9,6 +14,7 @@ mod subagent_lifecycle;
 mod subagent_policy;
 
 pub use compaction::{HistoryCompaction, OverflowRecovery};
+pub use hooks::{Hook, HookContext, HookPoint, HookRegistry, HookResult};
 pub use mcp_bridge::McpInvocation;
 pub use role_config::{
     parse_roles, AgentRole, RoleCatalog, RoleSubtask, RoleTaskBudget, RoleTaskIdentity,
@@ -87,6 +93,7 @@ struct ChatTurnConfig<'a> {
     max_tool_rounds: u32,
     external_events: Option<&'a dyn Fn() -> Vec<Event>>,
     overflow_recovery: Option<OverflowRecovery<'a>>,
+    hooks: Option<&'a HookRegistry>,
 }
 
 pub struct AgentLoop<'a> {
@@ -110,6 +117,8 @@ pub struct AgentLoop<'a> {
     pub external_events: Option<&'a dyn Fn() -> Vec<Event>>,
     /// TASK-303：窗口溢出时的强制压缩与有限自动重试配置。
     pub overflow_recovery: Option<OverflowRecovery<'a>>,
+    /// TASK-503：同步生命周期 Hook；注册表本身不持有 session 写能力。
+    pub hooks: Option<&'a HookRegistry>,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -131,6 +140,7 @@ impl<'a> AgentLoop<'a> {
             chat_history: Vec::new(),
             external_events: None,
             overflow_recovery: None,
+            hooks: None,
         }
     }
 
@@ -154,6 +164,7 @@ impl<'a> AgentLoop<'a> {
             chat_history: Vec::new(),
             external_events: None,
             overflow_recovery: None,
+            hooks: None,
         }
     }
 
@@ -209,6 +220,21 @@ impl<'a> AgentLoop<'a> {
                 self.inbox.queue_boundary_report(report.text.clone());
             }
         }
+        let outcome = match &result {
+            Ok(report) => ToolOutcome::Success {
+                value: serde_json::json!({
+                    "task_id": report.task_id,
+                    "child_event_count": report.child_event_count,
+                }),
+            },
+            Err(error) => ToolOutcome::Failure {
+                error: error.clone(),
+            },
+        };
+        let hook_result = self.execute_hook(HookContext::subagent(task.id(), outcome));
+        if result.is_ok() {
+            hook_result?;
+        }
         result
     }
 
@@ -241,6 +267,7 @@ impl<'a> AgentLoop<'a> {
                         max_tool_rounds: self.max_tool_rounds,
                         external_events: self.external_events,
                         overflow_recovery: self.overflow_recovery,
+                        hooks: self.hooks,
                     },
                     &mut self.chat_history,
                     turn_id,
@@ -258,12 +285,27 @@ impl<'a> AgentLoop<'a> {
             match result {
                 Ok(()) => completed += 1,
                 Err(e) => {
-                    self.abort(turn_id, e.message);
+                    let reason = self
+                        .execute_hook(HookContext::turn(
+                            HookPoint::TurnFailed,
+                            turn_id,
+                            Some(e.message.clone()),
+                        ))
+                        .err()
+                        .unwrap_or(e)
+                        .message;
+                    self.abort(turn_id, reason);
                     return completed;
                 }
             }
         }
 
+        if let Err(error) =
+            self.execute_hook(HookContext::turn(HookPoint::TurnCompleted, turn_id, None))
+        {
+            self.abort(turn_id, error.message);
+            return completed;
+        }
         self.session.append(Event::TurnCompleted { turn_id }).ok();
         self.phase = Phase::Idle;
         completed
@@ -362,6 +404,27 @@ impl<'a> AgentLoop<'a> {
                     })
                     .ok();
 
+                if let Err(error) = execute_hook(
+                    cfg.hooks,
+                    HookContext::tool(HookPoint::PreToolUse, Some(turn_id), &tc.id, &tc.name, None),
+                    session,
+                ) {
+                    let outcome = ToolOutcome::Failure {
+                        error: error.clone(),
+                    };
+                    session
+                        .append(Event::ToolResultAdded {
+                            call_id: tc.id.clone(),
+                            outcome: outcome.clone(),
+                        })
+                        .ok();
+                    history.push(ChatMessage::tool_result(
+                        tc.id.clone(),
+                        serde_json::to_string(&outcome).unwrap_or_default(),
+                    ));
+                    return Err(error);
+                }
+
                 let execution = if let Some(e) = parse_err {
                     ToolExecution::new(ToolOutcome::Failure {
                         error: ErrorEnvelope::new(
@@ -404,6 +467,17 @@ impl<'a> AgentLoop<'a> {
                     tc.id.clone(),
                     serde_json::to_string(&outcome).unwrap_or_default(),
                 ));
+                execute_hook(
+                    cfg.hooks,
+                    HookContext::tool(
+                        HookPoint::PostToolUse,
+                        Some(turn_id),
+                        &tc.id,
+                        &tc.name,
+                        Some(outcome),
+                    ),
+                    session,
+                )?;
             }
         }
 
@@ -421,6 +495,48 @@ impl<'a> AgentLoop<'a> {
             .append(Event::TurnAborted { turn_id, reason })
             .ok();
         self.phase = Phase::Idle;
+    }
+
+    /// 在同步骨架的安全点中断当前 turn，并触发可审计的 interrupted Hook。
+    pub fn interrupt_turn(
+        &mut self,
+        turn_id: u64,
+        reason: impl Into<String>,
+    ) -> Result<(), ErrorEnvelope> {
+        if self.phase != Phase::Running {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ToolArgsInvalid,
+                "only a running turn can be interrupted",
+            ));
+        }
+        let reason = reason.into();
+        let hook_result = self.execute_hook(HookContext::turn(
+            HookPoint::TurnInterrupted,
+            turn_id,
+            Some(reason.clone()),
+        ));
+        let abort_reason = hook_result
+            .as_ref()
+            .err()
+            .map(|error| error.message.clone())
+            .unwrap_or(reason);
+        self.abort(turn_id, abort_reason);
+        hook_result
+    }
+
+    pub(crate) fn execute_hook(&mut self, context: HookContext) -> Result<(), ErrorEnvelope> {
+        execute_hook(self.hooks, context, self.session)
+    }
+}
+
+fn execute_hook(
+    hooks: Option<&HookRegistry>,
+    context: HookContext,
+    session: &mut dyn SessionStore,
+) -> Result<(), ErrorEnvelope> {
+    match hooks {
+        Some(hooks) => hooks.execute(&context, session),
+        None => Ok(()),
     }
 }
 
