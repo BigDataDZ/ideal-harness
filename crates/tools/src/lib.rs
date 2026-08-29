@@ -2,12 +2,14 @@
 //! 错误一律以稳定 ErrorCode 回传，供模型自纠，绝不 panic。
 
 mod advertisement;
+mod mcp;
 mod schema;
 
 use protocol::ToolOutcome;
 use serde::{Deserialize, Serialize};
 
 pub use advertisement::EscalationAvailability;
+pub use mcp::{McpCallResult, McpClient, McpServerConfig, McpTool};
 pub use schema::validate_args;
 
 /// 工具规格：schema 即文档，schema 即校验器输入。

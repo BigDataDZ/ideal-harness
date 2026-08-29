@@ -2,12 +2,14 @@
 //! 生产版把执行器换成 tokio 不改协议：事件流即契约。
 
 mod compaction;
+mod mcp_bridge;
 mod role_config;
 mod subagent;
 mod subagent_lifecycle;
 mod subagent_policy;
 
 pub use compaction::{HistoryCompaction, OverflowRecovery};
+pub use mcp_bridge::McpInvocation;
 pub use role_config::{
     parse_roles, AgentRole, RoleCatalog, RoleSubtask, RoleTaskBudget, RoleTaskIdentity,
 };
