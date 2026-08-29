@@ -120,7 +120,7 @@
 - 验收标准: 每种超限均返回稳定 ErrorCode 并形成完整父事件对；拒绝时 runner 零调用；子策略不得扩大父策略
 - 明确不做: 不并行执行；不新增模型 provider；不改沙箱抽象
 
-### TASK-410: subagent 生命周期、lineage 与 report 投递
+### TASK-410: subagent 生命周期、lineage 与 report 投递 ✅（commit `f571d09`）
 - 目标 crate: protocol ⚠️串行、agent-loop、session
 - 内容: 增加向后兼容的子代理生命周期/报告事件；父取消传播；记录 parent/child lineage；支持 next-step 与 quiet 报告投递
 - 验收标准: 成功/失败/取消均有闭合事件序列；quiet 不唤醒父 inbox；next-step 仅在边界唤醒；旧 JSONL 可重放
