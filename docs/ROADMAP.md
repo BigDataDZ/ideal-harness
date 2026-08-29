@@ -102,7 +102,7 @@
 - 验收标准: 注入半帧/坏 checksum/同步失败；只修复未提交尾部，提交前缀损坏必须拒绝；旧 TASK-403 文件仍可迁移读取
 - 明确不做: 不过滤或重编号 Event；不把 SQLite 变成真相源；仅使用任务卡已批准的 zstd 依赖
 
-### TASK-407: SQLite 增量投影与水位
+### TASK-407: SQLite 增量投影与水位 ✅（commit `176f2f0`）
 - 目标 crate: session
 - 内容: 投影记录 source watermark 与 schema version；打开时只补齐缺失后缀，检测缺口/冲突后由 JSONL 原子重建
 - 验收标准: 长日志 reopen 不全表重写；模拟 JSONL 领先、SQLite 领先和中间缺口；查询始终与 replay 一致
