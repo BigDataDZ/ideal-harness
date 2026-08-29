@@ -4,6 +4,7 @@
 mod advertisement;
 mod mcp;
 mod schema;
+mod skills;
 
 use protocol::ToolOutcome;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub use advertisement::EscalationAvailability;
 pub use mcp::{McpCallResult, McpClient, McpServerConfig, McpTool};
 pub use schema::validate_args;
+pub use skills::{SkillCatalog, SkillRefresh, VerifiedSkill, VerifiedSkillScope};
 
 /// 工具规格：schema 即文档，schema 即校验器输入。
 #[derive(Debug, Clone, Serialize, Deserialize)]
