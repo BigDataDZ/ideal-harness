@@ -114,7 +114,7 @@
 - 验收标准: 多 turn 分页无重无漏；revert 后源/目标独立追加；非法 turn/cursor fail-closed
 - 明确不做: 不回滚工作区文件；不原地截断源日志；不新增 UI
 
-### TASK-409: subagent 资源与选择策略
+### TASK-409: subagent 资源与选择策略 ✅（commit `bd83a8f`）
 - 目标 crate: agent-loop
 - 内容: 最大深度/并发、turn/token 预算、允许模型与工具 allow/deny；所有限制在运行器调用前检查
 - 验收标准: 每种超限均返回稳定 ErrorCode 并形成完整父事件对；拒绝时 runner 零调用；子策略不得扩大父策略
