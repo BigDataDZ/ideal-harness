@@ -15,12 +15,16 @@ use session::{replay as session_replay, JsonlSession};
 use tools::{EscalationAvailability, ToolRegistry, ToolSpec};
 
 mod security;
+mod session_commands;
 use security::{register_exec_tool, ProviderProxy};
+use session_commands::{cmd_fork, cmd_resume};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("chat") => cmd_chat(&args[1..]),
+        Some("resume") => cmd_resume(&args[1..]),
+        Some("fork") => cmd_fork(&args[1..]),
         _ => demo(),
     }
 }
