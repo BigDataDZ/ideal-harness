@@ -154,6 +154,7 @@ impl McpClient {
                 description: tool.description.clone(),
                 parameters_schema: tool.input_schema.clone(),
                 escalation_capable: false,
+                timeout_ms: None,
             },
             arguments,
         )?;

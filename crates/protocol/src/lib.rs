@@ -29,6 +29,10 @@ pub enum ErrorCode {
     CursorInvalid,
     TeamRevisionConflict,
     TeamDependencyCycle,
+    /// TASK-702：工具执行超过其 deadline；底层副作用不被取消。
+    ToolTimeout,
+    /// TASK-702：循环防护拒绝了重复的等参工具调用。
+    ToolLoopDetected,
     Internal,
 }
 
@@ -540,6 +544,8 @@ mod tests {
             (ErrorCode::ToolArgsInvalid, "tool_args_invalid"),
             (ErrorCode::ContextWindowExceeded, "context_window_exceeded"),
             (ErrorCode::ApprovalRejected, "approval_rejected"),
+            (ErrorCode::ToolTimeout, "tool_timeout"),
+            (ErrorCode::ToolLoopDetected, "tool_loop_detected"),
         ] {
             let json = serde_json::to_string(&code).unwrap();
             assert_eq!(json, format!("\"{tag}\""));

@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -88,7 +88,7 @@ impl WebFetchTool {
         };
         let mut current = url.trim().to_string();
         for _hop in 0..=MAX_REDIRECT_HOPS {
-            let (scheme, host) = parse_url(&current)?;
+            let (_scheme, host) = parse_url(&current)?;
             if is_private_host(&host) {
                 return Err(denied(format!(
                     "private or loopback hosts are not fetchable: {host}"
@@ -252,7 +252,7 @@ fn is_private_ipv6(host: &str) -> bool {
 }
 
 fn decode_body(body: &[u8]) -> Result<String, ErrorEnvelope> {
-    if body.iter().any(|byte| *byte == 0) {
+    if body.contains(&0) {
         return Err(args_error(
             "fetched content is binary; only text is supported",
         ));
@@ -279,7 +279,7 @@ fn io_error(action: impl AsRef<str>, error: std::io::Error) -> ErrorEnvelope {
     )
 }
 
-fn path_error(path: &PathBuf, error: std::io::Error) -> ErrorEnvelope {
+fn path_error(path: &Path, error: std::io::Error) -> ErrorEnvelope {
     ErrorEnvelope::new(
         ErrorCode::Internal,
         format!("failed to access {}: {error}", path.display()),

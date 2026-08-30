@@ -309,6 +309,7 @@ fn builtin_tool_result_flows_without_middleware() {
                 "properties": { "text": { "type": "string" } }
             }),
             escalation_capable: false,
+            timeout_ms: None,
         },
         Box::new(|args| ToolOutcome::Success {
             value: args["text"].clone(),

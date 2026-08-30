@@ -42,6 +42,10 @@ pub struct ToolSpec {
     pub parameters_schema: serde_json::Value,
     /// 仅当受限沙箱后端挂载时才向模型广告提权出口（P2-4 动态 schema）。
     pub escalation_capable: bool,
+    /// TASK-702：单次执行的 deadline（毫秒）。None = 不限时。
+    /// 超时不取消底层副作用（进程类工具须自行超时），仅以稳定码把结果回给模型。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 impl ToolSpec {
@@ -86,9 +90,10 @@ impl ToolExecution {
     }
 }
 
+/// TASK-702：handler 以 Arc 承载，使超时执行可以把它移入独立线程。
 enum ToolHandler {
-    Plain(Box<ToolFn>),
-    Audited(Box<AuditedToolFn>),
+    Plain(Arc<ToolFn>),
+    Audited(Arc<AuditedToolFn>),
 }
 
 struct RegisteredTool {
@@ -139,7 +144,7 @@ impl ToolRegistry {
         );
         self.tools.push(RegisteredTool {
             spec,
-            handler: ToolHandler::Plain(handler),
+            handler: ToolHandler::Plain(Arc::from(handler)),
         });
     }
 
@@ -152,7 +157,7 @@ impl ToolRegistry {
         );
         self.tools.push(RegisteredTool {
             spec,
-            handler: ToolHandler::Audited(handler),
+            handler: ToolHandler::Audited(Arc::from(handler)),
         });
     }
 
@@ -209,7 +214,7 @@ impl ToolRegistry {
         );
         self.tools.push(RegisteredTool {
             spec,
-            handler: ToolHandler::Plain(handler),
+            handler: ToolHandler::Plain(Arc::from(handler)),
         });
         Ok(())
     }
@@ -285,11 +290,50 @@ impl ToolRegistry {
         if let Err(error) = self.verify_plugin_tool(name) {
             return Some(ToolExecution::new(ToolOutcome::Failure { error }));
         }
+        if let Some(ms) = t.spec.timeout_ms.filter(|ms| *ms > 0) {
+            return Some(
+                run_with_deadline(&t.handler, args, std::time::Duration::from_millis(ms))
+                    .unwrap_or_else(|| {
+                        ToolExecution::new(ToolOutcome::Failure {
+                            error: ErrorEnvelope::new(
+                                protocol::ErrorCode::ToolTimeout,
+                                format!("tool {name} exceeded its {ms}ms execution deadline"),
+                            ),
+                        })
+                    }),
+            );
+        }
         Some(match &t.handler {
             ToolHandler::Plain(handler) => ToolExecution::new(handler(args)),
             ToolHandler::Audited(handler) => handler(args),
         })
     }
+}
+
+/// TASK-702：在独立线程执行 handler 并限时等待；超时返回 None（线程成为分离线程，
+/// 其副作用不被取消——结果仅以稳定码回给模型）。
+fn run_with_deadline(
+    handler: &ToolHandler,
+    args: &serde_json::Value,
+    deadline: std::time::Duration,
+) -> Option<ToolExecution> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let args = args.clone();
+    match handler {
+        ToolHandler::Plain(handler) => {
+            let handler = Arc::clone(handler);
+            std::thread::spawn(move || {
+                let _ = sender.send(ToolExecution::new(handler(&args)));
+            });
+        }
+        ToolHandler::Audited(handler) => {
+            let handler = Arc::clone(handler);
+            std::thread::spawn(move || {
+                let _ = sender.send(handler(&args));
+            });
+        }
+    }
+    receiver.recv_timeout(deadline).ok()
 }
 
 #[cfg(test)]
@@ -307,6 +351,7 @@ mod tests {
                 "properties": { "text": { "type": "string" } }
             }),
             escalation_capable: false,
+            timeout_ms: None,
         }
     }
 
@@ -344,6 +389,62 @@ mod tests {
             Some(ToolOutcome::Success { value }) => assert_eq!(value, "hi"),
             other => panic!("expected success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deadline_exceeded_returns_tool_timeout_and_still_pairing() {
+        let mut reg = ToolRegistry::default();
+        reg.register(
+            ToolSpec {
+                name: "slow".into(),
+                description: "slow handler".into(),
+                parameters_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                escalation_capable: false,
+                timeout_ms: Some(50),
+            },
+            Box::new(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                ToolOutcome::Success { value: ().into() }
+            }),
+        );
+        let started = std::time::Instant::now();
+        match reg.dispatch("slow", &serde_json::json!({})) {
+            Some(ToolOutcome::Failure { error }) => {
+                assert_eq!(error.code, ErrorCode::ToolTimeout);
+                assert!(error.message.contains("deadline"));
+            }
+            other => panic!("expected timeout failure, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "调度必须在 deadline 附近返回而不是等 handler 跑完"
+        );
+    }
+
+    #[test]
+    fn deadline_within_limit_returns_success_with_audits() {
+        let mut reg = ToolRegistry::default();
+        reg.register_audited(
+            ToolSpec {
+                name: "quick".into(),
+                description: "quick audited handler".into(),
+                parameters_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                escalation_capable: false,
+                timeout_ms: Some(1000),
+            },
+            Box::new(|_| ToolExecution {
+                outcome: ToolOutcome::Success { value: ().into() },
+                audits: vec![ToolAudit::ApprovalDecided {
+                    approved: true,
+                    authorization: None,
+                }],
+            }),
+        );
+        let execution = reg
+            .dispatch_with_audit("quick", &serde_json::json!({}))
+            .unwrap();
+        assert!(matches!(execution.outcome, ToolOutcome::Success { .. }));
+        assert_eq!(execution.audits.len(), 1);
     }
 
     #[test]

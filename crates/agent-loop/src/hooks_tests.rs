@@ -69,6 +69,7 @@ fn tool_spec() -> ToolSpec {
         description: "echo".into(),
         parameters_schema: serde_json::json!({"type":"object"}),
         escalation_capable: false,
+        timeout_ms: None,
     }
 }
 

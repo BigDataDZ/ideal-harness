@@ -48,7 +48,7 @@ fn err(result: Option<ToolOutcome>) -> protocol::ErrorEnvelope {
 
 #[test]
 fn write_then_read_roundtrip_and_read_before_write_is_enforced() {
-    let (mut h, _set) = setup("roundtrip");
+    let (h, _set) = setup("roundtrip");
     // 新文件可以直接写
     ok(h.registry.dispatch(
         "fs_write",
@@ -87,7 +87,7 @@ fn write_then_read_roundtrip_and_read_before_write_is_enforced() {
 
 #[test]
 fn edit_requires_read_unique_anchor_and_leaves_file_unchanged_on_failure() {
-    let (mut h, _set) = setup("edit");
+    let (h, _set) = setup("edit");
     std::fs::write(h.root.join("code.txt"), "alpha\nbeta\nalpha\n").unwrap();
     // 未读先编辑 → 拒绝
     assert_eq!(
@@ -140,7 +140,7 @@ fn edit_requires_read_unique_anchor_and_leaves_file_unchanged_on_failure() {
 
 #[test]
 fn path_escape_and_missing_paths_fail_closed() {
-    let (mut h, _set) = setup("escape");
+    let (h, _set) = setup("escape");
     assert_eq!(
         err(h
             .registry
@@ -169,7 +169,7 @@ fn path_escape_and_missing_paths_fail_closed() {
 
 #[test]
 fn symlinked_file_is_not_followed_when_platform_allows_creation() {
-    let (mut h, _set) = setup("symlink");
+    let (h, _set) = setup("symlink");
     let outside = workspace("symlink-outside");
     std::fs::remove_dir_all(&outside).ok();
     std::fs::create_dir_all(&outside).unwrap();
@@ -199,7 +199,7 @@ fn symlinked_file_is_not_followed_when_platform_allows_creation() {
 
 #[test]
 fn glob_supports_recursive_and_wildcard_segments() {
-    let (mut h, _set) = setup("glob");
+    let (h, _set) = setup("glob");
     for path in ["src/a.rs", "src/deep/b.rs", "docs/c.md"] {
         std::fs::create_dir_all(h.root.join(path).parent().unwrap()).unwrap();
         std::fs::write(h.root.join(path), "x").unwrap();
@@ -227,7 +227,7 @@ fn glob_supports_recursive_and_wildcard_segments() {
 
 #[test]
 fn grep_reports_lines_skips_binary_and_spills_on_overflow() {
-    let (mut h, _set) = setup("grep");
+    let (h, _set) = setup("grep");
     std::fs::create_dir_all(h.root.join("src")).unwrap();
     std::fs::write(h.root.join("src/a.rs"), "let apple = 1;\nlet banana = 2;\n").unwrap();
     std::fs::write(h.root.join("bin.dat"), [0u8, 1, 2, b'a']).unwrap();
@@ -275,7 +275,7 @@ fn grep_reports_lines_skips_binary_and_spills_on_overflow() {
 
 #[test]
 fn large_file_read_spills_with_locator_and_counts_as_read() {
-    let (mut h, _set) = setup("big-read");
+    let (h, _set) = setup("big-read");
     let big = format!(
         "{}
 unique-tail-marker

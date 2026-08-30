@@ -43,6 +43,7 @@ fn dsh_style_spec() -> ToolSpec {
             }
         }),
         escalation_capable: true,
+        timeout_ms: None,
     }
 }
 
@@ -107,6 +108,7 @@ fn additional_properties_schema_validates_unknown_values() {
             "additionalProperties": { "type": "string" }
         }),
         escalation_capable: false,
+        timeout_ms: None,
     };
 
     assert!(validate_args(&spec, &serde_json::json!({ "owner": "agent" })).is_ok());
@@ -129,6 +131,7 @@ fn malformed_supported_keywords_are_internal_schema_errors() {
             }
         }),
         escalation_capable: false,
+        timeout_ms: None,
     };
 
     let error = validate_args(&spec, &serde_json::json!({ "values": [] })).unwrap_err();

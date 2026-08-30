@@ -48,7 +48,8 @@ impl FsToolSet {
 
     /// 注册全部文件工具；重复名由 ToolRegistry 断言暴露。
     pub fn register(self: &Arc<Self>, registry: &mut ToolRegistry) {
-        let specs: Vec<(&str, &str, Value, fn(&Arc<Self>, &Value) -> ToolOutcome)> = vec![
+        type FsToolHandler = fn(&Arc<FsToolSet>, &Value) -> ToolOutcome;
+        let specs: Vec<(&str, &str, Value, FsToolHandler)> = vec![
             (
                 "fs_read",
                 "读取工作区内文本文件；path 相对工作区根；返回 {path, content}",
@@ -119,6 +120,7 @@ impl FsToolSet {
                     description: description.to_string(),
                     parameters_schema: schema,
                     escalation_capable: false,
+                    timeout_ms: None,
                 },
                 Box::new(move |args| handler(&set, args)),
             );
@@ -257,7 +259,7 @@ impl FsToolSet {
                 return Err(args_error("query must not be empty"));
             }
             let filter = match args.get("glob") {
-                Some(Value::String(pattern)) => Some(parse_pattern(&pattern)?),
+                Some(Value::String(pattern)) => Some(parse_pattern(pattern)?),
                 _ => None,
             };
             let mut matches: Vec<Value> = Vec::new();
@@ -329,7 +331,7 @@ impl FsToolSet {
             }
             let path = entry.path();
             if file_type.is_dir() {
-                if path.file_name().map_or(false, |name| name == ".harness") {
+                if path.file_name().is_some_and(|name| name == ".harness") {
                     continue;
                 }
                 self.walk(&path, depth + 1, budget, visit)?;

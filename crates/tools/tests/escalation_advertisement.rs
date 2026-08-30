@@ -16,6 +16,7 @@ fn capable_spec() -> ToolSpec {
             }
         }),
         escalation_capable: true,
+        timeout_ms: None,
     }
 }
 

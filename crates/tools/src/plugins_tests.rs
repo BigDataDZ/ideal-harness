@@ -152,6 +152,7 @@ fn undeclared_capability_spec_drift_and_missing_gate_fail_closed() {
                     description: "Greet via plugin".into(),
                     parameters_schema: serde_json::json!({ "type": "object", "properties": {} }),
                     escalation_capable: false,
+                    timeout_ms: None,
                 },
                 Box::new(|_| ToolOutcome::Success { value: ().into() }),
             )
@@ -172,6 +173,7 @@ fn undeclared_capability_spec_drift_and_missing_gate_fail_closed() {
                     description: "not declared".into(),
                     parameters_schema: serde_json::json!({ "type": "object" }),
                     escalation_capable: false,
+                    timeout_ms: None,
                 },
                 Box::new(|_| ToolOutcome::Success { value: ().into() }),
             )
@@ -190,6 +192,7 @@ fn undeclared_capability_spec_drift_and_missing_gate_fail_closed() {
                     "extra": { "type": "string" }
                 } }),
                 escalation_capable: false,
+                timeout_ms: None,
             },
         ),
         (
@@ -199,6 +202,7 @@ fn undeclared_capability_spec_drift_and_missing_gate_fail_closed() {
                 description: "different description".into(),
                 parameters_schema: serde_json::json!({ "type": "object", "properties": {} }),
                 escalation_capable: false,
+                timeout_ms: None,
             },
         ),
         (
@@ -208,6 +212,7 @@ fn undeclared_capability_spec_drift_and_missing_gate_fail_closed() {
                 description: "Greet via plugin".into(),
                 parameters_schema: serde_json::json!({ "type": "object", "properties": {} }),
                 escalation_capable: true,
+                timeout_ms: None,
             },
         ),
     ] {

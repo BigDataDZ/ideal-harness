@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use agent_loop::{AgentLoop, ModelProvider};
 use approval::TerminalApprover;
 use model_provider::{ChatMessage, OpenAiCompatClient};
-use protocol::{ErrorCode, ErrorEnvelope, Event, ModelCallSpec, ToolOutcome};
+use protocol::{ErrorEnvelope, Event, ModelCallSpec, ToolOutcome};
 use sandbox_exec::PlatformRestrictedBackend;
 use sandbox_policy::{SandboxMode, SandboxPolicy};
 use session::{replay_session, JsonlSession, SessionStore};
@@ -244,6 +244,7 @@ fn register_web_fetch_tool(
                 "properties": { "url": { "type": "string" } }
             }),
             escalation_capable: false,
+            timeout_ms: None,
         },
         Box::new(move |args| tool.fetch(args)),
     );
@@ -262,6 +263,7 @@ fn register_demo_tools(registry: &mut ToolRegistry) {
                 "properties": { "text": { "type": "string" } }
             }),
             escalation_capable: false,
+            timeout_ms: None,
         },
         Box::new(|args| ToolOutcome::Success {
             value: serde_json::json!({ "echoed": args["text"] }),
@@ -273,6 +275,7 @@ fn register_demo_tools(registry: &mut ToolRegistry) {
             description: "返回当前 Unix 时间戳（秒）".into(),
             parameters_schema: serde_json::json!({ "type": "object", "properties": {} }),
             escalation_capable: false,
+            timeout_ms: None,
         },
         Box::new(|_| ToolOutcome::Success {
             value: serde_json::json!({
@@ -623,6 +626,7 @@ mod tests {
                     "properties": { "url": { "type": "string" } }
                 }),
                 escalation_capable: false,
+                timeout_ms: None,
             },
             Box::new(move |args| tool.fetch(args)),
         );
@@ -635,7 +639,7 @@ mod tests {
             .unwrap();
         match denied {
             ToolOutcome::Failure { error } => {
-                assert_eq!(error.code, ErrorCode::SandboxDenied);
+                assert_eq!(error.code, protocol::ErrorCode::SandboxDenied);
                 assert!(error.message.contains("not allowlisted"));
             }
             other => panic!("expected denial, got {other:?}"),

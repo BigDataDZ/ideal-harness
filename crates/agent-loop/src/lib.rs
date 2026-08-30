@@ -21,6 +21,16 @@ pub use mcp_bridge::McpInvocation;
 pub use result_guard::{
     guard_tool_result, ToolResultContext, ToolResultDecision, ToolResultMiddleware,
 };
+/// TASK-702：循环防护策略——同一工具连续等参调用先提醒后拒绝。
+/// None = 不启用；这是增强性护栏而非 fail-closed 安全件，缺席时行为与既有完全一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopGuard {
+    /// 第 N 次起在结果中附加提醒。
+    pub remind_after: u32,
+    /// 第 M 次起不再执行 handler，直接回 ToolLoopDetected。
+    pub reject_after: u32,
+}
+
 pub use role_config::{
     parse_roles, AgentRole, RoleCatalog, RoleSubtask, RoleTaskBudget, RoleTaskIdentity,
 };
@@ -104,6 +114,8 @@ struct ChatTurnConfig<'a> {
     hooks: Option<&'a HookRegistry>,
     /// TASK-607：结果进模型表面前的安全中间件。
     result_middleware: Option<&'a dyn ToolResultMiddleware>,
+    /// TASK-702：循环防护；None = 不启用。
+    loop_guard: Option<LoopGuard>,
     agent_path: &'a [String],
 }
 
@@ -132,6 +144,8 @@ pub struct AgentLoop<'a> {
     pub hooks: Option<&'a HookRegistry>,
     /// TASK-607：工具结果进模型前的安全中间件；插件来源结果在缺席时 fail-closed。
     pub result_middleware: Option<&'a dyn ToolResultMiddleware>,
+    /// TASK-702：工具循环防护（同一工具连续等参调用先提醒后拒绝）。
+    pub loop_guard: Option<LoopGuard>,
     /// TASK-602：从根到当前代理的稳定身份路径；usage 通过它归集到所有祖先。
     agent_path: Vec<String>,
 }
@@ -157,6 +171,7 @@ impl<'a> AgentLoop<'a> {
             overflow_recovery: None,
             hooks: None,
             result_middleware: None,
+            loop_guard: None,
             agent_path: vec!["root".into()],
         }
     }
@@ -183,6 +198,7 @@ impl<'a> AgentLoop<'a> {
             overflow_recovery: None,
             hooks: None,
             result_middleware: None,
+            loop_guard: None,
             agent_path: vec!["root".into()],
         }
     }
@@ -330,6 +346,7 @@ impl<'a> AgentLoop<'a> {
                         overflow_recovery: self.overflow_recovery,
                         hooks: self.hooks,
                         result_middleware: self.result_middleware,
+                        loop_guard: self.loop_guard,
                         agent_path: &self.agent_path,
                     },
                     &mut self.chat_history,
@@ -400,6 +417,9 @@ impl<'a> AgentLoop<'a> {
         user_text: &str,
     ) -> Result<(), ErrorEnvelope> {
         let call_id = format!("turn-{turn_id}");
+        // TASK-702：本 turn 内的连续等参调用追踪
+        let mut recent_calls: Vec<(String, String)> = Vec::new();
+        let mut consecutive_calls: u32 = 0;
         session
             .append(Event::UserMessage {
                 text: user_text.to_string(),
@@ -535,11 +555,32 @@ impl<'a> AgentLoop<'a> {
                     return Err(error);
                 }
 
+                let call_key = (tc.name.clone(), tc.arguments.clone());
+                consecutive_calls = if recent_calls.last() == Some(&call_key) {
+                    consecutive_calls + 1
+                } else {
+                    1
+                };
+                recent_calls.push(call_key);
                 let execution = if let Some(e) = parse_err {
                     ToolExecution::new(ToolOutcome::Failure {
                         error: ErrorEnvelope::new(
                             ErrorCode::ToolArgsInvalid,
                             format!("tool arguments 不是合法 JSON: {e}"),
+                        ),
+                    })
+                } else if cfg
+                    .loop_guard
+                    .is_some_and(|guard| consecutive_calls >= guard.reject_after)
+                {
+                    // TASK-702：拒绝分支不触发 handler；配对照常落盘
+                    ToolExecution::new(ToolOutcome::Failure {
+                        error: ErrorEnvelope::new(
+                            ErrorCode::ToolLoopDetected,
+                            format!(
+                                "identical tool call {} repeated {consecutive_calls} times; loop guard rejected it",
+                                tc.name
+                            ),
                         ),
                     })
                 } else {
@@ -587,6 +628,16 @@ impl<'a> AgentLoop<'a> {
                     &tc.name,
                     execution.outcome,
                 );
+                // TASK-702：提醒分支——结果照常交付，附加循环告示
+                let outcome = match cfg.loop_guard {
+                    Some(guard)
+                        if consecutive_calls >= guard.remind_after
+                            && consecutive_calls < guard.reject_after =>
+                    {
+                        wrap_loop_reminder(outcome, consecutive_calls)
+                    }
+                    _ => outcome,
+                };
                 session
                     .append(Event::ToolResultAdded {
                         call_id: tc.id.clone(),
@@ -699,6 +750,20 @@ impl<'a> AgentLoop<'a> {
 
     pub(crate) fn execute_hook(&mut self, context: HookContext) -> Result<(), ErrorEnvelope> {
         execute_hook(self.hooks, context, self.session)
+    }
+}
+
+fn wrap_loop_reminder(outcome: ToolOutcome, times: u32) -> ToolOutcome {
+    match outcome {
+        ToolOutcome::Success { value } => ToolOutcome::Success {
+            value: serde_json::json!({
+                "result": value,
+                "guard_notice": format!(
+                    "repeated identical tool call #{times}; if the result is not changing, stop calling the tool and answer with what you have"
+                ),
+            }),
+        },
+        other => other,
     }
 }
 
@@ -927,6 +992,7 @@ mod tests {
                 "properties": { "text": { "type": "string" } }
             }),
             escalation_capable: false,
+            timeout_ms: None,
         }
     }
 

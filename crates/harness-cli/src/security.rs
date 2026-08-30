@@ -95,6 +95,7 @@ pub(crate) fn register_exec_tool<B>(
                 }
             }),
             escalation_capable: true,
+            timeout_ms: None,
         },
         Box::new(move |args| execute_restricted(args, &pool, approver.as_deref())),
     );

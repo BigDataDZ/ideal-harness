@@ -223,6 +223,7 @@ impl PluginCatalog {
                 description: declaration.description().to_string(),
                 parameters_schema: declaration.parameters_schema().clone(),
                 escalation_capable: false,
+                timeout_ms: None,
             };
             let payload = payload.clone();
             registry.register_plugin_tool(
