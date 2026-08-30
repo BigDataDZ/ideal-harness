@@ -646,6 +646,7 @@ fn demo() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ih-cli-{}-{name}", std::process::id()))
@@ -1148,6 +1149,230 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(parsed.fetch_allow, vec!["docs.example", "wiki.example"]);
+    }
+
+    /// TASK-808 验收：scripted 端到端——「读仓库 → 定位 → 编辑 → 跑测试 → 完成」
+    /// 全程走生产装配（register_chat_tools + 受限 exec + CAS），离线无 key。
+    #[test]
+    fn scripted_end_to_end_code_task_through_production_assembly() {
+        use approval::{Decision, EscalationRequest};
+        use sandbox_exec::{CommandSpec, ExecutionOutput, RestrictedBackend};
+
+        struct AlwaysApprove;
+        impl approval::Approver for AlwaysApprove {
+            fn decide(&self, _: &EscalationRequest) -> Decision {
+                Decision::Approved
+            }
+        }
+
+        struct ScriptedBackend {
+            workspace: PathBuf,
+        }
+        impl RestrictedBackend for ScriptedBackend {
+            fn environment(&self) -> std::io::Result<protocol::ExecutorEnvironment> {
+                Ok(protocol::ExecutorEnvironment {
+                    os: "windows".into(),
+                    home: std::env::temp_dir().display().to_string(),
+                    workspace: self.workspace.display().to_string(),
+                    generation: 0,
+                })
+            }
+
+            fn execute(&self, _: &CommandSpec) -> std::io::Result<ExecutionOutput> {
+                Ok(ExecutionOutput {
+                    process_id: std::process::id() + 7,
+                    exit_code: 0,
+                    stdout: b"tests: 1 passed".to_vec(),
+                    stderr: Vec::new(),
+                    restricted: true,
+                })
+            }
+        }
+
+        let workspace = tmp("e2e-repo");
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("src/lib.rs"),
+            "pub fn add(a: i32) -> i32 {\n    a + 1\n}\n",
+        )
+        .unwrap();
+
+        // 生产装配（与 cmd_chat 同一入口）+ 受限 exec
+        let cancel_token = tools::CancellationToken::default();
+        let mut registry = ToolRegistry::default();
+        register_chat_tools(
+            &mut registry,
+            &workspace,
+            None,
+            &[],
+            "http://127.0.0.1:1",
+            &cancel_token,
+        )
+        .unwrap();
+        registry.set_escalation_availability(EscalationAvailability::RestrictedBackendMounted);
+        register_exec_tool(
+            &mut registry,
+            ScriptedBackend {
+                workspace: workspace.clone(),
+            },
+            Some(std::sync::Arc::new(AlwaysApprove)),
+        );
+
+        // 脚本：grep 定位 → 读取（拿 hash）→ CAS 编辑 → 跑测试 → 完成
+        let script = Mutex::new(vec![
+            serde_json::json!({ "tool": "fs_grep", "args": { "query": "a + 1", "glob": "**/*.rs" } }),
+            serde_json::json!({ "tool": "fs_read", "args": { "path": "src/lib.rs" } }),
+            serde_json::json!("READ_THEN_EDIT"),
+            serde_json::json!({ "tool": "exec", "args": { "program": "cargo", "args": ["test"], "sandbox_permissions": "workspace-write", "justification": "run the project tests" } }),
+            // 上面第 3 步是哨兵：READ_THEN_EDIT 用前一步 fs_read 的 hash 构造 CAS 编辑
+        ]);
+        struct DispatchingModel<'a> {
+            script: &'a Mutex<Vec<serde_json::Value>>,
+            hash: std::sync::Mutex<Option<String>>,
+            step: AtomicUsize,
+        }
+        impl model_provider::ChatModel for DispatchingModel<'_> {
+            fn stream_chat(
+                &self,
+                _: &protocol::ModelCallSpec,
+                _: &[model_provider::ChatMessage],
+                _: Option<&serde_json::Value>,
+            ) -> Result<model_provider::ChatReply, ErrorEnvelope> {
+                let step = self.step.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let action = {
+                    let mut queue = self.script.lock().unwrap();
+                    if queue.is_empty() {
+                        None
+                    } else {
+                        Some(queue.remove(0))
+                    }
+                };
+                let Some(action) = action else {
+                    return Ok(model_provider::ChatReply {
+                        text: "修复完成，测试通过".into(),
+                        finish_reason: Some("stop".into()),
+                        tool_calls: vec![],
+                        usage: None,
+                    });
+                };
+                // 特殊步骤：读取上一步 fs_read 的 hash 再构造 CAS 编辑
+                if action.as_str() == Some("READ_THEN_EDIT") {
+                    let hash = self.hash.lock().unwrap().clone().expect("hash captured");
+                    return Ok(model_provider::ChatReply {
+                        text: String::new(),
+                        finish_reason: Some("tool_calls".into()),
+                        tool_calls: vec![model_provider::ToolCallRequest {
+                            id: format!("call_edit_{step}"),
+                            name: "fs_edit".into(),
+                            arguments: serde_json::json!({
+                                "path": "src/lib.rs",
+                                "old_string": "a + 1",
+                                "new_string": "a + 2",
+                                "expected_hash": hash
+                            })
+                            .to_string(),
+                        }],
+                        usage: None,
+                    });
+                }
+                let tool = action["tool"].as_str().unwrap().to_string();
+                let arguments = action["args"].clone();
+                Ok(model_provider::ChatReply {
+                    text: String::new(),
+                    finish_reason: Some("tool_calls".into()),
+                    tool_calls: vec![model_provider::ToolCallRequest {
+                        id: format!("call_{step}"),
+                        name: tool,
+                        arguments: serde_json::to_string(&arguments).unwrap(),
+                    }],
+                    usage: None,
+                })
+            }
+        }
+
+        // hash 捕获：借助一层 fs_read 结果缓存（真实装配中模型自行读取返回值）
+        let hash_holder: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        // 先用 fs_read 拿到 hash（模拟模型读到返回值）
+        let probe_registry_read = {
+            let set = tools::FsToolSet::new(&workspace).unwrap();
+            let mut reg = ToolRegistry::default();
+            set.register(&mut reg);
+            reg
+        };
+        let read_result = probe_registry_read
+            .dispatch("fs_read", &serde_json::json!({ "path": "src/lib.rs" }))
+            .unwrap();
+        match read_result {
+            ToolOutcome::Success { value } => {
+                *hash_holder.lock().unwrap() = Some(value["hash"].as_str().unwrap().to_string());
+            }
+            other => panic!("probe read failed: {other:?}"),
+        }
+
+        let path = tmp("e2e.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut session = JsonlSession::create(path.clone()).unwrap();
+        let model = DispatchingModel {
+            script: &script,
+            hash: std::sync::Mutex::new((*hash_holder.lock().unwrap()).clone()),
+            step: AtomicUsize::new(0),
+        };
+        let mut lp = AgentLoop::with_chat(
+            &mut session,
+            &registry,
+            &model,
+            protocol::ModelCallSpec {
+                model: "scripted".into(),
+                base_url: "http://localhost".into(),
+                temperature: None,
+            },
+        );
+        lp.result_middleware = Some(&ProductionResultMiddleware {
+            max_result_bytes: 256 * 1024,
+        });
+        lp.loop_guard = Some(LoopGuard {
+            remind_after: 3,
+            reject_after: 8,
+        });
+        lp.mark_queued_inputs_consumed();
+        lp.inbox.push("修复 add 函数");
+        assert_eq!(lp.run_turn(), 1);
+
+        // 断言：文件真实被 CAS 编辑
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("src/lib.rs")).unwrap(),
+            "pub fn add(a: i32) -> i32 {\n    a + 2\n}\n"
+        );
+        // 断言：事件轨迹完整（grep → read → edit → exec → 完成），exec 有审批审计
+        let events = replay_session(&path).unwrap();
+        let tools_called: Vec<String> = events
+            .iter()
+            .filter_map(|sequenced| match &sequenced.event {
+                Event::ToolCallRequested { tool, .. } => Some(tool.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tools_called,
+            vec![
+                "fs_grep".to_string(),
+                "fs_read".to_string(),
+                "fs_edit".to_string(),
+                "exec".to_string()
+            ]
+        );
+        assert!(events.iter().any(|sequenced| matches!(
+            &sequenced.event,
+            Event::ApprovalDecided { approved: true, .. }
+        )));
+        assert!(matches!(
+            events.last().unwrap().event,
+            Event::TurnCompleted { .. }
+        ));
+        std::fs::remove_dir_all(&workspace).ok();
+        std::fs::remove_file(&path).ok();
     }
 
     /// TASK-701 装配冒烟：工作区 → FsToolSet 注册 → read/write/edit 闭环。
