@@ -275,20 +275,19 @@ fn recover_dangling_turn(session: &mut dyn SessionStore) -> anyhow::Result<bool>
     Ok(true)
 }
 
-/// 从事件流重建模型可见历史：user/assistant 成对回放；
-/// 工具调用中间态由该 turn 的最终 assistant 文本概括（MVP 语义，P3 压缩接管）。
+/// TASK-601：从唯一事件流投影完整模型可见历史；审计事件不会混入上下文。
 fn rebuild_history(path: &Path) -> anyhow::Result<Vec<ChatMessage>> {
-    let mut out = Vec::new();
-    for se in replay_session(path)? {
-        match se.event {
-            Event::UserMessage { text } => out.push(ChatMessage::user(text)),
-            Event::AssistantMessage { text } if !text.is_empty() => {
-                out.push(ChatMessage::assistant(text))
-            }
-            _ => {}
-        }
-    }
-    Ok(out)
+    session::project_model_surface(&replay_session(path)?)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "model surface projection failed ({:?}): {}",
+                error.code,
+                error.message
+            )
+        })?
+        .into_iter()
+        .map(|entry| ChatMessage::try_from(entry.message).map_err(anyhow::Error::from))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn rebuild_history_pairs_user_and_assistant_only() {
+    fn rebuild_history_ignores_non_surface_stream_events() {
         let path = tmp("rebuild.jsonl");
         let _ = std::fs::remove_file(&path);
         {
@@ -433,6 +432,86 @@ mod tests {
         }
         let h = rebuild_history(&path).unwrap();
         assert_eq!(h, vec![ChatMessage::user("q"), ChatMessage::assistant("a")]);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rebuild_history_restores_tools_and_exact_compaction_without_audit_hooks() {
+        let path = tmp("rebuild-tools.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let model_outcome = ToolOutcome::Success {
+            value: serde_json::json!("ok"),
+        };
+        {
+            let mut js = JsonlSession::create(path.clone()).unwrap();
+            js.append(Event::UserMessage { text: "old".into() })
+                .unwrap();
+            js.append(Event::AssistantMessage {
+                text: "old answer".into(),
+            })
+            .unwrap();
+            js.append(Event::UserMessage { text: "q".into() }).unwrap();
+            js.append(Event::ModelToolCallsRequested {
+                request_id: "r1".into(),
+                calls: vec![protocol::ModelToolCall {
+                    id: "c1".into(),
+                    name: "lookup".into(),
+                    arguments: r#"{"q":"rust"}"#.into(),
+                }],
+            })
+            .unwrap();
+            js.append(Event::ToolCallRequested {
+                call_id: "c1".into(),
+                tool: "lookup".into(),
+                args: serde_json::json!({"q":"rust"}),
+            })
+            .unwrap();
+            js.append(Event::ToolResultAdded {
+                call_id: "c1".into(),
+                outcome: model_outcome.clone(),
+            })
+            .unwrap();
+            js.append(Event::ToolCallRequested {
+                call_id: "hook-1".into(),
+                tool: "hook:audit".into(),
+                args: serde_json::json!({}),
+            })
+            .unwrap();
+            js.append(Event::ToolResultAdded {
+                call_id: "hook-1".into(),
+                outcome: ToolOutcome::Success {
+                    value: serde_json::Value::Null,
+                },
+            })
+            .unwrap();
+            js.append(Event::AssistantMessage {
+                text: "done".into(),
+            })
+            .unwrap();
+            js.append(Event::CompactionApplied {
+                summary: "older context".into(),
+                compacted_messages: Some(2),
+                source_event_seqs: vec![0, 1],
+            })
+            .unwrap();
+        }
+
+        let history = rebuild_history(&path).unwrap();
+        assert_eq!(history.len(), 5);
+        assert_eq!(
+            history[0],
+            ChatMessage::system("Compacted conversation summary:\nolder context")
+        );
+        assert_eq!(history[1], ChatMessage::user("q"));
+        assert_eq!(history[2].tool_calls.as_ref().unwrap()[0].id, "c1");
+        assert_eq!(
+            history[3],
+            ChatMessage::tool_result("c1", serde_json::to_string(&model_outcome).unwrap())
+        );
+        assert_eq!(history[4], ChatMessage::assistant("done"));
+        assert!(history
+            .iter()
+            .all(|message| !message.content.contains("hook:audit")));
         std::fs::remove_file(&path).ok();
     }
 

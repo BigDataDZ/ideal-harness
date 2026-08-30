@@ -21,6 +21,13 @@
 | D11 | 上下文压缩 | ContextManager+预采样压缩+AutoCompactWindow | ✅ 双触发（压力阈值+溢出报错）+强制压缩后自动 retry+两段式裁剪 | **学 DSH：双触发+自动重试**（TASK-303 填 TODO 挂点） | ⚠️ 铁律：裁剪永不拆散 tool_call/result 配对（P3 起属性测试强制） |
 | D12 | 测试基建 | ~600 *_tests.rs+insta 快照 741 | ✅ LLM mock 故障注入服务器+录制回放+100% 覆盖门禁 | **学 DSH 思想：mock 故障注入为必选项**；快照暂不引入 | ⚠️ 凡依赖 trait（ModelProvider/Approver）的逻辑必须测失败路径；临时文件用 temp_dir+进程 id，不引 tempfile 依赖 |
 | D13 | UI/客户端 | TUI/app-server/MCP-server 三前端说同一协议 | Web 纯投影+SSE 补洞 repairGap | **UI 是纯投影**（两家共识） | 客户端不得持有第二真相源；P5 才做 |
+| D14 | 模型可见历史 | rollout 记录结构化模型输入并维护压缩 lineage | surface event 与 log-only event 分离，`surfaceOp/sourceEventSeqs` 可重建 | **事件流派生唯一 Model Surface**（TASK-601） | 审计工具事件不得误入模型历史；压缩必须表达确定性的 replace-prefix 操作；旧事件缺元数据时兼容但不得伪造精确来源 |
+| D15 | 层级预算 | 根目标统一计算主代理与嵌套 subagent 消耗 | 子任务声明预算并持久化 delegation depth | **根预算账本 + 子树用量**（TASK-602） | 准入额度不是实际消费；每次模型 usage 必须落 Event，子代理不能绕过根预算 |
+| D16 | 权限时效 | Guardian 判定绑定当前权限状态；远端执行使用目标机真实环境 | host facts 带 generation，连接重建后替换瞬态状态 | **policy epoch + executor facts**（TASK-603） | 策略、工作区或执行目标变化后旧审批立即失效；未知目标环境 fail-closed |
+| D17 | MCP 运行时 | required/optional 发现宽限、结构化错误、按工具限额与动态刷新 | connection-owned transport + generation guard | **受监管 MCP registry**（TASK-604） | 可选服务超时只降级，必需服务失败则拒绝；旧 generation 的工具句柄不可调用 |
+| D18 | RPC 连续性 | app-server 线程恢复、能力协商与服务端请求 | follow-before-page、连接 generation、gap tail repair | **先强化只读流，再开放写 RPC**（TASK-605） | `last_seq` 与 generation 双校验；只对传输中断自动续接，业务错误不无限重试 |
+| D19 | Agent Team | subagent 并行但提醒写冲突与 token 成本 | 持久 mailbox + CAS task DAG + blockedBy/writeScopes | **事件溯源的轻量 Team Coordinator**（TASK-606） | 首版只做任务所有权与写范围重叠告警，不做强制文件锁和跨进程调度 |
+| D20 | 插件供应链 | plugin catalog 统一打包 skills/MCP/hooks，信任后启用 | 能力经容器组合与宿主连接提供 | **可信清单 + 能力声明 + 结果中间件**（TASK-607） | 先校验来源/哈希/权限再加载；插件失败不能遮蔽其他有效插件，不执行任意 shell hook |
 
 ## 二、本项目独有的环境注意点（两家文档都没有的）
 

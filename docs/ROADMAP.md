@@ -16,6 +16,7 @@
 | P4 | v0.5 ✅ | **会话产品化**：resume/fork/投影存储 | 断点续聊；fork 分支独立演化 |
 | P4.1 | v0.5.1 ✅ | **可靠性收口**：统一存储、崩溃恢复、subagent 治理 | 压缩会话可恢复；子代理资源与权限不越界 |
 | P5 | v0.6 ✅ | **扩展生态**：MCP/skill/hooks/Web 投影 | 第三方工具可控接入；客户端断线可按 seq 补洞 |
+| P6 | v0.7 🚧 | **运行时闭环**：忠实重放、层级预算、权限时效与受监管扩展 | resume 与在线上下文等价；预算/权限/连接状态不可被旧状态绕过 |
 
 并行规则：**同一阶段内不同 crate 的任务卡可由多个智能体并行认领；涉及 protocol 的任务串行**（契约冻结原则）。
 
@@ -166,7 +167,63 @@
 
 ---
 
-## 八、质量门禁演进（随阶段收紧）
+## 八、P6 运行时闭环（v0.7）
+
+### TASK-601: 模型可见历史统一投影 ✅（完成，待提交）
+- 目标 crate: protocol ⚠️串行、session、model-provider、agent-loop、harness-cli
+- 内容: 区分模型表面事件与纯审计事件；压缩记录确定性的 replace-prefix 操作及来源事件；resume 统一从事件流投影模型历史
+- 验收标准:
+  1. user/assistant/tool_call/tool_result/compaction 可重放为与在线运行语义一致的模型消息，Hook 等审计工具调用不得混入
+  2. 压缩替换不拆 tool_call/tool_result，非法来源、重复结果、缺失结果 fail-closed
+  3. 旧 JSONL（含旧格式 CompactionApplied）仍可读取；新增协议字段和事件有序列化兼容测试
+- 明确不做: 不改变 provider HTTP 协议；不修复历史文件；不新增持久化后端或外部依赖
+- 依赖: TASK-504
+
+### TASK-602: 根预算与子树 Token 用量账本
+- 目标 crate: protocol ⚠️串行、context、agent-loop、session
+- 内容: provider usage 优先、估算兜底；记录 own/subtree/root remaining；嵌套 subagent 消耗归集根预算
+- 验收标准: 主代理与两层子代理消费均落 Event；重放可恢复余额；超限在下一次采样前稳定拒绝且 runner/provider 零调用
+- 明确不做: 不实现计费；不按 message 文本推断错误；不允许子策略扩大根预算
+- 依赖: TASK-601
+
+### TASK-603: 权限 epoch 与执行环境事实
+- 目标 crate: protocol ⚠️串行、sandbox-policy、sandbox-exec、approval、tools
+- 内容: 审批绑定 policy epoch、权限配置摘要和 executor OS/home/workspace facts；状态变化使旧授权失效
+- 验收标准: policy/workspace/target 任一变化后旧决定不可复用；未知或过期环境 fail-closed；授权与失效均留 Event
+- 明确不做: 不实现远程执行协议；不缓存凭据；不改变 SandboxMode 三档语义
+- 依赖: TASK-602
+
+### TASK-604: 受监管 MCP registry
+- 目标 crate: tools、agent-loop
+- 内容: required/optional 服务状态机、发现宽限、connection generation、结构化错误、按工具输出限制与安全结果中间件
+- 验收标准: optional 超时可降级而 required 失败拒绝启动；旧 generation 调用被拒；单服务失败不隐藏其他有效目录
+- 明确不做: 不做 HTTP MCP/OAuth；不引入异步运行时；不执行服务端任意代码
+- 依赖: TASK-603
+
+### TASK-605: generation-aware RPC/SSE 连续性
+- 目标 crate: protocol ⚠️串行、harness-cli
+- 内容: follow-before-page、connection generation、Last-Event-ID 续传与序号缺口修复；服务端能力协商保持只读
+- 验收标准: 首屏与并发追加无窗口丢失；断线补洞无重无漏；旧 generation、坏 cursor 和业务错误不自动无限重试
+- 明确不做: 不开放远程写、审批或公网监听；不实现完整 Web UI/认证
+- 依赖: TASK-604
+
+### TASK-606: 持久化 Agent Team 协调层
+- 目标 crate: protocol ⚠️串行、session、agent-loop
+- 内容: durable roster/mailbox、消息去重、带 revision/CAS 的任务 DAG、blockedBy 与 writeScopes 重叠告警
+- 验收标准: 崩溃重放恢复团队状态；重复消息恰好投递一次；环依赖/旧 revision fail-closed；写范围冲突产生审计告警
+- 明确不做: 不强制文件锁；不跨进程调度；不允许团队成员扩大父权限
+- 依赖: TASK-605
+
+### TASK-607: 可信插件清单与结果中间件
+- 目标 crate: tools、agent-loop、harness-cli
+- 内容: 本地插件 manifest、来源/哈希/能力声明校验；有效目录隔离加载；工具结果进模型前可检查、脱敏或拒绝
+- 验收标准: 路径逃逸/哈希漂移/未声明能力拒绝；坏插件不遮蔽好插件；安全中间件缺席或失败时 fail-closed 并留 Event
+- 明确不做: 不做远端市场/自动下载；不执行 shell hook；不引入新 workspace 外部依赖
+- 依赖: TASK-606
+
+---
+
+## 九、质量门禁演进（随阶段收紧）
 
 | 门禁 | P0 现在 | P1 起 | P2 起 | P3 起 |
 |---|---|---|---|---|
@@ -176,14 +233,14 @@
 | 属性测试 | — | — | — | 配对完整性必须 |
 | 审计事件覆盖 | — | — | 网络拒绝必须落事件 | 自动压缩必须落事件 |
 
-## 九、规范自身的演进规则
+## 十、规范自身的演进规则
 
 1. 改 `DEVELOPMENT.md`/`AGENTS.md` 的 PR 必须在标题加 `[spec]` 前缀，人工 review
 2. 新 crate 入册：PR 同时更新所有权地图（AGENTS.md §1）与本文档依赖图
 3. 任务卡完成后：在本文件对应卡片打 ✅ 并附 PR 链接，禁止删除历史卡片
 4. 阶段出口评审：人类守护者按「出口判据」逐条打勾后才开下一阶段的卡
 
-## 十、给协调者的并行调度建议
+## 十一、给协调者的并行调度建议
 
 - **可并行组**：{102, 104} 与 {201} 与 {403} 互不触碰
 - **串行链**：101 → 103 → 303（协议→闭环→自愈，一条线一个人/代理跟到底）

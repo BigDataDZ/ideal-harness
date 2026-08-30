@@ -23,7 +23,7 @@ pub use subagent::{SubagentReport, SubagentRunner, SubagentTask, SubagentTrace};
 pub use subagent_lifecycle::{SubagentCancellation, SubagentDelegation};
 pub use subagent_policy::{SubagentPolicy, SubagentRequest};
 
-use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
+use protocol::{ErrorCode, ErrorEnvelope, Event, ModelToolCall, ToolOutcome};
 use session::SessionStore;
 use tools::{ToolAudit, ToolExecution, ToolRegistry};
 
@@ -332,7 +332,7 @@ impl<'a> AgentLoop<'a> {
             .ok();
         history.push(ChatMessage::user(user_text));
 
-        for _round in 0..cfg.max_tool_rounds {
+        for round in 0..cfg.max_tool_rounds {
             let mut overflow_retries = 0;
             let reply = loop {
                 let reply = chat.stream_chat(cfg.spec, history, cfg.tool_definitions);
@@ -385,10 +385,24 @@ impl<'a> AgentLoop<'a> {
                 return Ok(());
             }
 
+            session
+                .append(Event::ModelToolCallsRequested {
+                    request_id: format!("turn-{turn_id}-round-{round}"),
+                    calls: reply
+                        .tool_calls
+                        .iter()
+                        .map(|call| ModelToolCall {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        })
+                        .collect(),
+                })
+                .ok();
             history.push(ChatMessage::assistant_with_tool_calls(
                 reply.tool_calls.clone(),
             ));
-            for tc in &reply.tool_calls {
+            for (call_index, tc) in reply.tool_calls.iter().enumerate() {
                 // 参数必须是合法 JSON：非法则不触发 handler，直接回自纠码
                 // （配对完整：ToolCallRequested 先落盘，结果随后必达）。
                 let (args, parse_err) =
@@ -422,6 +436,12 @@ impl<'a> AgentLoop<'a> {
                         tc.id.clone(),
                         serde_json::to_string(&outcome).unwrap_or_default(),
                     ));
+                    Self::close_unexecuted_model_calls(
+                        session,
+                        history,
+                        &reply.tool_calls[call_index + 1..],
+                        &error,
+                    );
                     return Err(error);
                 }
 
@@ -467,7 +487,7 @@ impl<'a> AgentLoop<'a> {
                     tc.id.clone(),
                     serde_json::to_string(&outcome).unwrap_or_default(),
                 ));
-                execute_hook(
+                if let Err(error) = execute_hook(
                     cfg.hooks,
                     HookContext::tool(
                         HookPoint::PostToolUse,
@@ -477,7 +497,15 @@ impl<'a> AgentLoop<'a> {
                         Some(outcome),
                     ),
                     session,
-                )?;
+                ) {
+                    Self::close_unexecuted_model_calls(
+                        session,
+                        history,
+                        &reply.tool_calls[call_index + 1..],
+                        &error,
+                    );
+                    return Err(error);
+                }
             }
         }
 
@@ -488,6 +516,41 @@ impl<'a> AgentLoop<'a> {
                 cfg.max_tool_rounds
             ),
         ))
+    }
+
+    fn close_unexecuted_model_calls(
+        session: &mut dyn SessionStore,
+        history: &mut Vec<ChatMessage>,
+        remaining: &[model_provider::ToolCallRequest],
+        cause: &ErrorEnvelope,
+    ) {
+        for call in remaining {
+            let args = serde_json::from_str(&call.arguments)
+                .unwrap_or_else(|_| serde_json::Value::String(call.arguments.clone()));
+            session
+                .append(Event::ToolCallRequested {
+                    call_id: call.id.clone(),
+                    tool: call.name.clone(),
+                    args,
+                })
+                .ok();
+            let outcome = ToolOutcome::Failure {
+                error: ErrorEnvelope::new(
+                    cause.code,
+                    "tool was not executed because an earlier call in the batch failed",
+                ),
+            };
+            session
+                .append(Event::ToolResultAdded {
+                    call_id: call.id.clone(),
+                    outcome: outcome.clone(),
+                })
+                .ok();
+            history.push(ChatMessage::tool_result(
+                call.id.clone(),
+                serde_json::to_string(&outcome).unwrap_or_default(),
+            ));
+        }
     }
 
     fn abort(&mut self, turn_id: u64, reason: String) {
@@ -604,6 +667,10 @@ mod tests {
 
         fn path(&self) -> &Path {
             &self.path
+        }
+
+        fn replay_events(&self) -> std::io::Result<Vec<SequencedEvent>> {
+            Ok(self.events.clone())
         }
     }
 
@@ -797,6 +864,7 @@ mod tests {
             Event::ModelChunkReceived { .. } => "model_chunk",
             Event::ToolCallRequested { .. } => "tool_call_requested",
             Event::ToolResultAdded { .. } => "tool_result_added",
+            Event::ModelToolCallsRequested { .. } => "model_tool_calls_requested",
             Event::CompactionApplied { .. } => "compaction",
             Event::ApprovalDecided { .. } => "approval",
             Event::NetworkAccessDenied { .. } => "network_access_denied",
@@ -835,6 +903,7 @@ mod tests {
                 "turn_started",
                 "user_message",
                 "model_chunk", // 第 1 轮采样文本留痕
+                "model_tool_calls_requested",
                 "tool_call_requested",
                 "tool_result_added", // 与调用严格配对
                 "model_chunk",       // 第 2 轮采样文本
@@ -842,7 +911,7 @@ mod tests {
                 "turn_completed",
             ]
         );
-        match &evs[4].event {
+        match &evs[5].event {
             Event::ToolResultAdded { outcome, .. } => match outcome {
                 ToolOutcome::Success { value } => assert_eq!(value, "hi"),
                 other => panic!("expected success outcome, got {other:?}"),
@@ -915,7 +984,7 @@ mod tests {
         assert_eq!(lp.run_turn(), 1);
 
         let evs = events(&path);
-        match &evs[3].event {
+        match &evs[4].event {
             Event::ToolResultAdded { outcome, .. } => match outcome {
                 ToolOutcome::Failure { error } => {
                     assert_eq!(error.code, ErrorCode::ToolArgsInvalid)
@@ -954,7 +1023,7 @@ mod tests {
         assert_eq!(lp.run_turn(), 1);
 
         let evs = events(&path);
-        match &evs[3].event {
+        match &evs[4].event {
             Event::ToolResultAdded { outcome, .. } => match outcome {
                 ToolOutcome::Failure { error } => {
                     assert_eq!(error.code, ErrorCode::ToolArgsInvalid)

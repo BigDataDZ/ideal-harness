@@ -183,6 +183,10 @@ impl SessionStore for ProjectedSession {
     fn path(&self) -> &Path {
         self.source_path()
     }
+
+    fn replay_events(&self) -> io::Result<Vec<SequencedEvent>> {
+        replay(self.source.path())
+    }
 }
 
 fn replace_projection(transaction: &Transaction<'_>, events: &[SequencedEvent]) -> io::Result<()> {

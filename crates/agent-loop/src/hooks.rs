@@ -373,6 +373,10 @@ mod tests {
         fn path(&self) -> &Path {
             &self.path
         }
+
+        fn replay_events(&self) -> std::io::Result<Vec<SequencedEvent>> {
+            Ok(self.events.clone())
+        }
     }
 
     #[test]

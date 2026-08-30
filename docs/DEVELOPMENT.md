@@ -118,3 +118,4 @@
 | TASK-301~304 | context/session/agent-loop | P3 上下文工程 | 见 ROADMAP |
 | TASK-401~412 | harness-cli/session/agent-loop/protocol | P4/P4.1 会话产品化与可靠性收口 | 见 ROADMAP |
 | TASK-501~504 | tools/agent-loop/protocol/harness-cli | P5 扩展生态 | 见 ROADMAP |
+| TASK-601~607 | protocol/session/context/agent-loop/tools/cli | P6 运行时闭环 | 见 ROADMAP |

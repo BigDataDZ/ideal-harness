@@ -10,7 +10,7 @@
 use std::io::{BufRead, Read};
 use std::time::Duration;
 
-use protocol::{ErrorCode, ErrorEnvelope, ModelCallSpec};
+use protocol::{ErrorCode, ErrorEnvelope, ModelCallSpec, ModelSurfaceMessage};
 use serde::{Deserialize, Serialize};
 
 /// API key 的环境变量名（任务卡指定）。
@@ -132,6 +132,35 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: Some(call_id.into()),
         }
+    }
+}
+
+impl TryFrom<ModelSurfaceMessage> for ChatMessage {
+    type Error = serde_json::Error;
+
+    fn try_from(message: ModelSurfaceMessage) -> Result<Self, Self::Error> {
+        Ok(match message {
+            ModelSurfaceMessage::SystemSummary { text } => {
+                ChatMessage::system(format!("Compacted conversation summary:\n{text}"))
+            }
+            ModelSurfaceMessage::User { text } => ChatMessage::user(text),
+            ModelSurfaceMessage::Assistant { text } => ChatMessage::assistant(text),
+            ModelSurfaceMessage::AssistantToolCalls { calls, .. } => {
+                ChatMessage::assistant_with_tool_calls(
+                    calls
+                        .into_iter()
+                        .map(|call| ToolCallRequest {
+                            id: call.id,
+                            name: call.name,
+                            arguments: call.arguments,
+                        })
+                        .collect(),
+                )
+            }
+            ModelSurfaceMessage::ToolResult { call_id, outcome } => {
+                ChatMessage::tool_result(call_id, serde_json::to_string(&outcome)?)
+            }
+        })
     }
 }
 
@@ -680,5 +709,29 @@ mod tests {
         let tool = ChatMessage::tool_result("call_1", r#"{"ok":true}"#);
         let jt = serde_json::to_string(&tool).unwrap();
         assert!(jt.contains(r#""tool_call_id":"call_1""#), "{jt}");
+    }
+
+    #[test]
+    fn model_surface_conversion_preserves_tool_arguments_and_outcome() {
+        let assistant = ChatMessage::try_from(ModelSurfaceMessage::AssistantToolCalls {
+            request_id: "r1".into(),
+            calls: vec![protocol::ModelToolCall {
+                id: "c1".into(),
+                name: "lookup".into(),
+                arguments: r#"{"q":1}"#.into(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(assistant.tool_calls.unwrap()[0].arguments, r#"{"q":1}"#);
+
+        let outcome = protocol::ToolOutcome::Success {
+            value: serde_json::json!({"answer": 42}),
+        };
+        let tool = ChatMessage::try_from(ModelSurfaceMessage::ToolResult {
+            call_id: "c1".into(),
+            outcome: outcome.clone(),
+        })
+        .unwrap();
+        assert_eq!(tool.content, serde_json::to_string(&outcome).unwrap());
     }
 }

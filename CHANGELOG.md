@@ -7,6 +7,7 @@
 
 ### Added
 
+- **protocol/session/agent-loop/harness-cli（TASK-601）**：新增唯一 Model Surface 契约与事件投影；模型工具调用批次和压缩 replace-prefix/source seq 可忠实重放，Hook 等纯审计调用不会混入 resume 上下文；旧 JSONL 保持可读
 - **protocol（TASK-504）**：新增只读会话 timeline、SSE event frame、查询参数与统一 RPC 错误 DTO，并增加 `SessionNotFound` / `CursorInvalid` 稳定错误码
 - **harness-cli（TASK-504）**：新增 loopback-only `serve` 子命令；按请求重放 JSONL 真相源，支持 timeline 分页与 `last_seq` SSE 无重无漏补洞；非本机监听、写方法、路径穿越、坏 cursor 和未知会话均 fail-closed
 - **protocol（TASK-203）**：新增 `NetworkAccessDenied` 稳定审计事件，记录被白名单代理拒绝的 host、port 与结构化原因

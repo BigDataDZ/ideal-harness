@@ -4,6 +4,7 @@ use crate::AgentLoop;
 use context::{CompactionEntry, CompactionKind, SummaryProvider, TwoStageCompactor};
 use model_provider::ChatMessage;
 use protocol::{ErrorCode, ErrorEnvelope, Event};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryCompaction {
@@ -57,9 +58,41 @@ pub(crate) fn compact_history(
     let Some(plan) = compactor.plan(&entries, summarizer)? else {
         return Ok(None);
     };
+    let persisted = session.replay_events().map_err(|error| {
+        ErrorEnvelope::new(
+            ErrorCode::Internal,
+            format!("failed to replay session before compaction: {error}"),
+        )
+    })?;
+    let surface = session::project_model_surface(&persisted)?;
+    let projected_history: Result<Vec<ChatMessage>, _> = surface
+        .iter()
+        .cloned()
+        .map(|entry| ChatMessage::try_from(entry.message))
+        .collect();
+    let projected_history = projected_history.map_err(|error| {
+        ErrorEnvelope::new(
+            ErrorCode::Internal,
+            format!("failed to convert projected model history: {error}"),
+        )
+    })?;
+    if projected_history != *history || plan.compacted_prefix > surface.len() {
+        return Err(ErrorEnvelope::new(
+            ErrorCode::Internal,
+            "live model history diverged from the persisted event projection",
+        ));
+    }
+    let mut seen_sources = BTreeSet::new();
+    let source_event_seqs = surface[..plan.compacted_prefix]
+        .iter()
+        .flat_map(|entry| entry.source_event_seqs.iter().copied())
+        .filter(|seq| seen_sources.insert(*seq))
+        .collect();
     session
         .append(Event::CompactionApplied {
             summary: plan.summary.clone(),
+            compacted_messages: Some(plan.compacted_prefix as u64),
+            source_event_seqs,
         })
         .map_err(|error| {
             ErrorEnvelope::new(
@@ -123,6 +156,9 @@ mod tests {
     }
 
     fn history() -> Vec<ChatMessage> {
+        let tool_outcome = protocol::ToolOutcome::Success {
+            value: serde_json::json!("0123456789"),
+        };
         vec![
             ChatMessage::user("old question"),
             ChatMessage::assistant_with_tool_calls(vec![ToolCallRequest {
@@ -130,7 +166,7 @@ mod tests {
                 name: "lookup".into(),
                 arguments: "{}".into(),
             }]),
-            ChatMessage::tool_result("c1", "0123456789"),
+            ChatMessage::tool_result("c1", serde_json::to_string(&tool_outcome).unwrap()),
             ChatMessage::assistant("old answer"),
             ChatMessage::user("recent question"),
         ]
@@ -141,13 +177,53 @@ mod tests {
         let path = tmp("success.jsonl");
         let _ = std::fs::remove_file(&path);
         let mut session = JsonlSession::create(path.clone()).unwrap();
+        session
+            .append(Event::UserMessage {
+                text: "old question".into(),
+            })
+            .unwrap();
+        session
+            .append(Event::ModelToolCallsRequested {
+                request_id: "r1".into(),
+                calls: vec![protocol::ModelToolCall {
+                    id: "c1".into(),
+                    name: "lookup".into(),
+                    arguments: "{}".into(),
+                }],
+            })
+            .unwrap();
+        session
+            .append(Event::ToolCallRequested {
+                call_id: "c1".into(),
+                tool: "lookup".into(),
+                args: serde_json::json!({}),
+            })
+            .unwrap();
+        session
+            .append(Event::ToolResultAdded {
+                call_id: "c1".into(),
+                outcome: protocol::ToolOutcome::Success {
+                    value: serde_json::json!("0123456789"),
+                },
+            })
+            .unwrap();
+        session
+            .append(Event::AssistantMessage {
+                text: "old answer".into(),
+            })
+            .unwrap();
+        session
+            .append(Event::UserMessage {
+                text: "recent question".into(),
+            })
+            .unwrap();
         let tools = ToolRegistry::default();
         let mut agent = AgentLoop::new(&mut session, &tools, &Unused);
         agent.chat_history = history();
         let compactor = TwoStageCompactor::new(1, ToolResultPruner::new(5, 3).unwrap());
         let result = agent
             .compact_chat_history(&compactor, &|input: &str| {
-                assert!(input.contains("012\n[tool result pruned: 10 chars]"));
+                assert!(input.contains("[tool result pruned:"));
                 Ok("summary".into())
             })
             .unwrap()
@@ -162,7 +238,11 @@ mod tests {
         assert_eq!(agent.chat_history[1], ChatMessage::user("recent question"));
         assert!(matches!(
             replay(&path).unwrap().last().unwrap().event,
-            Event::CompactionApplied { .. }
+            Event::CompactionApplied {
+                compacted_messages: Some(4),
+                ref source_event_seqs,
+                ..
+            } if source_event_seqs == &[0, 1, 3, 4]
         ));
         std::fs::remove_file(path).ok();
     }
@@ -244,6 +324,14 @@ mod tests {
         let path = tmp("overflow-retry.jsonl");
         let _ = std::fs::remove_file(&path);
         let mut session = JsonlSession::create(path.clone()).unwrap();
+        session
+            .append(Event::UserMessage { text: "old".into() })
+            .unwrap();
+        session
+            .append(Event::AssistantMessage {
+                text: "answer".into(),
+            })
+            .unwrap();
         let tools = ToolRegistry::default();
         let model = OverflowThenSuccess(Cell::new(0));
         let compactor = TwoStageCompactor::new(1, ToolResultPruner::new(20, 10).unwrap());
@@ -260,7 +348,9 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|entry| matches!(entry.event, Event::UserMessage { .. }))
+                .filter(
+                    |entry| matches!(&entry.event, Event::UserMessage { text } if text == "new")
+                )
                 .count(),
             1
         );
@@ -279,6 +369,14 @@ mod tests {
         let path = tmp("overflow-exhausted.jsonl");
         let _ = std::fs::remove_file(&path);
         let mut session = JsonlSession::create(path.clone()).unwrap();
+        session
+            .append(Event::UserMessage { text: "old".into() })
+            .unwrap();
+        session
+            .append(Event::AssistantMessage {
+                text: "answer".into(),
+            })
+            .unwrap();
         let tools = ToolRegistry::default();
         let model = AlwaysOverflow(Cell::new(0));
         let compactor = TwoStageCompactor::new(1, ToolResultPruner::new(20, 10).unwrap());

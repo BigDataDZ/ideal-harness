@@ -2,6 +2,7 @@
 //! 崩溃恢复、fork、time-travel 全部由重放派生。
 
 mod lineage;
+mod model_surface;
 mod projection;
 mod spill;
 mod timeline;
@@ -11,6 +12,7 @@ mod zstd_frames;
 mod zstd_record;
 
 pub use lineage::{derive_subagent_lineage, SubagentLineage};
+pub use model_surface::project_model_surface;
 pub use projection::{ProjectedSession, SqliteProjection};
 pub use spill::{SpillLocator, SpillStore, StoredToolResult};
 pub use timeline::{
@@ -31,6 +33,7 @@ pub trait SessionStore {
     fn append(&mut self, event: Event) -> std::io::Result<SequencedEvent>;
     fn len(&self) -> u64;
     fn path(&self) -> &Path;
+    fn replay_events(&self) -> std::io::Result<Vec<SequencedEvent>>;
 
     fn is_empty(&self) -> bool {
         self.len() == 0
@@ -89,6 +92,10 @@ impl SessionStore for JsonlSession {
 
     fn path(&self) -> &Path {
         JsonlSession::path(self)
+    }
+
+    fn replay_events(&self) -> std::io::Result<Vec<SequencedEvent>> {
+        replay(self.path())
     }
 }
 

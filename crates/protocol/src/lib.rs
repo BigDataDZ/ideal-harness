@@ -54,6 +54,45 @@ pub enum ToolOutcome {
     Failure { error: ErrorEnvelope },
 }
 
+/// 一次模型响应中声明的工具调用。`arguments` 保留 provider 返回的原始 JSON 文本，
+/// 使 resume 后发送给模型的消息与在线路径保持一致。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// 从事件流派生的唯一模型可见消息；客户端和 provider 适配层不得各建第二套投影。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ModelSurfaceMessage {
+    SystemSummary {
+        text: String,
+    },
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    AssistantToolCalls {
+        request_id: String,
+        calls: Vec<ModelToolCall>,
+    },
+    ToolResult {
+        call_id: String,
+        outcome: ToolOutcome,
+    },
+}
+
+/// 模型表面消息及其来源事件；压缩用来源集合证明 replace-prefix 没有越界。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelSurfaceEntry {
+    pub message: ModelSurfaceMessage,
+    pub source_event_seqs: Vec<u64>,
+}
+
 /// 子代理的闭合终态；Started 必须恰好对应一个 Stopped。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,8 +140,20 @@ pub enum Event {
         call_id: String,
         outcome: ToolOutcome,
     },
+    /// TASK-601：仅描述真正发送给模型的 assistant tool_calls 批次。
+    /// `ToolCallRequested` 继续承担逐调用审计，二者职责不得混用。
+    ModelToolCallsRequested {
+        request_id: String,
+        calls: Vec<ModelToolCall>,
+    },
     CompactionApplied {
         summary: String,
+        /// 新事件必须填写；None 仅用于兼容 TASK-601 之前的 JSONL。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compacted_messages: Option<u64>,
+        /// 被替换表面消息对应的事件序号，按首次出现顺序去重。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        source_event_seqs: Vec<u64>,
     },
     ApprovalDecided {
         call_id: String,
@@ -226,6 +277,33 @@ mod tests {
                 reason: "old session".into(),
             }
         );
+    }
+
+    #[test]
+    fn pre_task_601_compaction_remains_readable() {
+        let old = r#"{"type":"compaction_applied","summary":"legacy"}"#;
+        assert_eq!(
+            serde_json::from_str::<Event>(old).unwrap(),
+            Event::CompactionApplied {
+                summary: "legacy".into(),
+                compacted_messages: None,
+                source_event_seqs: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn model_surface_contract_roundtrips() {
+        let event = Event::ModelToolCallsRequested {
+            request_id: "turn-1-round-0".into(),
+            calls: vec![ModelToolCall {
+                id: "call-1".into(),
+                name: "lookup".into(),
+                arguments: r#"{"q":"rust"}"#.into(),
+            }],
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
     }
 
     #[test]

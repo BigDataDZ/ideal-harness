@@ -106,6 +106,10 @@ impl SessionStore for ZstdSession {
     fn path(&self) -> &Path {
         ZstdSession::path(self)
     }
+
+    fn replay_events(&self) -> io::Result<Vec<SequencedEvent>> {
+        replay_zstd(self.path())
+    }
 }
 
 /// 自动识别传统 JSONL、旧 zstd 流与当前提交帧格式。
