@@ -350,6 +350,10 @@ impl ToolRegistry {
     }
 }
 
+/// TASK-810：分离线程硬上限；超限时拒绝派生并以稳定码回给模型。
+const MAX_DETACHED_TASKS: usize = 64;
+static DETACHED_TASKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// TASK-702：在独立线程执行 handler 并限时等待；超时返回 None（线程成为分离线程，
 /// 其副作用不被取消——结果仅以稳定码回给模型）。
 fn run_with_deadline(
@@ -357,23 +361,39 @@ fn run_with_deadline(
     args: &serde_json::Value,
     deadline: std::time::Duration,
 ) -> Option<ToolExecution> {
+    if DETACHED_TASKS.load(std::sync::atomic::Ordering::SeqCst) >= MAX_DETACHED_TASKS {
+        return None;
+    }
+    let _ = DETACHED_TASKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let (sender, receiver) = std::sync::mpsc::channel();
     let args = args.clone();
+    let guard = DetachedGuard;
     match handler {
         ToolHandler::Plain(handler) => {
             let handler = Arc::clone(handler);
             std::thread::spawn(move || {
+                let _guard = guard;
                 let _ = sender.send(ToolExecution::new(handler(&args)));
             });
         }
         ToolHandler::Audited(handler) => {
             let handler = Arc::clone(handler);
             std::thread::spawn(move || {
+                let _guard = guard;
                 let _ = sender.send(handler(&args));
             });
         }
     }
     receiver.recv_timeout(deadline).ok()
+}
+
+/// RAII：分离线程结束时递减在途计数。
+struct DetachedGuard;
+
+impl Drop for DetachedGuard {
+    fn drop(&mut self) {
+        DETACHED_TASKS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
@@ -428,6 +448,45 @@ mod tests {
         match reg.dispatch("echo", &serde_json::json!({ "text": "hi" })) {
             Some(ToolOutcome::Success { value }) => assert_eq!(value, "hi"),
             other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fuzz_dispatch_arbitrary_args_never_panics() {
+        fn xorshift(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        let mut reg = ToolRegistry::default();
+        reg.register(
+            ToolSpec {
+                name: "fuzzed".into(),
+                description: "fuzz target".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["a"],
+                    "properties": { "a": { "type": "string" } }
+                }),
+                escalation_capable: false,
+                timeout_ms: None,
+            },
+            Box::new(|_| ToolOutcome::Success { value: ().into() }),
+        );
+        let mut state = 0xabcd_ef01_u64;
+        for _ in 0..2000 {
+            let mut value = serde_json::json!({ "a": "x" });
+            // 随机破坏参数结构
+            let roll = xorshift(&mut state) % 4;
+            match roll {
+                0 => value = serde_json::json!((xorshift(&mut state) as i64)),
+                1 => value = serde_json::json!(format!("n{}x", xorshift(&mut state))),
+                2 => value["extra"] = serde_json::json!(xorshift(&mut state)),
+                _ => value["a"] = serde_json::json!(xorshift(&mut state)),
+            }
+            // 任意参数只能得到 Outcome（Success/Failure），绝不 panic
+            let _ = reg.dispatch("fuzzed", &value);
         }
     }
 

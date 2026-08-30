@@ -76,6 +76,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 const MAX_READ_BYTES: usize = 256 * 1024;
+/// TASK-810：单工具集 spill 总量硬上限；超限返回稳定码（结果留在事件里可审计）。
+const MAX_SPILL_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
 const MAX_SPILL_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WALK_ENTRIES: usize = 10_000;
@@ -94,6 +96,8 @@ pub struct FsToolSet {
     read_tracker: Mutex<BTreeSet<PathBuf>>,
     /// TASK-802：协作取消令牌；写/编辑提交点检查，超时后拒绝产生新副作用。
     cancellation_token: Mutex<Option<CancellationToken>>,
+    /// TASK-810：已 spill 的累计字节数（硬上限守卫）。
+    spilled_bytes: AtomicU64,
 }
 
 impl FsToolSet {
@@ -108,6 +112,7 @@ impl FsToolSet {
             spill_counter: AtomicU64::new(0),
             read_tracker: Mutex::new(BTreeSet::new()),
             cancellation_token: Mutex::new(None),
+            spilled_bytes: AtomicU64::new(0),
         }))
     }
 
@@ -490,6 +495,15 @@ impl FsToolSet {
     fn spill(&self, content: &str) -> Result<String, ErrorEnvelope> {
         if content.len() > MAX_SPILL_BYTES {
             return Err(args_error("result exceeds spill size limit"));
+        }
+        // TASK-810：总量硬上限——超限拒绝并留事件（稳定码随 ToolResultAdded 落盘）
+        let spilled = self
+            .spilled_bytes
+            .fetch_add(content.len() as u64, Ordering::Relaxed);
+        if spilled + content.len() as u64 > MAX_SPILL_TOTAL_BYTES {
+            self.spilled_bytes
+                .fetch_sub(content.len() as u64, Ordering::Relaxed);
+            return Err(args_error("spill budget exhausted for this workspace"));
         }
         fs::create_dir_all(&self.spill_dir)
             .map_err(|error| io_error("create spill directory", error))?;

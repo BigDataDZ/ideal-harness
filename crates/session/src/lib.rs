@@ -233,6 +233,120 @@ mod tests {
     }
 
     #[test]
+    fn fuzz_replay_rejects_garbage_without_panicking() {
+        fn xorshift(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        let path = std::env::temp_dir().join(format!("ih-810-fuzz-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut state = 0xfeed_beef_u64;
+        for _round in 0..300 {
+            let mut bytes = Vec::from(
+                r#"{"seq":0,"event":{"type":"user_message","text":"x"}}"#.as_bytes(),
+            );
+            let mutations = (xorshift(&mut state) % 6) + 1;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 3 {
+                    0 => {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        let pos = (xorshift(&mut state) as usize) % bytes.len();
+                        bytes[pos] = (xorshift(&mut state) & 0xff) as u8;
+                    }
+                    1 => {
+                        bytes.truncate((xorshift(&mut state) as usize) % (bytes.len() + 1));
+                    }
+                    _ => {
+                        let pos = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.insert(pos.min(bytes.len()), (xorshift(&mut state) & 0xff) as u8);
+                    }
+                }
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            // 损坏输入只允许 Ok（跳过）或 Err，绝不 panic
+            let _ = replay(&path);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn soak_100k_events_replay_projection_and_pairing() {
+        let path = std::env::temp_dir().join(format!("ih-810-soak-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut session = JsonlSession::create(path.clone()).unwrap();
+        // 10 万级事件：5 万个完整工具调用对 + 用户消息
+        let mut batch = Vec::new();
+        let pairs = 25_000usize;
+        for index in 0..pairs {
+            batch.push(Event::TurnStarted {
+                turn_id: index as u64,
+            });
+            batch.push(Event::UserMessage {
+                text: format!("turn {index}"),
+            });
+            batch.push(Event::ModelToolCallsRequested {
+                request_id: format!("r-{index}"),
+                calls: vec![protocol::ModelToolCall {
+                    id: format!("call-{index}"),
+                    name: "fs_read".into(),
+                    arguments: "{}".into(),
+                }],
+            });
+            batch.push(Event::ToolCallRequested {
+                call_id: format!("call-{index}"),
+                tool: "fs_read".into(),
+                args: serde_json::json!({}),
+            });
+            batch.push(Event::ToolResultAdded {
+                call_id: format!("call-{index}"),
+                outcome: protocol::ToolOutcome::Success {
+                    value: serde_json::json!({"v": index}),
+                },
+            });
+            batch.push(Event::TurnCompleted {
+                turn_id: index as u64,
+            });
+        }
+        let records = session.append_batch(batch).unwrap();
+        assert_eq!(records.len(), pairs * 6);
+        let total = session.len();
+        assert_eq!(total, (pairs * 6) as u64, "10 万级事件写入（15 万）");
+
+        // 重放：序号连续无缺口
+        let events = replay(&path).unwrap();
+        assert_eq!(events.len() as u64, total);
+        for (index, sequenced) in events.iter().enumerate() {
+            assert_eq!(sequenced.seq, index as u64, "seq 在 {index} 处出现缺口");
+        }
+        // 模型表面投影：配对完整、条目数正确
+        let surface = project_model_surface(&events).unwrap();
+        let tool_results = surface
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.message,
+                    protocol::ModelSurfaceMessage::ToolResult { .. }
+                )
+            })
+            .count();
+        assert_eq!(tool_results, pairs, "投影必须保留全部工具结果");
+        // timeline 分页（基于事件流直接分页）：无重无漏抽样校验
+        let page = timeline_page(&events, None, 100).unwrap();
+        assert_eq!(page.turns.len(), 100, "timeline 分页无重无漏");
+        let all = timeline_page(&events, None, usize::MAX).unwrap();
+        let seen: Vec<u64> = all.turns.iter().map(|turn| turn.turn_id).collect();
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(seen, sorted, "turn 序必须单调");
+        assert_eq!(seen.len(), pairs, "全部 turn 均被索引");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn batch_append_is_contiguous_and_replays_in_order() {
         let path = std::env::temp_dir().join(format!("ih-805-batch-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);

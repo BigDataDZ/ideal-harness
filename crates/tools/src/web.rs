@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MAX_REDIRECT_HOPS: usize = 3;
+/// TASK-810：单工具 spill 总量硬上限。
+const MAX_SPILL_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_CONTENT_CHARS: usize = 20_000;
 const PREVIEW_CHARS: usize = 4_000;
 const MAX_SPILL_BYTES: usize = 8 * 1024 * 1024;
@@ -47,6 +49,7 @@ pub struct WebFetchTool {
     spill_root: PathBuf,
     locator_base: String,
     spill_counter: AtomicU64,
+    spilled_bytes: AtomicU64,
     max_bytes: usize,
 }
 
@@ -66,6 +69,7 @@ impl WebFetchTool {
             spill_root,
             locator_base: locator_base.trim_matches('/').to_string(),
             spill_counter: AtomicU64::new(0),
+            spilled_bytes: AtomicU64::new(0),
             max_bytes,
         })
     }
@@ -157,6 +161,15 @@ impl WebFetchTool {
     fn spill(&self, content: &str) -> Result<String, ErrorEnvelope> {
         if content.len() > MAX_SPILL_BYTES {
             return Err(args_error("fetched content exceeds spill size limit"));
+        }
+        // TASK-810：总量硬上限
+        let spilled = self
+            .spilled_bytes
+            .fetch_add(content.len() as u64, Ordering::Relaxed);
+        if spilled + content.len() as u64 > MAX_SPILL_TOTAL_BYTES {
+            self.spilled_bytes
+                .fetch_sub(content.len() as u64, Ordering::Relaxed);
+            return Err(args_error("web spill budget exhausted"));
         }
         fs::create_dir_all(&self.spill_root)
             .map_err(|error| io_error("create spill directory", error))?;

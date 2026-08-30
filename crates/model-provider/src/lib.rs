@@ -589,6 +589,42 @@ fn consume_sse_stream(response: reqwest::blocking::Response) -> Result<ChatReply
 mod tests {
     use super::*;
 
+    /// TASK-810：SSE 行解析 fuzz——任意字节输入只允许 Ok/Err，绝不 panic。
+    #[test]
+    fn fuzz_parse_sse_line_never_panics() {
+        fn xorshift(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        let base = "data: {\"id\":\"x\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}";
+        let mut state = 0x1234_5678_u64;
+        for _ in 0..3000 {
+            let mut bytes = base.as_bytes().to_vec();
+            let mutations = (xorshift(&mut state) % 6) + 1;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 3 {
+                    0 => {
+                        let pos = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.insert(pos.min(bytes.len()), (xorshift(&mut state) & 0xff) as u8);
+                    }
+                    1 => {
+                        if !bytes.is_empty() {
+                            let pos = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes.remove(pos);
+                        }
+                    }
+                    _ => {
+                        bytes.truncate((xorshift(&mut state) as usize) % (bytes.len() + 1));
+                    }
+                }
+            }
+            let line = String::from_utf8_lossy(&bytes).into_owned();
+            let _ = parse_sse_line(&line);
+        }
+    }
+
     #[test]
     fn parse_sse_line_classifies_all_shapes() {
         assert_eq!(parse_sse_line(""), SseLine::Ignore);

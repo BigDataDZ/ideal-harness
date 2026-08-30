@@ -447,6 +447,45 @@ mod tests {
         }
     }
 
+    /// TASK-810：确定性 xorshift 变异 fuzz——解析器对任意输入只能 Ok 或稳定 Err，绝不 panic。
+    #[test]
+    fn fuzz_event_jsonl_parse_never_panics() {
+        fn xorshift(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        let base = r#"{"seq":1,"event":{"type":"tool_result_added","call_id":"c1","outcome":{"success":{"value":42}}}}"#;
+        let base_bytes = base.as_bytes();
+        let mut state = 0x5eed_1234_u64;
+        for _round in 0..4000 {
+            let mut bytes = base_bytes.to_vec();
+            let mutations = (xorshift(&mut state) % 8) + 1;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 3 {
+                    0 => {
+                        let pos = (xorshift(&mut state) as usize) % bytes.len();
+                        bytes[pos] = (xorshift(&mut state) & 0xff) as u8;
+                    }
+                    1 => {
+                        let pos = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.insert(pos.min(bytes.len()), (xorshift(&mut state) & 0xff) as u8);
+                    }
+                    _ => {
+                        if !bytes.is_empty() {
+                            let pos = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes.remove(pos);
+                        }
+                    }
+                }
+            }
+            let input = String::from_utf8_lossy(&bytes);
+            // 只允许 Ok 或 Err，绝不允许 panic/挂起
+            let _ = serde_json::from_str::<SequencedEvent>(&input);
+        }
+    }
+
     #[test]
     fn tool_termination_event_roundtrip() {
         for termination in [

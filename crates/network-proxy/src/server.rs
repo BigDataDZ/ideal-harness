@@ -5,13 +5,15 @@ use protocol::Event;
 use std::{
     io::{self, Read, Write},
     net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::Arc,
     thread,
     time::Duration,
 };
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
+/// TASK-810：并发连接 worker 硬上限；超限立即 503 并留审计事件。
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
 pub trait AuditSink: Send + Sync {
     fn record(&self, event: Event) -> io::Result<()>;
@@ -55,13 +57,31 @@ impl<S: AuditSink + 'static> ProxyServer<S> {
     pub fn serve_until(&self, stop: &AtomicBool) -> io::Result<()> {
         self.listener.set_nonblocking(true)?;
         let mut workers = Vec::new();
+        let active = Arc::new(AtomicUsize::new(0));
         while !stop.load(Ordering::Acquire) {
             match self.listener.accept() {
                 Ok((client, _)) => {
+                    // TASK-810：并发上限——超限立即 503 并留审计事件
+                    if active.load(Ordering::SeqCst) >= MAX_CONCURRENT_CONNECTIONS {
+                        let mut client = client;
+                        let _ = client.write_all(
+                            b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n",
+                        );
+                        self.audit.record(Event::NetworkAccessDenied {
+                            host: "connection".into(),
+                            port: 0,
+                            reason: "connection_limit_exceeded".into(),
+                        })?;
+                        continue;
+                    }
+                    let _ = active.fetch_add(1, Ordering::SeqCst);
                     let policy = self.policy.clone();
                     let audit = Arc::clone(&self.audit);
+                    let active_for_worker = Arc::clone(&active);
                     workers.push(thread::spawn(move || {
-                        handle_client(client, &policy, audit.as_ref())
+                        let result = handle_client(client, &policy, audit.as_ref());
+                        active_for_worker.fetch_sub(1, Ordering::SeqCst);
+                        result
                     }));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -531,6 +551,44 @@ mod tests {
             .unwrap();
         let response = read_to_end(&mut client);
         assert!(String::from_utf8_lossy(&response).contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn fuzz_request_head_parse_never_panics() {
+        fn xorshift(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+        let base = b"CONNECT 127.0.0.1:443 HTTP/1.1
+Host: 127.0.0.1
+
+";
+        let mut state = 0x9e37_79b9_u64;
+        for _ in 0..3000 {
+            let mut bytes = base.to_vec();
+            let mutations = (xorshift(&mut state) % 8) + 1;
+            for _ in 0..mutations {
+                match xorshift(&mut state) % 3 {
+                    0 => {
+                        let pos = (xorshift(&mut state) as usize) % (bytes.len() + 1);
+                        bytes.insert(pos.min(bytes.len()), (xorshift(&mut state) & 0xff) as u8);
+                    }
+                    1 => {
+                        if !bytes.is_empty() {
+                            let pos = (xorshift(&mut state) as usize) % bytes.len();
+                            bytes.remove(pos);
+                        }
+                    }
+                    _ => {
+                        let pos = (xorshift(&mut state) as usize) % bytes.len();
+                        bytes[pos] = (xorshift(&mut state) & 0xff) as u8;
+                    }
+                }
+            }
+            let _ = parse_request_head(&bytes);
+        }
     }
 
     #[test]
