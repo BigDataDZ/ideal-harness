@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **network-proxy/harness-cli**：修复 `web_fetch` 在真实 chat 链路上的断链——代理白名单此前只含 provider 域名，fetch 目标在工具层放行后仍会被代理拒绝；现在 `--fetch-allow` 主机会同时注入代理 allowlist（`ProviderProxy::start_with_fetch_hosts`），代理补齐 absolute-form GET/HEAD 明文转发（请求头此前被读取后未转发给源站），并在 accept 后显式恢复阻塞模式（Windows 非阻塞继承会导致 WSAEWOULDBLOCK）。新增 reqwest→代理→源站的端到端测试
+
 ### Added
 
 - **tools/harness-cli（TASK-701）**：内置文件工具集 `fs_read/fs_write/fs_edit/fs_glob/fs_grep`——以 canonical 工作区根为信任边界（symlink 拒绝 + 词法穿越栅栏），覆盖写与编辑强制 read-before-write，超大文件与超限结果集全文落 `.harness/spill`、结果仅带预览 + 可被 `fs_read` 取回的 locator

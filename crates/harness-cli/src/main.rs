@@ -86,7 +86,11 @@ fn parse_chat_args(args: &[String]) -> anyhow::Result<ChatArgs> {
 fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
     let cfg = parse_chat_args(args)?;
     let proxy_events = Arc::new(Mutex::new(Vec::<Event>::new()));
-    let mut proxy = ProviderProxy::start(&cfg.base_url, Arc::clone(&proxy_events))?;
+    let mut proxy = ProviderProxy::start_with_fetch_hosts(
+        &cfg.base_url,
+        &cfg.fetch_allow,
+        Arc::clone(&proxy_events),
+    )?;
     // fail-closed：无 key 直接拒绝启动（红线 3），绝不匿名调用上游。
     let client = OpenAiCompatClient::from_env_via_proxy(&proxy.url).map_err(|e| {
         anyhow::anyhow!(

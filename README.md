@@ -6,11 +6,15 @@
 > 取其共识（事件溯源、ErrorCode 路由、OS 级沙箱），避其教训（巨石 core / 过度碎片化）。
 > 每个决策的对标记录见 [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md)。
 
-## 当前状态：路线图 P5 已完成 ✅
+## 当前状态：路线图 P7 已完成 ✅
 
 ✅ 已实现：流式模型与工具闭环、三层沙箱与 fail-closed 审批、JSONL/zstd/SQLite 会话恢复、
 上下文压缩与 spill、subagent 生命周期与角色策略、stdio MCP、可信 Skill、可审计 Hook，
-以及 loopback-only 的只读 timeline RPC 与按事件序号补洞的 SSE 投影。
+loopback-only 的只读 timeline RPC 与按事件序号补洞的 SSE 投影，
+运行时闭环（模型表面忠实重放、层级 Token 预算、权限 epoch/执行环境绑定、
+受监管 MCP registry、generation-aware RPC、事件溯源 Agent Team、可信插件清单与结果中间件），
+以及 P7 工具面（fs_read/write/edit/glob/grep 内置文件工具、白名单代理内的 web_fetch、
+工具超时与循环防护、turn 内 steer 排队输入、跨会话记忆投影、Linux Landlock 生产后端）。
 
 ## 快速开始
 

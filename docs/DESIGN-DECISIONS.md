@@ -28,6 +28,11 @@
 | D18 | RPC 连续性 | app-server 线程恢复、能力协商与服务端请求 | follow-before-page、连接 generation、gap tail repair | **先强化只读流，再开放写 RPC**（TASK-605） | `last_seq` 与 generation 双校验；只对传输中断自动续接，业务错误不无限重试 |
 | D19 | Agent Team | subagent 并行但提醒写冲突与 token 成本 | 持久 mailbox + CAS task DAG + blockedBy/writeScopes | **事件溯源的轻量 Team Coordinator**（TASK-606） | 首版只做任务所有权与写范围重叠告警，不做强制文件锁和跨进程调度 |
 | D20 | 插件供应链 | plugin catalog 统一打包 skills/MCP/hooks，信任后启用 | 能力经容器组合与宿主连接提供 | **可信清单 + 能力声明 + 结果中间件**（TASK-607） | 先校验来源/哈希/权限再加载；插件失败不能遮蔽其他有效插件，不执行任意 shell hook |
+| D21 | 工具执行护栏 | 每命令超时与 sandbox 拒绝重试编排 | timeout-policy（挂死即超时错误）+ repeat-tool-reminder（3/5/8 次提醒） | **deadline 线程限时 + 可选 LoopGuard 先提醒后拒绝**（TASK-702） | 超时不取消底层副作用（handler 是分离线程）；护栏缺席时行为不变（增强件非 fail-closed 安全件）；拒绝必须保持 tool_call/result 配对 |
+| D22 | turn 内 steer | queued inputs + steering 中断点（feature flag） | agent.inject() 任意时刻注入，轮边界生效 | **事件化 UserInputQueued + 采样轮边界按游标吸收**（TASK-704） | 投影在工具批次未闭合时延迟出账（provider 消息序合法）；resume 与在线视图必须一致；不做采样中途抢占 |
+| D23 | 工具面广度 | shell/unified_exec/apply_patch/web_search 为核心，文件编辑靠 patch | 内置 fs/搜索/终端/web 全家桶 + read-before-write 观察策略 | **声明式内置文件工具 + 白名单代理内 web_fetch**（TASK-701/703） | 写前必读 fail-closed；fetch 拒私网/回环且逐跳复检重定向；出网只经 CONNECT/明文白名单代理，fetch 主机必须同时进代理 allowlist |
+| D24 | 跨平台沙箱后端 | Seatbelt/Landlock/bwrap/AppContainer+WFP 全平台矩阵 | bwrap/Landlock/Seatbelt/Windows ACL token | **Windows 受限 token + Linux Landlock（TASK-706）**，其余平台 fail-closed 拒执行 | 无 Landlock 的内核拒绝执行不降级；未知 sandbox 档位 fail-closed；网络域限制（v4 NET）暂不落地 |
+
 
 ## 二、本项目独有的环境注意点（两家文档都没有的）
 

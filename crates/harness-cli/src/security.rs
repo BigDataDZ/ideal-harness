@@ -25,12 +25,23 @@ pub(crate) struct ProviderProxy {
 }
 
 impl ProviderProxy {
-    pub(crate) fn start(base_url: &str, events: Arc<Mutex<Vec<Event>>>) -> anyhow::Result<Self> {
+    /// TASK-703 补口：除 provider 域名外，把 web_fetch 白名单主机一并注入
+    /// 代理 allowlist——否则工具层放行后 CONNECT/明文转发仍会被代理拒绝。
+    pub(crate) fn start_with_fetch_hosts(
+        base_url: &str,
+        fetch_hosts: &[String],
+        events: Arc<Mutex<Vec<Event>>>,
+    ) -> anyhow::Result<Self> {
         let provider = reqwest::Url::parse(base_url)?;
         let host = provider
             .host_str()
             .ok_or_else(|| anyhow::anyhow!("provider base_url 缺少主机名"))?;
-        let policy = ProxyPolicy::for_provider(host).map_err(anyhow::Error::msg)?;
+        let mut policy = ProxyPolicy::for_provider(host).map_err(anyhow::Error::msg)?;
+        for fetch_host in fetch_hosts {
+            policy
+                .allow_host(fetch_host)
+                .map_err(|reason| anyhow::anyhow!("fetch allowlist 条目非法: {reason}"))?;
+        }
         let server = ProxyServer::bind(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
             policy,
@@ -270,6 +281,40 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tools::EscalationAvailability;
+
+    /// TASK-703 补口验证：fetch 白名单注入代理后，明文 GET 经真实代理链路到达源站。
+    #[test]
+    fn fetch_allow_hosts_are_proxied_end_to_end() {
+        // 源站：127.0.0.1 上的固定响应
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buffer = [0u8; 2048];
+                let _ = stream.read(&mut buffer);
+                let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+                stream.write_all(response).unwrap();
+            }
+        });
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut proxy = ProviderProxy::start_with_fetch_hosts(
+            "https://provider.example/v1",
+            &["127.0.0.1".to_string()],
+            Arc::clone(&events),
+        )
+        .unwrap();
+        let outcome = model_provider::http_fetch_via_proxy(
+            Some(&proxy.url),
+            &format!("http://127.0.0.1:{origin_port}/guide"),
+            64 * 1024,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(outcome.status, 200);
+        assert_eq!(outcome.body, b"hello".to_vec());
+        proxy.shutdown().unwrap();
+    }
 
     #[derive(Clone, Copy)]
     struct FakeRestrictedBackend;
