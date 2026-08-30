@@ -130,36 +130,29 @@ impl PluginCatalog {
             &canonical_root,
             "plugin root escapes workspace",
         )?;
+        let (plugins, failures) = scan_entries(&canonical_root)?;
+        Ok(Self {
+            plugin_root: canonical_root,
+            plugins,
+            failures,
+        })
+    }
 
-        let mut entries: Vec<_> = fs::read_dir(&canonical_root)
-            .map_err(|error| io_error("read plugin directory", error))?
-            .collect::<Result<_, _>>()
-            .map_err(|error| io_error("read plugin entry", error))?;
-        entries.sort_by_key(|entry| entry.file_name());
-        let mut plugins: BTreeMap<String, VerifiedPlugin> = BTreeMap::new();
-        let mut failures = Vec::new();
-        for entry in entries {
-            let dir_name = entry.file_name().to_string_lossy().into_owned();
-            if let Some(verified) =
-                verify_plugin_dir(&canonical_root, &entry.path(), &dir_name, &mut failures)
-            {
-                if let Some(previous) = plugins.remove(&verified.name) {
-                    let error = args_error("duplicate plugin name");
-                    failures.push(PluginFailure {
-                        plugin: previous.name.clone(),
-                        stage: PluginFailureStage::Manifest,
-                        error: error.clone(),
-                    });
-                    failures.push(PluginFailure {
-                        plugin: verified.name.clone(),
-                        stage: PluginFailureStage::Manifest,
-                        error,
-                    });
-                    continue;
-                }
-                plugins.insert(verified.name.clone(), verified);
-            }
+    /// TASK-803：以显式给出的插件根目录为信任边界扫描（`--plugin-root` 语义：
+    /// 该目录本身直接包含插件子目录，不再叠加 `.harness/plugins` 前缀）。
+    /// 目录不存在时 fail-closed，而不是静默返回空目录。
+    pub fn discover_explicit(plugins_root: &Path) -> Result<Self, ErrorEnvelope> {
+        reject_symlink(plugins_root, "plugin root")?;
+        let canonical_root = plugins_root
+            .canonicalize()
+            .map_err(|error| io_error("canonicalize plugin root", error))?;
+        if !canonical_root.is_dir() {
+            return Err(args_error(format!(
+                "plugin root is not a directory: {}",
+                canonical_root.display()
+            )));
         }
+        let (plugins, failures) = scan_entries(&canonical_root)?;
         Ok(Self {
             plugin_root: canonical_root,
             plugins,
@@ -237,6 +230,42 @@ impl PluginCatalog {
         }
         Ok(bound)
     }
+}
+
+/// 扫描插件根下的全部条目；根必须是 canonical 目录。
+fn scan_entries(
+    canonical_root: &Path,
+) -> Result<(BTreeMap<String, VerifiedPlugin>, Vec<PluginFailure>), ErrorEnvelope> {
+    let mut entries: Vec<_> = fs::read_dir(canonical_root)
+        .map_err(|error| io_error("read plugin directory", error))?
+        .collect::<Result<_, _>>()
+        .map_err(|error| io_error("read plugin entry", error))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    let mut plugins: BTreeMap<String, VerifiedPlugin> = BTreeMap::new();
+    let mut failures = Vec::new();
+    for entry in entries {
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(verified) =
+            verify_plugin_dir(canonical_root, &entry.path(), &dir_name, &mut failures)
+        {
+            if let Some(previous) = plugins.remove(&verified.name) {
+                let error = args_error("duplicate plugin name");
+                failures.push(PluginFailure {
+                    plugin: previous.name.clone(),
+                    stage: PluginFailureStage::Manifest,
+                    error: error.clone(),
+                });
+                failures.push(PluginFailure {
+                    plugin: verified.name.clone(),
+                    stage: PluginFailureStage::Manifest,
+                    error,
+                });
+                continue;
+            }
+            plugins.insert(verified.name.clone(), verified);
+        }
+    }
+    Ok((plugins, failures))
 }
 
 /// 目录级校验：无关条目返回 None 且不记失败；坏插件记录隔离原因后返回 None。

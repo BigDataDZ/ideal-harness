@@ -5,7 +5,10 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use agent_loop::{AgentLoop, ModelProvider};
+use agent_loop::{
+    AgentLoop, LoopGuard, ModelProvider, ToolResultContext, ToolResultDecision,
+    ToolResultMiddleware,
+};
 use approval::TerminalApprover;
 use model_provider::{ChatMessage, OpenAiCompatClient};
 use protocol::{ErrorEnvelope, Event, ModelCallSpec, ToolOutcome};
@@ -46,6 +49,10 @@ struct ChatArgs {
     model: String,
     /// TASK-703：web_fetch 允许的主机白名单；默认空 = 全部拒绝（fail-closed）。
     fetch_allow: Vec<String>,
+    /// TASK-803：文件工具与相对路径的信任根；默认当前目录。
+    workspace: PathBuf,
+    /// TASK-803：显式插件根目录；None = 不加载任何插件（不自动信任工作区插件）。
+    plugin_root: Option<PathBuf>,
 }
 
 impl Default for ChatArgs {
@@ -55,6 +62,8 @@ impl Default for ChatArgs {
             base_url: "https://api.deepseek.com/v1".into(),
             model: "deepseek-chat".into(),
             fetch_allow: Vec::new(),
+            workspace: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            plugin_root: None,
         }
     }
 }
@@ -74,8 +83,10 @@ fn parse_chat_args(args: &[String]) -> anyhow::Result<ChatArgs> {
             "--base-url" => out.base_url = next_value(args, i, "--base-url")?,
             "--model" => out.model = next_value(args, i, "--model")?,
             "--fetch-allow" => out.fetch_allow.push(next_value(args, i, "--fetch-allow")?),
+            "--workspace" => out.workspace = PathBuf::from(next_value(args, i, "--workspace")?),
+            "--plugin-root" => out.plugin_root = Some(PathBuf::from(next_value(args, i, "--plugin-root")?)),
             other => anyhow::bail!(
-                "未知参数 {other}；用法: ideal-harness chat [--session <path>] [--base-url <url>] [--model <name>]"
+                "未知参数 {other}；用法: ideal-harness chat [--session <path>] [--base-url <url>] [--model <name>] [--workspace <dir>] [--plugin-root <dir>] [--fetch-allow <host>]"
             ),
         }
         i += 2;
@@ -104,10 +115,21 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         temperature: None,
     };
 
+    // TASK-803：--workspace 是文件工具与相对路径的唯一信任根（canonical 化，缺失即拒绝）
+    let workspace = cfg.workspace.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "--workspace 不存在或不可访问: {} ({error})",
+            cfg.workspace.display()
+        )
+    })?;
     let mut registry = ToolRegistry::default();
-    register_demo_tools(&mut registry);
-    register_web_fetch_tool(&mut registry, &proxy.url, &cfg.fetch_allow)?;
-    register_memory_tool(&mut registry);
+    register_chat_tools(
+        &mut registry,
+        &workspace,
+        cfg.plugin_root.as_deref(),
+        &cfg.fetch_allow,
+        &proxy.url,
+    )?;
     registry.set_escalation_availability(EscalationAvailability::RestrictedBackendMounted);
     let terminal_approver = Arc::new(TerminalApprover::new(
         std::io::BufReader::new(std::io::stdin()),
@@ -130,15 +152,25 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
     }
     let history = rebuild_history(js.path())?;
 
+    let production_middleware = ProductionResultMiddleware {
+        max_result_bytes: 256 * 1024,
+    };
     let mut lp = AgentLoop::with_chat(&mut js, &registry, &client, spec);
+    // TASK-803：生产默认护栏——结果大小预算 + 循环防护先提醒后拒绝
+    lp.result_middleware = Some(&production_middleware);
+    lp.loop_guard = Some(LoopGuard {
+        remind_after: 3,
+        reject_after: 8,
+    });
+    // /tools 与模型广告必须反映实际可用能力（不再硬编码清单）
+    let tool_names: Vec<&str> = registry.names().collect();
     lp.tool_definitions = Some(
-        openai_tools_json(
-            &registry,
-            &["echo", "now", "web_fetch", "memory_write", "exec"],
-        )
-        .map_err(|error| anyhow::anyhow!(error.message))?,
+        openai_tools_json(&registry, &tool_names)
+            .map_err(|error| anyhow::anyhow!(error.message))?,
     );
     lp.chat_history = history;
+    // 重建历史已含既有排队输入；以当前流长度推进水位避免重复吸收
+    lp.mark_queued_inputs_consumed();
     let event_source_queue = Arc::clone(&proxy_events);
     let event_source = move || match event_source_queue.lock() {
         Ok(mut events) => std::mem::take(&mut *events),
@@ -153,7 +185,9 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         cfg.base_url,
         lp.session.path().display()
     );
-    println!("直接输入即对话；/tools 查看工具；/exit 退出（EOF 同效）；Ctrl+C 直接退出，下次启动自动补记中断");
+    println!(
+        "直接输入即对话；/tools 查看工具；/steer <文本> 跨轮插入输入；/exit 退出（EOF 同效）；Ctrl+C 直接退出，下次启动自动补记中断",
+    );
 
     let stdin = std::io::stdin();
     loop {
@@ -170,10 +204,19 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         match text {
             "/exit" | "/quit" => break,
             "/tools" => {
-                for name in ["echo", "now", "web_fetch", "memory_write", "exec"] {
+                for name in registry.names() {
                     if let Some(s) = registry.get(name) {
                         println!("  {} — {}", s.name, s.description);
                     }
+                }
+                continue;
+            }
+            t if t.starts_with("/steer") => {
+                // TASK-803/704：steer 输入事件化入队，在下一采样轮边界被吸收
+                let payload = t.trim_start_matches("/steer").trim();
+                match lp.enqueue_input(payload) {
+                    Ok(()) => println!("  ↪ 已入队 steer（下一采样边界生效）"),
+                    Err(error) => println!("  ✗ steer 被拒绝: {}", error.message),
                 }
                 continue;
             }
@@ -203,6 +246,89 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
     drop(client);
     proxy.shutdown()?;
     Ok(())
+}
+
+/// TASK-803：生产结果中间件——超预算的成功结果被替换为带 locator 语义的截断预览，
+/// 失败结果原样放行（错误码即告示）。中间件在位，插件来源结果不再因缺席 fail-closed。
+struct ProductionResultMiddleware {
+    max_result_bytes: usize,
+}
+
+impl ToolResultMiddleware for ProductionResultMiddleware {
+    fn inspect(
+        &self,
+        context: &ToolResultContext<'_>,
+    ) -> Result<ToolResultDecision, ErrorEnvelope> {
+        match context.outcome {
+            ToolOutcome::Success { value } => {
+                let serialized = serde_json::to_string(value).unwrap_or_default();
+                if serialized.len() > self.max_result_bytes {
+                    let preview: String = serialized.chars().take(2_000).collect();
+                    return Ok(ToolResultDecision::Redact(ToolOutcome::Success {
+                        value: serde_json::json!({
+                            "truncated_by_result_guard": true,
+                            "original_bytes": serialized.len(),
+                            "preview": preview,
+                        }),
+                    }));
+                }
+                Ok(ToolResultDecision::Allow)
+            }
+            ToolOutcome::Failure { .. } => Ok(ToolResultDecision::Allow),
+        }
+    }
+}
+
+/// TASK-803：把工作区文件工具、显式插件目录装配进 chat 注册表；
+/// 返回装载的插件工具数。未显式给出 plugin_root 时不加载任何插件
+/// （不自动信任工作区插件）；坏插件被隔离跳过，不遮蔽其他插件。
+fn register_chat_tools(
+    registry: &mut ToolRegistry,
+    workspace: &Path,
+    plugin_root: Option<&Path>,
+    fetch_hosts: &[String],
+    proxy_url: &str,
+) -> anyhow::Result<usize> {
+    let fs_tools =
+        tools::FsToolSet::new(workspace).map_err(|error| anyhow::anyhow!(error.message))?;
+    fs_tools.register(registry);
+    register_demo_tools(registry);
+    register_web_fetch_tool(registry, proxy_url, fetch_hosts)?;
+    register_memory_tool(registry);
+
+    let mut plugin_tools = 0;
+    if let Some(root) = plugin_root {
+        let catalog = std::sync::Arc::new(
+            tools::PluginCatalog::discover_explicit(root)
+                .map_err(|error| anyhow::anyhow!(error.message))?,
+        );
+        for failure in catalog.failures() {
+            eprintln!(
+                "  ⚠ 插件 {} 被隔离（{:?}）：{}",
+                failure.plugin, failure.stage, failure.error.message
+            );
+        }
+        for plugin in catalog.plugins() {
+            match catalog.bind_static_tools(registry, plugin.name()) {
+                Ok(count) => {
+                    println!(
+                        "  插件已装配: {} v{}（+{count} 工具）",
+                        plugin.name(),
+                        plugin.version()
+                    );
+                    plugin_tools += count;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "  ⚠ 插件 {} 绑定失败（已跳过，不遮蔽其他插件）：{}",
+                        plugin.name(),
+                        error.message
+                    );
+                }
+            }
+        }
+    }
+    Ok(plugin_tools)
 }
 
 /// TASK-703：把物理出网接到本地 CONNECT 白名单代理的 Fetcher 适配器。
@@ -694,6 +820,188 @@ mod tests {
         assert_eq!(v[0]["type"], "function");
         assert_eq!(v[0]["function"]["name"], "echo");
         assert_eq!(v[1]["function"]["name"], "now");
+    }
+
+    struct ImmediateText;
+    impl model_provider::ChatModel for ImmediateText {
+        fn stream_chat(
+            &self,
+            _: &protocol::ModelCallSpec,
+            _: &[model_provider::ChatMessage],
+            _: Option<&serde_json::Value>,
+        ) -> Result<model_provider::ChatReply, ErrorEnvelope> {
+            Ok(model_provider::ChatReply {
+                text: "ok".into(),
+                finish_reason: Some("stop".into()),
+                tool_calls: vec![],
+                usage: None,
+            })
+        }
+    }
+
+    /// TASK-803 验收 1：生产装配后模型可调用 fs_* 工具且路径绑定 --workspace。
+    #[test]
+    fn production_assembly_advertises_and_dispatches_fs_tools() {
+        let workspace = tmp("ws-803");
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("note.txt"), "hello 803").unwrap();
+        let mut registry = ToolRegistry::default();
+        register_chat_tools(&mut registry, &workspace, None, &[], "http://127.0.0.1:1").unwrap();
+        let names: Vec<&str> = registry.names().collect();
+        for expected in [
+            "fs_read",
+            "fs_write",
+            "fs_edit",
+            "fs_glob",
+            "fs_grep",
+            "echo",
+            "now",
+            "web_fetch",
+            "memory_write",
+        ] {
+            assert!(names.contains(&expected), "缺少工具 {expected}: {names:?}");
+        }
+        // 工作区外的路径不受信任（fs_read 越界拒绝）
+        let outcome = registry
+            .dispatch("fs_read", &serde_json::json!({ "path": "../outside.txt" }))
+            .unwrap();
+        assert!(matches!(outcome, ToolOutcome::Failure { .. }));
+        // 工作区内可读
+        let outcome = registry
+            .dispatch("fs_read", &serde_json::json!({ "path": "note.txt" }))
+            .unwrap();
+        match outcome {
+            ToolOutcome::Success { value } => assert_eq!(value["content"], "hello 803"),
+            other => panic!("expected workspace read, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    /// TASK-803 验收 2：显式 plugin_root 装配插件；不指定时不加载任何插件。
+    #[test]
+    fn plugin_root_is_opt_in_and_quarantined_plugins_do_not_shadow() {
+        let workspace = tmp("ws-plugins");
+        let plugin_root = tmp("plugins-803");
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&plugin_root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let payload = r#"{"greeting":"from plugin"}"#;
+        let dir = plugin_root.join("greeter");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({
+            "name": "greeter",
+            "version": "1.0.0",
+            "payload": "payload.json",
+            "hash": tools::content_hash(payload.as_bytes()),
+            "tools": [{
+                "name": "greeter_hello",
+                "description": "Greet",
+                "parameters_schema": { "type": "object", "properties": {} }
+            }]
+        })
+        .to_string();
+        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        std::fs::write(dir.join("payload.json"), payload).unwrap();
+        // 坏插件与好插件并存
+        let bad = plugin_root.join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(
+            bad.join("manifest.json"),
+            r#"{"name":"bad","version":"1","payload":"payload.json","hash":"fnv1a:0000000000000000","tools":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(bad.join("payload.json"), r#"{"evil":true}"#).unwrap();
+
+        let mut registry = ToolRegistry::default();
+        register_chat_tools(
+            &mut registry,
+            &workspace,
+            Some(&plugin_root),
+            &[],
+            "http://127.0.0.1:1",
+        )
+        .unwrap();
+        let names: Vec<&str> = registry.names().collect();
+        assert!(names.contains(&"greeter_hello"), "{names:?}");
+        assert!(!names.contains(&"bad_any"), "隔离插件不得注册工具");
+        let outcome = registry
+            .dispatch("greeter_hello", &serde_json::json!({}))
+            .unwrap();
+        match outcome {
+            ToolOutcome::Success { value } => assert_eq!(value["greeting"], "from plugin"),
+            other => panic!("expected plugin payload, got {other:?}"),
+        }
+
+        // 不显式给 plugin_root：不自动信任工作区插件
+        let mut ungated = ToolRegistry::default();
+        register_chat_tools(&mut ungated, &workspace, None, &[], "http://127.0.0.1:1").unwrap();
+        assert!(!ungated.names().any(|name| name == "greeter_hello"));
+        std::fs::remove_dir_all(&workspace).ok();
+        std::fs::remove_dir_all(&plugin_root).ok();
+    }
+
+    /// TASK-803 验收 3：/steer 的入队路径落 UserInputQueued 事件。
+    #[test]
+    fn steer_command_enqueues_user_input_event() {
+        let path = tmp("steer-803.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut session = JsonlSession::create(path.clone()).unwrap();
+        let registry = ToolRegistry::default();
+        let model = ImmediateText;
+        let mut lp = AgentLoop::with_chat(
+            &mut session,
+            &registry,
+            &model,
+            protocol::ModelCallSpec {
+                model: "m".into(),
+                base_url: "http://localhost".into(),
+                temperature: None,
+            },
+        );
+        // 与 cmd_chat 的 /steer 分支相同的调用路径
+        lp.enqueue_input("优先处理 X").unwrap();
+        lp.mark_queued_inputs_consumed();
+        let events = replay_session(&path).unwrap();
+        assert!(events
+            .iter()
+            .any(|sequenced| matches!(&sequenced.event, Event::UserInputQueued { text } if text == "优先处理 X")));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// TASK-803 验收 4：生产结果中间件——超预算结果被截断替换，小结果原样放行。
+    #[test]
+    fn production_middleware_redacts_oversized_results() {
+        let middleware = ProductionResultMiddleware {
+            max_result_bytes: 32,
+        };
+        let outcome = ToolOutcome::Success {
+            value: serde_json::json!({ "data": "x".repeat(128) }),
+        };
+        let context = ToolResultContext {
+            call_id: "c1",
+            tool: "fs_read",
+            outcome: &outcome,
+        };
+        match middleware.inspect(&context).unwrap() {
+            ToolResultDecision::Redact(ToolOutcome::Success { value }) => {
+                assert_eq!(value["truncated_by_result_guard"], true);
+                assert!(value["original_bytes"].as_u64().unwrap() > 32);
+            }
+            other => panic!("expected redaction, got {other:?}"),
+        }
+        let small = ToolOutcome::Success {
+            value: serde_json::json!({ "data": "tiny" }),
+        };
+        let context = ToolResultContext {
+            call_id: "c2",
+            tool: "fs_read",
+            outcome: &small,
+        };
+        assert!(matches!(
+            middleware.inspect(&context).unwrap(),
+            ToolResultDecision::Allow
+        ));
     }
 
     /// TASK-705 验收：memory_write 落事件、注入幂等、resume 重建包含记忆系统消息。

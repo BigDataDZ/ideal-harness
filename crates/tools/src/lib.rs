@@ -249,6 +249,11 @@ impl ToolRegistry {
         gate.verify_capability(&provenance.plugin, tool).map(|_| ())
     }
 
+    /// 已注册工具名（按注册序）；生产装配据此生成 /tools 与模型广告。
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tools.iter().map(|tool| tool.spec.name.as_str())
+    }
+
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
         self.tools
             .iter()
