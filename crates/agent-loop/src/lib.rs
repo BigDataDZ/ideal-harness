@@ -8,6 +8,7 @@ mod hooks_subagent_tests;
 #[cfg(test)]
 mod hooks_tests;
 mod mcp_bridge;
+mod result_guard;
 mod role_config;
 mod subagent;
 mod subagent_lifecycle;
@@ -17,6 +18,9 @@ mod team;
 pub use compaction::{HistoryCompaction, OverflowRecovery};
 pub use hooks::{Hook, HookContext, HookPoint, HookRegistry, HookResult};
 pub use mcp_bridge::McpInvocation;
+pub use result_guard::{
+    guard_tool_result, ToolResultContext, ToolResultDecision, ToolResultMiddleware,
+};
 pub use role_config::{
     parse_roles, AgentRole, RoleCatalog, RoleSubtask, RoleTaskBudget, RoleTaskIdentity,
 };
@@ -98,6 +102,8 @@ struct ChatTurnConfig<'a> {
     external_events: Option<&'a dyn Fn() -> Vec<Event>>,
     overflow_recovery: Option<OverflowRecovery<'a>>,
     hooks: Option<&'a HookRegistry>,
+    /// TASK-607：结果进模型表面前的安全中间件。
+    result_middleware: Option<&'a dyn ToolResultMiddleware>,
     agent_path: &'a [String],
 }
 
@@ -124,6 +130,8 @@ pub struct AgentLoop<'a> {
     pub overflow_recovery: Option<OverflowRecovery<'a>>,
     /// TASK-503：同步生命周期 Hook；注册表本身不持有 session 写能力。
     pub hooks: Option<&'a HookRegistry>,
+    /// TASK-607：工具结果进模型前的安全中间件；插件来源结果在缺席时 fail-closed。
+    pub result_middleware: Option<&'a dyn ToolResultMiddleware>,
     /// TASK-602：从根到当前代理的稳定身份路径；usage 通过它归集到所有祖先。
     agent_path: Vec<String>,
 }
@@ -148,6 +156,7 @@ impl<'a> AgentLoop<'a> {
             external_events: None,
             overflow_recovery: None,
             hooks: None,
+            result_middleware: None,
             agent_path: vec!["root".into()],
         }
     }
@@ -173,6 +182,7 @@ impl<'a> AgentLoop<'a> {
             external_events: None,
             overflow_recovery: None,
             hooks: None,
+            result_middleware: None,
             agent_path: vec!["root".into()],
         }
     }
@@ -319,6 +329,7 @@ impl<'a> AgentLoop<'a> {
                         external_events: self.external_events,
                         overflow_recovery: self.overflow_recovery,
                         hooks: self.hooks,
+                        result_middleware: self.result_middleware,
                         agent_path: &self.agent_path,
                     },
                     &mut self.chat_history,
@@ -568,7 +579,14 @@ impl<'a> AgentLoop<'a> {
                         }
                     }
                 }
-                let outcome = execution.outcome;
+                // TASK-607：结果进模型表面前的安全裁决（缺席对插件来源 fail-closed）
+                let outcome = guard_tool_result(
+                    cfg.result_middleware,
+                    registry,
+                    &tc.id,
+                    &tc.name,
+                    execution.outcome,
+                );
                 session
                     .append(Event::ToolResultAdded {
                         call_id: tc.id.clone(),

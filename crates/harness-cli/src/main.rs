@@ -525,4 +525,44 @@ mod tests {
         assert_eq!(v[0]["function"]["name"], "echo");
         assert_eq!(v[1]["function"]["name"], "now");
     }
+
+    /// TASK-607 装配冒烟：workspace → 插件目录发现 → 绑定 → 调度回 payload。
+    #[test]
+    fn plugin_assembly_discovers_binds_and_dispatches_payload() {
+        let root = tmp("plugin-assembly");
+        let _ = std::fs::remove_dir_all(&root);
+        let payload = r#"{"greeting":"hi from plugin"}"#;
+        let dir = root.join(".harness/plugins/greeter");
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = serde_json::json!({
+            "name": "greeter",
+            "version": "1.0.0",
+            "payload": "payload.json",
+            "hash": tools::content_hash(payload.as_bytes()),
+            "tools": [{
+                "name": "greeter_hello",
+                "description": "Greet",
+                "parameters_schema": { "type": "object", "properties": {} }
+            }]
+        })
+        .to_string();
+        std::fs::write(dir.join("manifest.json"), manifest).unwrap();
+        std::fs::write(dir.join("payload.json"), payload).unwrap();
+
+        let catalog = std::sync::Arc::new(tools::PluginCatalog::discover(&root).unwrap());
+        assert!(catalog.failures().is_empty());
+        let mut registry = ToolRegistry::default();
+        assert_eq!(
+            catalog.bind_static_tools(&mut registry, "greeter").unwrap(),
+            1
+        );
+        assert_eq!(registry.plugin_provenance("greeter_hello"), Some("greeter"));
+        match registry.dispatch("greeter_hello", &serde_json::json!({})) {
+            Some(ToolOutcome::Success { value }) => {
+                assert_eq!(value["greeting"], "hi from plugin")
+            }
+            other => panic!("expected payload result, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
 }

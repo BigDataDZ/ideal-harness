@@ -4,17 +4,24 @@
 mod advertisement;
 mod mcp;
 mod mcp_registry;
+mod plugins;
 mod schema;
 mod skills;
 
-use protocol::{AuthorizationContext, ToolOutcome};
+use protocol::{AuthorizationContext, ErrorEnvelope, ToolOutcome};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub use advertisement::EscalationAvailability;
 pub use mcp::{McpCallResult, McpClient, McpServerConfig, McpTool};
 pub use mcp_registry::{
     McpFailureStage, McpRegistration, McpRegistry, McpServiceFailure, McpServiceRequirement,
     McpServiceSnapshot, McpServiceStatus, McpToolHandle,
+};
+pub use plugins::{
+    content_hash, PluginCatalog, PluginFailure, PluginFailureStage, PluginToolDeclaration,
+    VerifiedPlugin,
 };
 pub use schema::validate_args;
 pub use skills::{SkillCatalog, SkillRefresh, VerifiedSkill, VerifiedSkillScope};
@@ -85,9 +92,19 @@ struct RegisteredTool {
     handler: ToolHandler,
 }
 
+/// 插件工具的注册时快照：调度时会对照目录复核指纹与能力声明。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PluginProvenance {
+    plugin: String,
+    fingerprint: u64,
+}
+
 pub struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     escalation_availability: EscalationAvailability,
+    /// TASK-607：插件调度门；注册与调度两个时点都强制清单校验。
+    plugin_gate: Option<Arc<PluginCatalog>>,
+    plugin_tools: BTreeMap<String, PluginProvenance>,
 }
 
 impl Default for ToolRegistry {
@@ -95,6 +112,8 @@ impl Default for ToolRegistry {
         Self {
             tools: Vec::new(),
             escalation_availability: EscalationAvailability::Unavailable,
+            plugin_gate: None,
+            plugin_tools: BTreeMap::new(),
         }
     }
 }
@@ -131,6 +150,92 @@ impl ToolRegistry {
             spec,
             handler: ToolHandler::Audited(handler),
         });
+    }
+
+    /// TASK-607：安装插件调度门；此后 `register_plugin_tool` 才可用。
+    pub fn set_plugin_gate(&mut self, gate: Arc<PluginCatalog>) {
+        self.plugin_gate = Some(gate);
+    }
+
+    /// 注册插件提供的工具：能力必须已由验证过的清单声明且 spec 与声明完全一致；
+    /// 插件工具不允许提权出口（manifest 无此能力位），重复名按错误返回而非 panic。
+    pub fn register_plugin_tool(
+        &mut self,
+        plugin: &str,
+        spec: ToolSpec,
+        handler: Box<ToolFn>,
+    ) -> Result<(), ErrorEnvelope> {
+        let gate = self.plugin_gate.as_ref().ok_or_else(|| {
+            ErrorEnvelope::new(
+                protocol::ErrorCode::Internal,
+                "plugin gate is not installed; refusing plugin tool registration",
+            )
+        })?;
+        let declaration = gate.verify_capability(plugin, &spec.name)?;
+        if spec.escalation_capable {
+            return Err(ErrorEnvelope::new(
+                protocol::ErrorCode::SandboxDenied,
+                "plugin tools cannot declare escalation capability",
+            ));
+        }
+        if spec.description != declaration.description()
+            || spec.parameters_schema != *declaration.parameters_schema()
+        {
+            return Err(ErrorEnvelope::new(
+                protocol::ErrorCode::SandboxDenied,
+                "registered plugin tool spec does not match its manifest declaration",
+            ));
+        }
+        if self.get(&spec.name).is_some() {
+            return Err(ErrorEnvelope::new(
+                protocol::ErrorCode::ToolArgsInvalid,
+                format!("duplicate tool name: {}", spec.name),
+            ));
+        }
+        let fingerprint = gate
+            .get(plugin)
+            .map(VerifiedPlugin::fingerprint)
+            .expect("capability verified above");
+        self.plugin_tools.insert(
+            spec.name.clone(),
+            PluginProvenance {
+                plugin: plugin.to_string(),
+                fingerprint,
+            },
+        );
+        self.tools.push(RegisteredTool {
+            spec,
+            handler: ToolHandler::Plain(handler),
+        });
+        Ok(())
+    }
+
+    /// 插件来源标记；agent-loop 的结果中间件据此判定「未受监管来源」。
+    pub fn plugin_provenance(&self, tool: &str) -> Option<&str> {
+        self.plugin_tools.get(tool).map(|p| p.plugin.as_str())
+    }
+
+    /// 调度前的插件能力复核：门在位、指纹未漂移、payload 当场完整。
+    fn verify_plugin_tool(&self, tool: &str) -> Result<(), ErrorEnvelope> {
+        let Some(provenance) = self.plugin_tools.get(tool) else {
+            return Ok(());
+        };
+        let Some(gate) = self.plugin_gate.as_ref() else {
+            return Err(ErrorEnvelope::new(
+                protocol::ErrorCode::Internal,
+                "plugin gate missing; refusing dispatch of plugin tool",
+            ));
+        };
+        match gate.get(&provenance.plugin) {
+            Some(verified) if verified.fingerprint() == provenance.fingerprint => {}
+            _ => {
+                return Err(ErrorEnvelope::new(
+                    protocol::ErrorCode::SandboxDenied,
+                    "registered plugin capability is stale or quarantined; rebind required",
+                ));
+            }
+        }
+        gate.verify_capability(&provenance.plugin, tool).map(|_| ())
     }
 
     pub fn get(&self, name: &str) -> Option<&ToolSpec> {
@@ -172,6 +277,9 @@ impl ToolRegistry {
         }
         if let Err(e) = validate_args(&validation_spec, args) {
             return Some(ToolExecution::new(ToolOutcome::Failure { error: e }));
+        }
+        if let Err(error) = self.verify_plugin_tool(name) {
+            return Some(ToolExecution::new(ToolOutcome::Failure { error }));
         }
         Some(match &t.handler {
             ToolHandler::Plain(handler) => ToolExecution::new(handler(args)),
