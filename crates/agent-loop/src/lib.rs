@@ -12,6 +12,7 @@ mod role_config;
 mod subagent;
 mod subagent_lifecycle;
 mod subagent_policy;
+mod team;
 
 pub use compaction::{HistoryCompaction, OverflowRecovery};
 pub use hooks::{Hook, HookContext, HookPoint, HookRegistry, HookResult};
@@ -22,6 +23,7 @@ pub use role_config::{
 pub use subagent::{SubagentReport, SubagentRunner, SubagentTask, SubagentTrace};
 pub use subagent_lifecycle::{SubagentCancellation, SubagentDelegation};
 pub use subagent_policy::{SubagentPolicy, SubagentRequest};
+pub use team::TeamCoordinator;
 
 use context::{BudgetLedger, TokenMeter, TokenSource};
 use protocol::{ErrorCode, ErrorEnvelope, Event, ModelToolCall, TokenUsageSource, ToolOutcome};
@@ -1031,6 +1033,12 @@ mod tests {
             Event::SubagentCancellationRequested { .. } => "subagent_cancel_requested",
             Event::SubagentReportDelivered { .. } => "subagent_report_delivered",
             Event::SubagentStopped { .. } => "subagent_stopped",
+            Event::TeamMemberRegistered { .. } => "team_member_registered",
+            Event::TeamMessageEnqueued { .. } => "team_message_enqueued",
+            Event::TeamMessageDelivered { .. } => "team_message_delivered",
+            Event::TeamTaskCreated { .. } => "team_task_created",
+            Event::TeamTaskUpdated { .. } => "team_task_updated",
+            Event::TeamWriteScopeConflictDetected { .. } => "team_write_scope_conflict",
             Event::TurnCompleted { .. } => "turn_completed",
             Event::TurnAborted { .. } => "turn_aborted",
         }

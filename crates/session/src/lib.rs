@@ -5,6 +5,7 @@ mod lineage;
 mod model_surface;
 mod projection;
 mod spill;
+mod team;
 mod timeline;
 #[cfg(feature = "zstd")]
 mod zstd_frames;
@@ -15,6 +16,7 @@ pub use lineage::{derive_subagent_lineage, SubagentLineage};
 pub use model_surface::project_model_surface;
 pub use projection::{ProjectedSession, SqliteProjection};
 pub use spill::{SpillLocator, SpillStore, StoredToolResult};
+pub use team::TeamState;
 pub use timeline::{
     revert_before_turn, timeline_from_session, timeline_page, TimelinePage, TurnStatus, TurnSummary,
 };

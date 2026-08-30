@@ -200,14 +200,14 @@
 - 明确不做: 不做 HTTP MCP/OAuth；不引入异步运行时；不执行服务端任意代码
 - 依赖: TASK-603
 
-### TASK-605: generation-aware RPC/SSE 连续性 ✅（完成，提交见 git 历史）
+### TASK-605: generation-aware RPC/SSE 连续性 ✅（commit `47f5144`）
 - 目标 crate: protocol ⚠️串行、harness-cli
 - 内容: follow-before-page、connection generation、Last-Event-ID 续传与序号缺口修复；服务端能力协商保持只读
 - 验收标准: 首屏与并发追加无窗口丢失；断线补洞无重无漏；旧 generation、坏 cursor 和业务错误不自动无限重试
 - 明确不做: 不开放远程写、审批或公网监听；不实现完整 Web UI/认证
 - 依赖: TASK-604
 
-### TASK-606: 持久化 Agent Team 协调层
+### TASK-606: 持久化 Agent Team 协调层 ✅（完成，提交见 git 历史）
 - 目标 crate: protocol ⚠️串行、session、agent-loop
 - 内容: durable roster/mailbox、消息去重、带 revision/CAS 的任务 DAG、blockedBy 与 writeScopes 重叠告警
 - 验收标准: 崩溃重放恢复团队状态；重复消息恰好投递一次；环依赖/旧 revision fail-closed；写范围冲突产生审计告警

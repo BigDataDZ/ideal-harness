@@ -27,6 +27,8 @@ pub enum ErrorCode {
     SubagentCancelled,
     SessionNotFound,
     CursorInvalid,
+    TeamRevisionConflict,
+    TeamDependencyCycle,
     Internal,
 }
 
@@ -143,6 +145,48 @@ pub enum SubagentReportDelivery {
     Quiet,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamTaskStatus {
+    Pending,
+    InProgress,
+    Blocked,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMember {
+    pub member_id: String,
+    pub parent_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamMessage {
+    pub message_id: String,
+    pub from_member_id: String,
+    pub to_member_id: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamTask {
+    pub task_id: String,
+    pub owner_member_id: String,
+    pub revision: u64,
+    pub status: TeamTaskStatus,
+    pub blocked_by: Vec<String>,
+    pub write_scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamWriteScopeConflict {
+    pub task_id: String,
+    pub conflicting_task_id: String,
+    pub scope: String,
+}
+
 /// 会话事件流：append-only，事件溯源的唯一载体（P5）。
 /// 所有"魔法"（自动压缩/重试/审批）必须在这里留下痕迹（P7）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -240,6 +284,26 @@ pub enum Event {
         task_id: String,
         child_id: String,
         outcome: SubagentOutcome,
+    },
+    TeamMemberRegistered {
+        member: TeamMember,
+    },
+    TeamMessageEnqueued {
+        message: TeamMessage,
+    },
+    TeamMessageDelivered {
+        message_id: String,
+        to_member_id: String,
+    },
+    TeamTaskCreated {
+        task: TeamTask,
+    },
+    TeamTaskUpdated {
+        expected_revision: u64,
+        task: TeamTask,
+    },
+    TeamWriteScopeConflictDetected {
+        conflict: TeamWriteScopeConflict,
     },
     TurnCompleted {
         turn_id: u64,
@@ -412,6 +476,61 @@ mod tests {
                 approved: true,
                 authorization: None,
             }
+        );
+    }
+
+    #[test]
+    fn team_coordination_contract_roundtrips_with_stable_codes() {
+        let task = TeamTask {
+            task_id: "task-1".into(),
+            owner_member_id: "agent-a".into(),
+            revision: 2,
+            status: TeamTaskStatus::Blocked,
+            blocked_by: vec!["task-0".into()],
+            write_scopes: vec!["crates/session".into()],
+        };
+        for event in [
+            Event::TeamMemberRegistered {
+                member: TeamMember {
+                    member_id: "agent-a".into(),
+                    parent_id: "root".into(),
+                },
+            },
+            Event::TeamMessageEnqueued {
+                message: TeamMessage {
+                    message_id: "message-1".into(),
+                    from_member_id: "root".into(),
+                    to_member_id: "agent-a".into(),
+                    body: "continue".into(),
+                },
+            },
+            Event::TeamMessageDelivered {
+                message_id: "message-1".into(),
+                to_member_id: "agent-a".into(),
+            },
+            Event::TeamTaskCreated { task: task.clone() },
+            Event::TeamTaskUpdated {
+                expected_revision: 1,
+                task,
+            },
+            Event::TeamWriteScopeConflictDetected {
+                conflict: TeamWriteScopeConflict {
+                    task_id: "task-1".into(),
+                    conflicting_task_id: "task-2".into(),
+                    scope: "crates/session".into(),
+                },
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
+        }
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::TeamRevisionConflict).unwrap(),
+            "\"team_revision_conflict\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::TeamDependencyCycle).unwrap(),
+            "\"team_dependency_cycle\""
         );
     }
 

@@ -13,16 +13,16 @@ Rust 实现的 LLM Agent Harness 原型：protocol-first、事件溯源、三层
 
 | crate | 职责 | 设计原则 | 允许依赖 |
 |---|---|---|---|
-| `crates/protocol` | wire 协议：Event/ErrorCode/ErrorEnvelope + generation-aware 只读 RPC，**唯一契约** | P-arch/D18 | serde |
+| `crates/protocol` | wire 协议：Event/ErrorCode/ErrorEnvelope + generation-aware RPC + Team 协调契约，**唯一契约** | P-arch/D18/D19 | serde |
 | `crates/sandbox-policy` | SandboxMode 单一抽象 + 词法栅栏 + 加宽表 | P2 | — |
 | `crates/sandbox-exec` | OS 受限子进程池：Windows Restricted Token + Landlock 后端接口 + 执行器环境事实 | P2/D16 | protocol |
 | `crates/network-proxy` | 默认拒绝的 CONNECT 白名单代理 + 网络审计事件 | P2 | protocol |
 | `crates/approval` | fail-closed 审批 + 提权参数成对校验 + 权限 epoch/执行环境绑定 | P2/D16 | protocol, sandbox-policy |
 | `crates/tools` | 工具注册表 + schema 校验 + 调度 + 受监管 MCP 服务目录 | P3/P4/D17 | protocol |
-| `crates/session` | JSONL 事件溯源：append/replay/fork + 唯一 Model Surface 投影 | P5/D14 | protocol |
+| `crates/session` | JSONL 事件溯源：append/replay/fork + Model Surface/Team 状态投影 | P5/D14/D19 | protocol |
 | `crates/context` | token 计量 + 根/子树预算账本 + 双触发压缩判定 | P4/D15 | protocol |
 | `crates/model-provider` | OpenAI 兼容 HTTP+SSE 客户端（错误→稳定码映射） | P1 | protocol, reqwest |
-| `crates/agent-loop` | Phase 状态机主循环 + Inbox + 工具/MCP 调用闭环 | P3/D17 | protocol, session, tools, model-provider |
+| `crates/agent-loop` | Phase 状态机主循环 + Inbox + 工具/MCP/Agent Team 协调闭环 | P3/D17/D19 | protocol, session, tools, model-provider |
 | `crates/harness-cli` | 装配入口 + generation-aware 只读 RPC/SSE（唯一允许 main 的地方） | D18 | 全部 |
 
 依赖方向必须与上表一致，禁止反向依赖与跨层依赖。

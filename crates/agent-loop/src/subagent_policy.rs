@@ -170,11 +170,7 @@ pub(crate) fn validate_delegation(
     child: &SubagentPolicy,
     request: &SubagentRequest,
 ) -> Result<(), ErrorEnvelope> {
-    if !child.is_within(parent) {
-        return Err(policy_error(
-            "child subagent policy expands its parent policy",
-        ));
-    }
+    validate_child_policy(parent, child)?;
     if request.depth > child.max_depth {
         return Err(policy_error("subagent depth limit exceeded"));
     }
@@ -204,6 +200,19 @@ pub(crate) fn validate_delegation(
         return Err(policy_error("subagent tool selection is not allowed"));
     }
     Ok(())
+}
+
+pub(crate) fn validate_child_policy(
+    parent: &SubagentPolicy,
+    child: &SubagentPolicy,
+) -> Result<(), ErrorEnvelope> {
+    if child.is_within(parent) {
+        Ok(())
+    } else {
+        Err(policy_error(
+            "child subagent policy expands its parent policy",
+        ))
+    }
 }
 
 fn collect_names(
