@@ -73,11 +73,12 @@ fn write_then_read_roundtrip_and_read_before_write_is_enforced() {
         &serde_json::json!({ "path": "note.txt", "content": "v2" }),
     ));
     assert_eq!(error.code, ErrorCode::SandboxDenied);
-    // 该实例读过之后覆盖放行
-    ok(reg3.dispatch("fs_read", &serde_json::json!({ "path": "note.txt" })));
+    // 该实例读过之后覆盖放行（携带 read 返回的 hash）
+    let read_back = ok(reg3.dispatch("fs_read", &serde_json::json!({ "path": "note.txt" })));
+    let hash = read_back["hash"].as_str().unwrap().to_string();
     ok(reg3.dispatch(
         "fs_write",
-        &serde_json::json!({ "path": "note.txt", "content": "v2" }),
+        &serde_json::json!({ "path": "note.txt", "content": "v2", "expected_hash": hash }),
     ));
     assert_eq!(
         std::fs::read_to_string(h2.root.join("note.txt")).unwrap(),
@@ -98,12 +99,20 @@ fn edit_requires_read_unique_anchor_and_leaves_file_unchanged_on_failure() {
         .code,
         ErrorCode::SandboxDenied
     );
-    ok(h.registry
+    let read_back = ok(h
+        .registry
         .dispatch("fs_read", &serde_json::json!({ "path": "code.txt" })));
+    let hash = read_back["hash"].as_str().unwrap().to_string();
+    let with_hash = |mut args: serde_json::Value| {
+        args["expected_hash"] = serde_json::json!(hash);
+        args
+    };
     // 歧义锚串 → 拒绝且文件零改动
     let ambiguous = err(h.registry.dispatch(
         "fs_edit",
-        &serde_json::json!({ "path": "code.txt", "old_string": "alpha", "new_string": "X" }),
+        &with_hash(
+            serde_json::json!({ "path": "code.txt", "old_string": "alpha", "new_string": "X" }),
+        ),
     ));
     assert_eq!(ambiguous.code, ErrorCode::ToolArgsInvalid);
     assert!(ambiguous.message.contains("left unchanged"));
@@ -114,13 +123,23 @@ fn edit_requires_read_unique_anchor_and_leaves_file_unchanged_on_failure() {
     // 唯一锚串替换
     let value = ok(h.registry.dispatch(
         "fs_edit",
-        &serde_json::json!({ "path": "code.txt", "old_string": "beta", "new_string": "BETA" }),
+        &with_hash(
+            serde_json::json!({ "path": "code.txt", "old_string": "beta", "new_string": "BETA" }),
+        ),
     ));
     assert_eq!(value["replacements"], 1);
-    // replace_all
+    // replace_all（上次编辑已改变内容：重取 hash）
+    let read_back = ok(h
+        .registry
+        .dispatch("fs_read", &serde_json::json!({ "path": "code.txt" })));
+    let hash = read_back["hash"].as_str().unwrap().to_string();
+    let with_hash = |mut args: serde_json::Value| {
+        args["expected_hash"] = serde_json::json!(hash);
+        args
+    };
     let value = ok(h.registry.dispatch(
         "fs_edit",
-        &serde_json::json!({ "path": "code.txt", "old_string": "alpha", "new_string": "X", "replace_all": true }),
+        &with_hash(serde_json::json!({ "path": "code.txt", "old_string": "alpha", "new_string": "X", "replace_all": true })),
     ));
     assert_eq!(value["replacements"], 2);
     assert_eq!(
@@ -321,14 +340,86 @@ unique-tail-marker
         4_000,
         "预览固定 4000 字符"
     );
+    let hash = value["hash"].as_str().unwrap().to_string();
     // 虽然截断交付，已读事实成立：编辑放行
     let value = ok(h.registry.dispatch(
         "fs_edit",
         &serde_json::json!({
             "path": "big.txt",
             "old_string": "unique-tail-marker",
-            "new_string": "unique-tail-marked"
+            "new_string": "unique-tail-marked",
+            "expected_hash": hash
         }),
     ));
     assert_eq!(value["replacements"], 1);
+}
+#[test]
+fn stale_expected_hash_conflicts_and_leaves_file_unchanged() {
+    let (h, _set) = setup("cas");
+    ok(h.registry.dispatch(
+        "fs_write",
+        &serde_json::json!({ "path": "doc.txt", "content": "v1" }),
+    ));
+    let read_back = ok(h
+        .registry
+        .dispatch("fs_read", &serde_json::json!({ "path": "doc.txt" })));
+    let stale_hash = read_back["hash"].as_str().unwrap().to_string();
+    std::fs::write(h.root.join("doc.txt"), "v2 from outside").unwrap();
+    let error = err(h.registry.dispatch(
+        "fs_write",
+        &serde_json::json!({ "path": "doc.txt", "content": "v3", "expected_hash": stale_hash }),
+    ));
+    assert_eq!(error.code, ErrorCode::FileRevisionConflict);
+    assert!(error.message.contains("left unchanged"));
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("doc.txt")).unwrap(),
+        "v2 from outside"
+    );
+    let error = err(h.registry.dispatch(
+        "fs_write",
+        &serde_json::json!({ "path": "doc.txt", "content": "v3" }),
+    ));
+    assert_eq!(error.code, ErrorCode::ToolArgsInvalid);
+    let fresh = ok(h
+        .registry
+        .dispatch("fs_read", &serde_json::json!({ "path": "doc.txt" })));
+    ok(h.registry.dispatch(
+        "fs_write",
+        &serde_json::json!({ "path": "doc.txt", "content": "v3", "expected_hash": fresh["hash"] }),
+    ));
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("doc.txt")).unwrap(),
+        "v3"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(h.root.join("doc.txt").parent().unwrap())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().contains(".ih-tmp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "不得留下临时文件: {leftovers:?}");
+}
+
+#[test]
+fn edit_with_stale_hash_conflicts() {
+    let (h, _set) = setup("cas-edit");
+    std::fs::write(h.root.join("f.txt"), "base").unwrap();
+    let read_back = ok(h
+        .registry
+        .dispatch("fs_read", &serde_json::json!({ "path": "f.txt" })));
+    let hash = read_back["hash"].as_str().unwrap().to_string();
+    std::fs::write(h.root.join("f.txt"), "changed outside").unwrap();
+    let error = err(h.registry.dispatch(
+        "fs_edit",
+        &serde_json::json!({
+            "path": "f.txt",
+            "old_string": "base",
+            "new_string": "new",
+            "expected_hash": hash
+        }),
+    ));
+    assert_eq!(error.code, ErrorCode::FileRevisionConflict);
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("f.txt")).unwrap(),
+        "changed outside"
+    );
 }

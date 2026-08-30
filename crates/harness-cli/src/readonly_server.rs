@@ -436,7 +436,9 @@ fn rpc_error_response(error: ErrorEnvelope) -> HttpResponse {
     let status = match error.code {
         ErrorCode::SessionNotFound => 404,
         ErrorCode::CursorInvalid | ErrorCode::ToolArgsInvalid => 400,
-        ErrorCode::TeamRevisionConflict | ErrorCode::TeamDependencyCycle => 409,
+        ErrorCode::TeamRevisionConflict
+        | ErrorCode::TeamDependencyCycle
+        | ErrorCode::FileRevisionConflict => 409,
         ErrorCode::SandboxDenied | ErrorCode::ApprovalRejected => 403,
         _ => 500,
     };

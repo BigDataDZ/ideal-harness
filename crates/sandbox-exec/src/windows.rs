@@ -225,12 +225,10 @@ fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
         )
     } == 0
     {
-        return Err(io::Error::other(
-            format!(
-                "SetInformationJobObject failed: {}",
-                io::Error::last_os_error()
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "SetInformationJobObject failed: {}",
+            io::Error::last_os_error()
+        )));
     }
     Ok(job_handle)
 }
@@ -313,12 +311,10 @@ fn execute_inner(command: &CommandSpec, deadline: Option<Duration>) -> io::Resul
     let job = create_kill_on_close_job()?;
     // SAFETY: job 与刚创建的 process 句柄均有效。
     if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0 {
-        let error = io::Error::other(
-            format!(
-                "AssignProcessToJobObject failed: {}",
-                io::Error::last_os_error()
-            ),
-        );
+        let error = io::Error::other(format!(
+            "AssignProcessToJobObject failed: {}",
+            io::Error::last_os_error()
+        ));
         unsafe { TerminateProcess(process.0, 1) };
         return Err(error);
     }

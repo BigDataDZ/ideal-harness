@@ -4,6 +4,68 @@
 //! 结果只携带预览 + locator（locator 是工作区内相对路径，可用 fs_read 取回全文）。
 
 use crate::{CancellationToken, ToolRegistry};
+
+/// TASK-804：文件内容摘要（与插件 hash 同一 fnv1a 稳定算法）。
+fn content_digest(bytes: &[u8]) -> String {
+    format!("fnv1a:{:016x}", fnv1a(bytes))
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// TASK-804：CAS 前置——目标存在时必须携带与当前内容一致的 expected_hash。
+fn verify_expected_hash(path: &Path, expected: Option<&str>) -> Result<(), ErrorEnvelope> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let Some(expected) = expected else {
+        return Err(ErrorEnvelope::new(
+            ErrorCode::ToolArgsInvalid,
+            format!(
+                "expected_hash is required when overwriting an existing file: {}",
+                path.display()
+            ),
+        ));
+    };
+    let bytes = fs::read(path).map_err(|error| path_error(path, error))?;
+    let current = content_digest(&bytes);
+    if current != expected.trim() {
+        return Err(ErrorEnvelope::new(
+            ErrorCode::FileRevisionConflict,
+            format!(
+                "file changed since last read (expected {expected}, current {current}); file left unchanged"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// TASK-804：原子替换——同目录临时文件 + sync + rename；失败清理临时文件，
+/// 路径上只会出现旧文件或完整新文件，绝不出现半文件。
+fn atomic_write(path: &Path, bytes: &[u8], unique: u64) -> Result<(), ErrorEnvelope> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| args_error("path has no file name"))?
+        .to_os_string();
+    let mut tmp_name = file_name.clone();
+    tmp_name.push(format!(".ih-tmp-{}-{unique}", std::process::id()));
+    let tmp_path = path.with_file_name(tmp_name);
+    {
+        let mut file = fs::File::create(&tmp_path).map_err(|error| path_error(&tmp_path, error))?;
+        file.write_all(bytes)
+            .map_err(|error| path_error(&tmp_path, error))?;
+        file.sync_all()
+            .map_err(|error| path_error(&tmp_path, error))?;
+    }
+    if let Err(error) = fs::rename(&tmp_path, path) {
+        fs::remove_file(&tmp_path).ok();
+        return Err(path_error(path, error));
+    }
+    Ok(())
+}
 use protocol::{ErrorCode, ErrorEnvelope, ToolOutcome};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -86,8 +148,8 @@ impl FsToolSet {
                 |set, args| set.tool_read(args),
             ),
             (
-                "fs_write",
-                "创建或覆盖工作区内文本文件；覆盖既有文件前必须先 fs_read；返回 {path, bytes}",
+            "fs_write",
+            "创建或覆盖工作区内文本文件；覆盖既有文件前必须先 fs_read 并携带其返回的 hash 作为 expected_hash；返回 {path, bytes}",
                 serde_json::json!({
                     "type": "object",
                     "required": ["path", "content"],
@@ -99,8 +161,8 @@ impl FsToolSet {
                 |set, args| set.tool_write(args),
             ),
             (
-                "fs_edit",
-                "在工作区文件内做字符串替换；old_string 必须先经 fs_read；默认要求唯一匹配，replace_all=true 才全量替换；返回 {path, replacements}",
+            "fs_edit",
+            "在工作区文件内做字符串替换；old_string 必须先经 fs_read 并携带其返回的 hash 作为 expected_hash；默认要求唯一匹配，replace_all=true 才全量替换；返回 {path, replacements}",
                 serde_json::json!({
                     "type": "object",
                     "required": ["path", "old_string", "new_string"],
@@ -165,6 +227,7 @@ impl FsToolSet {
                 .lock()
                 .expect("read tracker poisoned")
                 .insert(path.clone());
+            let digest = content_digest(&bytes);
             if metadata.len() as usize > MAX_READ_BYTES {
                 let locator = self.spill(&text)?;
                 return Ok(serde_json::json!({
@@ -172,11 +235,13 @@ impl FsToolSet {
                     "content": preview(&text),
                     "truncated": true,
                     "locator": locator,
+                    "hash": digest,
                 }));
             }
             Ok(serde_json::json!({
                 "path": path.display().to_string(),
                 "content": text,
+                "hash": digest,
             }))
         })
     }
@@ -202,7 +267,10 @@ impl FsToolSet {
                     path.display()
                 )));
             }
-            fs::write(&path, content.as_bytes()).map_err(|error| path_error(&path, error))?;
+            // TASK-804：CAS——覆盖既有文件必须携带与当前内容一致的 expected_hash
+            verify_expected_hash(&path, args.get("expected_hash").and_then(Value::as_str))?;
+            let unique = self.spill_counter.fetch_add(1, Ordering::Relaxed);
+            atomic_write(&path, content.as_bytes(), unique)?;
             self.read_tracker
                 .lock()
                 .expect("read tracker poisoned")
@@ -237,6 +305,8 @@ impl FsToolSet {
                 )));
             }
             let bytes = fs::read(&path).map_err(|error| path_error(&path, error))?;
+            // TASK-804：CAS——编辑覆盖前校验 expected_hash（fs_read 返回值中的 hash）
+            verify_expected_hash(&path, args.get("expected_hash").and_then(Value::as_str))?;
             let text = decode_utf8(&bytes)?;
             let replacements = text.matches(old_string.as_str()).count();
             if replacements == 0 {
@@ -255,7 +325,8 @@ impl FsToolSet {
             if updated.len() > MAX_WRITE_BYTES {
                 return Err(args_error("edited file would exceed fs_write size limit"));
             }
-            fs::write(&path, updated.as_bytes()).map_err(|error| path_error(&path, error))?;
+            let unique = self.spill_counter.fetch_add(1, Ordering::Relaxed);
+            atomic_write(&path, updated.as_bytes(), unique)?;
             Ok(serde_json::json!({
                 "path": path.display().to_string(),
                 "replacements": if replace_all { replacements } else { 1 },

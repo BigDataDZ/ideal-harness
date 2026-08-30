@@ -1165,13 +1165,22 @@ mod tests {
                 &serde_json::json!({ "path": "note.txt", "content": "one\n" }),
             )
             .expect("new file write must succeed");
-        registry
+        let read_back = registry
             .dispatch("fs_read", &serde_json::json!({ "path": "note.txt" }))
             .expect("read back must succeed");
+        let ToolOutcome::Success { value: read_value } = read_back else {
+            panic!("read must succeed");
+        };
+        let hash = read_value["hash"].as_str().unwrap().to_string();
         let edit = registry
             .dispatch(
                 "fs_edit",
-                &serde_json::json!({ "path": "note.txt", "old_string": "one", "new_string": "two" }),
+                &serde_json::json!({
+                    "path": "note.txt",
+                    "old_string": "one",
+                    "new_string": "two",
+                    "expected_hash": hash
+                }),
             )
             .expect("edit after read must succeed");
         match edit {

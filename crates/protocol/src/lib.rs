@@ -33,6 +33,8 @@ pub enum ErrorCode {
     ToolTimeout,
     /// TASK-702：循环防护拒绝了重复的等参工具调用。
     ToolLoopDetected,
+    /// TASK-804：文件 CAS——expected_hash 与当前内容不符，旧文件零改动。
+    FileRevisionConflict,
     Internal,
 }
 
@@ -626,6 +628,7 @@ mod tests {
             (ErrorCode::ApprovalRejected, "approval_rejected"),
             (ErrorCode::ToolTimeout, "tool_timeout"),
             (ErrorCode::ToolLoopDetected, "tool_loop_detected"),
+            (ErrorCode::FileRevisionConflict, "file_revision_conflict"),
         ] {
             let json = serde_json::to_string(&code).unwrap();
             assert_eq!(json, format!("\"{tag}\""));
