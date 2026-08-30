@@ -526,6 +526,41 @@ mod tests {
         assert_eq!(v[1]["function"]["name"], "now");
     }
 
+    /// TASK-701 装配冒烟：工作区 → FsToolSet 注册 → read/write/edit 闭环。
+    #[test]
+    fn fs_toolset_assembly_read_write_edit_roundtrip() {
+        let root = tmp("fs-assembly");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let set = tools::FsToolSet::new(&root).unwrap();
+        let mut registry = ToolRegistry::default();
+        set.register(&mut registry);
+        registry
+            .dispatch(
+                "fs_write",
+                &serde_json::json!({ "path": "note.txt", "content": "one\n" }),
+            )
+            .expect("new file write must succeed");
+        registry
+            .dispatch("fs_read", &serde_json::json!({ "path": "note.txt" }))
+            .expect("read back must succeed");
+        let edit = registry
+            .dispatch(
+                "fs_edit",
+                &serde_json::json!({ "path": "note.txt", "old_string": "one", "new_string": "two" }),
+            )
+            .expect("edit after read must succeed");
+        match edit {
+            ToolOutcome::Success { value } => assert_eq!(value["replacements"], 1),
+            other => panic!("expected edit success, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "two\n"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// TASK-607 装配冒烟：workspace → 插件目录发现 → 绑定 → 调度回 payload。
     #[test]
     fn plugin_assembly_discovers_binds_and_dispatches_payload() {

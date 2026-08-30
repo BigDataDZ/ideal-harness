@@ -2,6 +2,7 @@
 //! 错误一律以稳定 ErrorCode 回传，供模型自纠，绝不 panic。
 
 mod advertisement;
+mod fs_tools;
 mod mcp;
 mod mcp_registry;
 mod plugins;
@@ -14,6 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use advertisement::EscalationAvailability;
+pub use fs_tools::FsToolSet;
 pub use mcp::{McpCallResult, McpClient, McpServerConfig, McpTool};
 pub use mcp_registry::{
     McpFailureStage, McpRegistration, McpRegistry, McpServiceFailure, McpServiceRequirement,
