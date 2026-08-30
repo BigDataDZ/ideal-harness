@@ -7,6 +7,7 @@
 
 ### Added
 
+- **tools/agent-loop/harness-cli（TASK-607，D17）**：新增可信插件目录（`.harness/plugins/*/manifest.json`）与工具结果安全中间件；manifest 声明 payload 哈希与工具能力，未知字段拒绝，路径逃逸/哈希漂移/未声明能力在注册与调度两个时点 fail-closed，坏插件被隔离而不遮蔽好插件；工具结果进模型表面前可检查、脱敏或拒绝，插件来源结果在中间件缺席或失败时 fail-closed 并经 `ToolResultAdded` 留痕
 - **protocol/session/agent-loop/harness-cli（TASK-601）**：新增唯一 Model Surface 契约与事件投影；模型工具调用批次和压缩 replace-prefix/source seq 可忠实重放，Hook 等纯审计调用不会混入 resume 上下文；旧 JSONL 保持可读
 - **protocol/context/model-provider/agent-loop（TASK-602）**：新增可重放根 Token 预算与 usage 事件账本；provider usage 优先、启发式兜底，主代理和两层 subagent 用量按 agent path 汇总 own/subtree，耗尽后在下一次 provider/runner 调用前拒绝
 - **protocol/sandbox-policy/sandbox-exec/approval/tools（TASK-603，D16）**：审批绑定权限配置 epoch、稳定摘要与 executor OS/home/workspace/generation；审批期间策略、工作区或执行目标变化会拒绝旧授权并记录失效事件，未知环境 fail-closed
