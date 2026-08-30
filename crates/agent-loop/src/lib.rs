@@ -630,6 +630,16 @@ impl<'a> AgentLoop<'a> {
                                 })
                                 .ok();
                         }
+                        ToolAudit::MemoryRecorded { text, tags } => {
+                            // TASK-705：记忆写入留 Event；id 取当前流长度（单调且幂等可重放）
+                            session
+                                .append(Event::MemoryRecorded {
+                                    memory_id: format!("mem-{}", session.len()),
+                                    text,
+                                    tags,
+                                })
+                                .ok();
+                        }
                     }
                 }
                 // TASK-607：结果进模型表面前的安全裁决（缺席对插件来源 fail-closed）
@@ -1156,6 +1166,8 @@ mod tests {
         match e {
             Event::TurnStarted { .. } => "turn_started",
             Event::UserMessage { .. } => "user_message",
+            Event::MemoryRecorded { .. } => "memory_recorded",
+            Event::MemoryContextInjected { .. } => "memory_context_injected",
             Event::UserInputQueued { .. } => "user_input_queued",
             Event::AssistantMessage { .. } => "assistant_message",
             Event::ModelChunkReceived { .. } => "model_chunk",

@@ -81,6 +81,20 @@ pub fn project_model_surface(
                     )));
                 }
             }
+            Event::MemoryContextInjected { summary } => {
+                require_closed(&pending, sequenced.seq)?;
+                flush_deferred_inputs(&mut deferred_inputs, &mut out);
+                // 记忆注入是加法式系统消息：进模型表面但绝不参与压缩替换
+                out.insert(
+                    0,
+                    ModelSurfaceEntry {
+                        message: ModelSurfaceMessage::SystemSummary {
+                            text: summary.clone(),
+                        },
+                        source_event_seqs: vec![sequenced.seq],
+                    },
+                );
+            }
             Event::CompactionApplied {
                 summary,
                 compacted_messages,

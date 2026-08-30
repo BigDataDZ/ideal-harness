@@ -2,6 +2,7 @@
 //! 崩溃恢复、fork、time-travel 全部由重放派生。
 
 mod lineage;
+mod memory;
 mod model_surface;
 mod projection;
 mod spill;
@@ -13,6 +14,7 @@ mod zstd_frames;
 mod zstd_record;
 
 pub use lineage::{derive_subagent_lineage, SubagentLineage};
+pub use memory::{project_memories, MemoryEntry};
 pub use model_surface::project_model_surface;
 pub use projection::{ProjectedSession, SqliteProjection};
 pub use spill::{SpillLocator, SpillStore, StoredToolResult};

@@ -294,6 +294,16 @@ pub enum Event {
         child_id: String,
         outcome: SubagentOutcome,
     },
+    /// TASK-705：跨会话记忆写入；id 幂等，重放时后写覆盖同 id。
+    MemoryRecorded {
+        memory_id: String,
+        text: String,
+        tags: Vec<String>,
+    },
+    /// TASK-705：记忆注入系统表面的事件化事实（模型可见）。
+    MemoryContextInjected {
+        summary: String,
+    },
     TeamMemberRegistered {
         member: TeamMember,
     },
@@ -389,6 +399,23 @@ mod tests {
         for event in events {
             let encoded = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+        }
+    }
+
+    #[test]
+    fn memory_events_roundtrip() {
+        for event in [
+            Event::MemoryRecorded {
+                memory_id: "mem-1".into(),
+                text: "用户偏好 Rust".into(),
+                tags: vec!["preference".into()],
+            },
+            Event::MemoryContextInjected {
+                summary: "记忆: 用户偏好 Rust".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
         }
     }
 

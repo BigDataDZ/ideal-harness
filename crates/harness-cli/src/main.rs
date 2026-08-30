@@ -12,7 +12,7 @@ use protocol::{ErrorEnvelope, Event, ModelCallSpec, ToolOutcome};
 use sandbox_exec::PlatformRestrictedBackend;
 use sandbox_policy::{SandboxMode, SandboxPolicy};
 use session::{replay_session, JsonlSession, SessionStore};
-use tools::{EscalationAvailability, ToolRegistry, ToolSpec};
+use tools::{EscalationAvailability, ToolAudit, ToolExecution, ToolRegistry, ToolSpec};
 
 mod readonly_server;
 #[cfg(test)]
@@ -103,6 +103,7 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
     let mut registry = ToolRegistry::default();
     register_demo_tools(&mut registry);
     register_web_fetch_tool(&mut registry, &proxy.url, &cfg.fetch_allow)?;
+    register_memory_tool(&mut registry);
     registry.set_escalation_availability(EscalationAvailability::RestrictedBackendMounted);
     let terminal_approver = Arc::new(TerminalApprover::new(
         std::io::BufReader::new(std::io::stdin()),
@@ -119,12 +120,19 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
     if recover_dangling_turn(&mut js)? {
         println!("（检测到上次中断的 turn，已补记 TurnAborted——事件溯源崩溃恢复）");
     }
+    // TASK-705：记忆注入先于历史重建（注入事件随即进入模型表面投影）
+    if inject_memories(&mut js)? {
+        println!("（已注入跨会话记忆）");
+    }
     let history = rebuild_history(js.path())?;
 
     let mut lp = AgentLoop::with_chat(&mut js, &registry, &client, spec);
     lp.tool_definitions = Some(
-        openai_tools_json(&registry, &["echo", "now", "web_fetch", "exec"])
-            .map_err(|error| anyhow::anyhow!(error.message))?,
+        openai_tools_json(
+            &registry,
+            &["echo", "now", "web_fetch", "memory_write", "exec"],
+        )
+        .map_err(|error| anyhow::anyhow!(error.message))?,
     );
     lp.chat_history = history;
     let event_source_queue = Arc::clone(&proxy_events);
@@ -158,7 +166,7 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         match text {
             "/exit" | "/quit" => break,
             "/tools" => {
-                for name in ["echo", "now", "web_fetch", "exec"] {
+                for name in ["echo", "now", "web_fetch", "memory_write", "exec"] {
                     if let Some(s) = registry.get(name) {
                         println!("  {} — {}", s.name, s.description);
                     }
@@ -249,6 +257,99 @@ fn register_web_fetch_tool(
         Box::new(move |args| tool.fetch(args)),
     );
     Ok(())
+}
+
+/// TASK-705：注册 memory_write 工具——工具层不持有 session，
+/// 通过 ToolAudit::MemoryRecorded 让 agent-loop 落事件。
+fn register_memory_tool(registry: &mut ToolRegistry) {
+    registry.register_audited(
+        ToolSpec {
+            name: "memory_write".into(),
+            description: "把一条跨会话记忆事实写入事件流（会随 resume/fork 重放恢复）".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "required": ["text"],
+                "properties": {
+                    "text": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } }
+                }
+            }),
+            escalation_capable: false,
+            timeout_ms: None,
+        },
+        Box::new(|args| {
+            let Some(text) = args["text"].as_str().map(str::to_owned) else {
+                return ToolExecution::new(ToolOutcome::Failure {
+                    error: protocol::ErrorEnvelope::new(
+                        protocol::ErrorCode::ToolArgsInvalid,
+                        "missing string argument: text",
+                    ),
+                });
+            };
+            if text.trim().is_empty() {
+                return ToolExecution::new(ToolOutcome::Failure {
+                    error: protocol::ErrorEnvelope::new(
+                        protocol::ErrorCode::ToolArgsInvalid,
+                        "memory text must not be empty",
+                    ),
+                });
+            }
+            let tags = args["tags"]
+                .as_array()
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            ToolExecution {
+                outcome: ToolOutcome::Success {
+                    value: serde_json::json!({ "recorded": true, "text": text }),
+                },
+                audits: vec![ToolAudit::MemoryRecorded { text, tags }],
+            }
+        }),
+    );
+}
+
+/// TASK-705：把当前记忆注入会话表面（事件化 MemoryContextInjected）。
+/// 幂等：内容与最近一次注入相同则跳过；无记忆则不动。
+fn inject_memories(session: &mut dyn SessionStore) -> anyhow::Result<bool> {
+    let events = session.replay_events()?;
+    let memories = session::project_memories(&events)?;
+    if memories.is_empty() {
+        return Ok(false);
+    }
+    let summary = render_memory_summary(&memories);
+    let already = events.iter().any(|sequenced| {
+        matches!(
+            &sequenced.event,
+            Event::MemoryContextInjected { summary: existing } if *existing == summary
+        )
+    });
+    if already {
+        return Ok(false);
+    }
+    session.append(Event::MemoryContextInjected { summary })?;
+    Ok(true)
+}
+
+fn render_memory_summary(memories: &[session::MemoryEntry]) -> String {
+    let mut out = String::from(
+        "Known persistent memories:
+",
+    );
+    for memory in memories {
+        out.push_str(&format!(
+            "- [{}] {}
+",
+            memory.tags.join(","),
+            memory.text
+        ));
+    }
+    out
 }
 
 /// 演示工具集：echo（自纠演示）+ now（真实副作用最小示例）。
@@ -589,6 +690,51 @@ mod tests {
         assert_eq!(v[0]["type"], "function");
         assert_eq!(v[0]["function"]["name"], "echo");
         assert_eq!(v[1]["function"]["name"], "now");
+    }
+
+    /// TASK-705 验收：memory_write 落事件、注入幂等、resume 重建包含记忆系统消息。
+    #[test]
+    fn memory_write_event_injection_and_rebuild_roundtrip() {
+        let path = tmp("memory.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let mut js = JsonlSession::create(path.clone()).unwrap();
+        let mut registry = ToolRegistry::default();
+        register_memory_tool(&mut registry);
+        let result = registry
+            .dispatch_with_audit(
+                "memory_write",
+                &serde_json::json!({ "text": "用户偏好 Rust", "tags": ["lang"] }),
+            )
+            .unwrap();
+        assert!(matches!(result.outcome, ToolOutcome::Success { .. }));
+        assert_eq!(result.audits.len(), 1);
+        // agent-loop 的审计分支出事件——此处手动模拟同一行为以验证幂等注入
+        js.append(Event::MemoryRecorded {
+            memory_id: "mem-0".into(),
+            text: "用户偏好 Rust".into(),
+            tags: vec!["lang".into()],
+        })
+        .unwrap();
+        // 首次注入：发生
+        assert!(inject_memories(&mut js).unwrap());
+        // 二次注入：幂等跳过
+        assert!(!inject_memories(&mut js).unwrap());
+        // 空白文本 fail-closed 且零审计事实
+        let blank = registry
+            .dispatch_with_audit("memory_write", &serde_json::json!({ "text": "  " }))
+            .unwrap();
+        match blank.outcome {
+            ToolOutcome::Failure { error } => {
+                assert_eq!(error.code, protocol::ErrorCode::ToolArgsInvalid);
+            }
+            other => panic!("expected blank rejection, got {other:?}"),
+        }
+        assert!(blank.audits.is_empty());
+        // resume 重建：记忆以 SystemSummary 出现在历史头部
+        let history = rebuild_history(&path).unwrap();
+        assert!(history[0].content.contains("Known persistent memories"));
+        assert!(history[0].content.contains("用户偏好 Rust"));
+        std::fs::remove_file(&path).ok();
     }
 
     struct CannedFetcher;
