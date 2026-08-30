@@ -543,11 +543,24 @@ impl<'a> AgentLoop<'a> {
                 };
                 for audit in execution.audits {
                     match audit {
-                        ToolAudit::ApprovalDecided { approved } => {
+                        ToolAudit::ApprovalDecided {
+                            approved,
+                            authorization,
+                        } => {
                             session
                                 .append(Event::ApprovalDecided {
                                     call_id: tc.id.clone(),
                                     approved,
+                                    authorization,
+                                })
+                                .ok();
+                        }
+                        ToolAudit::AuthorizationInvalidated { previous, current } => {
+                            session
+                                .append(Event::AuthorizationInvalidated {
+                                    call_id: tc.id.clone(),
+                                    previous,
+                                    current,
                                 })
                                 .ok();
                         }
@@ -745,7 +758,7 @@ fn execute_hook(
 mod tests {
     use super::*;
     use model_provider::{ChatReply, ToolCallRequest};
-    use protocol::{ErrorEnvelope, SequencedEvent};
+    use protocol::{AuthorizationContext, ErrorEnvelope, ExecutorEnvironment, SequencedEvent};
     use session::JsonlSession;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1012,6 +1025,7 @@ mod tests {
             Event::TokenBudgetConfigured { .. } => "token_budget_configured",
             Event::TokenUsageRecorded { .. } => "token_usage_recorded",
             Event::ApprovalDecided { .. } => "approval",
+            Event::AuthorizationInvalidated { .. } => "authorization_invalidated",
             Event::NetworkAccessDenied { .. } => "network_access_denied",
             Event::SubagentStarted { .. } => "subagent_started",
             Event::SubagentCancellationRequested { .. } => "subagent_cancel_requested",
@@ -1273,13 +1287,36 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut js = JsonlSession::create(path.clone()).unwrap();
         let mut reg = ToolRegistry::default();
+        let previous = AuthorizationContext {
+            policy_epoch: 1,
+            permission_profile_hash: "profile-1".into(),
+            executor: ExecutorEnvironment {
+                os: "windows".into(),
+                home: "C:/Users/test".into(),
+                workspace: "D:/work".into(),
+                generation: 1,
+            },
+        };
+        let current = AuthorizationContext {
+            policy_epoch: 2,
+            ..previous.clone()
+        };
         reg.register_audited(
             echo_spec(),
-            Box::new(|args| ToolExecution {
+            Box::new(move |args| ToolExecution {
                 outcome: ToolOutcome::Success {
                     value: args["text"].clone(),
                 },
-                audits: vec![ToolAudit::ApprovalDecided { approved: true }],
+                audits: vec![
+                    ToolAudit::ApprovalDecided {
+                        approved: false,
+                        authorization: Some(previous.clone()),
+                    },
+                    ToolAudit::AuthorizationInvalidated {
+                        previous: previous.clone(),
+                        current: current.clone(),
+                    },
+                ],
             }),
         );
         let scripted = Scripted(Mutex::new(vec![tool_reply(), text_reply()]));
@@ -1296,11 +1333,17 @@ mod tests {
             .iter()
             .position(|entry| matches!(entry.event, Event::ToolResultAdded { .. }))
             .unwrap();
-        assert!(approval_index < result_index);
+        let invalidation_index = evs
+            .iter()
+            .position(|entry| matches!(entry.event, Event::AuthorizationInvalidated { .. }))
+            .unwrap();
+        assert!(approval_index < invalidation_index && invalidation_index < result_index);
         match &evs[approval_index].event {
-            Event::ApprovalDecided { call_id, approved } => {
+            Event::ApprovalDecided {
+                call_id, approved, ..
+            } => {
                 assert_eq!(call_id, "call_1");
-                assert!(*approved);
+                assert!(!*approved);
             }
             _ => unreachable!(),
         }

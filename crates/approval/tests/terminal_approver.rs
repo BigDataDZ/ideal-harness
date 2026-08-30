@@ -1,7 +1,10 @@
 //! TASK-204 验收：终端 y/n 审批与所有 I/O 失败路径均 fail-closed。
 
-use approval::{approve_escalation, Approver, Decision, EscalationRequest, TerminalApprover};
-use protocol::ErrorCode;
+use approval::{
+    approve_escalation, Approver, AuthorizationContextProvider, Decision, EscalationRequest,
+    TerminalApprover,
+};
+use protocol::{AuthorizationContext, ErrorCode, ErrorEnvelope, ExecutorEnvironment};
 use sandbox_policy::SandboxMode::{DangerFullAccess, ReadOnly, WorkspaceWrite};
 use std::{
     io::{self, BufRead, Cursor, Read, Write},
@@ -12,6 +15,23 @@ fn request() -> EscalationRequest {
     EscalationRequest {
         requested_mode: WorkspaceWrite,
         justification: "need to update workspace files".into(),
+    }
+}
+
+struct KnownContext;
+
+impl AuthorizationContextProvider for KnownContext {
+    fn current_context(&self) -> Result<AuthorizationContext, ErrorEnvelope> {
+        Ok(AuthorizationContext {
+            policy_epoch: 1,
+            permission_profile_hash: "terminal-test".into(),
+            executor: ExecutorEnvironment {
+                os: "test-os".into(),
+                home: "test-home".into(),
+                workspace: "test-workspace".into(),
+                generation: 1,
+            },
+        })
     }
 }
 
@@ -34,7 +54,9 @@ fn negative_blank_and_unknown_answers_reject() {
 #[test]
 fn eof_rejects_and_approve_escalation_returns_stable_code() {
     let approver = TerminalApprover::new(Cursor::new(Vec::<u8>::new()), Vec::new());
-    let error = approve_escalation(ReadOnly, request(), Some(&approver)).unwrap_err();
+    let error = approve_escalation(ReadOnly, request(), Some(&approver), Some(&KnownContext))
+        .result
+        .unwrap_err();
     assert_eq!(error.code, ErrorCode::ApprovalRejected);
 }
 
@@ -80,14 +102,23 @@ fn flush_failure_rejects_without_reading() {
 #[test]
 fn terminal_approval_integrates_with_widening_contract() {
     let approver = TerminalApprover::new(Cursor::new("yes\n"), Vec::new());
-    let widened = approve_escalation(ReadOnly, request(), Some(&approver)).unwrap();
-    assert_eq!(widened, WorkspaceWrite);
+    let widened = approve_escalation(ReadOnly, request(), Some(&approver), Some(&KnownContext))
+        .result
+        .unwrap();
+    assert_eq!(widened.mode, WorkspaceWrite);
 
     let narrowing = EscalationRequest {
         requested_mode: ReadOnly,
         justification: "reduce access".into(),
     };
-    let error = approve_escalation(DangerFullAccess, narrowing, Some(&approver)).unwrap_err();
+    let error = approve_escalation(
+        DangerFullAccess,
+        narrowing,
+        Some(&approver),
+        Some(&KnownContext),
+    )
+    .result
+    .unwrap_err();
     assert_eq!(error.code, ErrorCode::SandboxDenied);
 }
 

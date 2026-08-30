@@ -179,14 +179,14 @@
 - 明确不做: 不改变 provider HTTP 协议；不修复历史文件；不新增持久化后端或外部依赖
 - 依赖: TASK-504
 
-### TASK-602: 根预算与子树 Token 用量账本 ✅（完成，待提交）
+### TASK-602: 根预算与子树 Token 用量账本 ✅（commit `9966fa8`）
 - 目标 crate: protocol ⚠️串行、context、agent-loop、session
 - 内容: provider usage 优先、估算兜底；记录 own/subtree/root remaining；嵌套 subagent 消耗归集根预算
 - 验收标准: 主代理与两层子代理消费均落 Event；重放可恢复余额；超限在下一次采样前稳定拒绝且 runner/provider 零调用
 - 明确不做: 不实现计费；不按 message 文本推断错误；不允许子策略扩大根预算
 - 依赖: TASK-601
 
-### TASK-603: 权限 epoch 与执行环境事实
+### TASK-603: 权限 epoch 与执行环境事实 ✅（完成，提交见 git 历史）
 - 目标 crate: protocol ⚠️串行、sandbox-policy、sandbox-exec、approval、tools
 - 内容: 审批绑定 policy epoch、权限配置摘要和 executor OS/home/workspace facts；状态变化使旧授权失效
 - 验收标准: policy/workspace/target 任一变化后旧决定不可复用；未知或过期环境 fail-closed；授权与失效均留 Event

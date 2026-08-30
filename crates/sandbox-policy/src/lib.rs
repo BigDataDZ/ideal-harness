@@ -37,6 +37,59 @@ impl SandboxPolicy {
     pub fn can_widen(from: SandboxMode, to: SandboxMode) -> bool {
         to > from
     }
+
+    /// 稳定权限配置摘要；不依赖进程随机种子，跨重放结果一致。
+    pub fn profile_hash(&self) -> String {
+        let mode = match self.mode {
+            SandboxMode::ReadOnly => "read-only",
+            SandboxMode::WorkspaceWrite => "workspace-write",
+            SandboxMode::DangerFullAccess => "danger-full-access",
+        };
+        let canonical = format!("v1\0{mode}\0{}", self.workspace_root.to_string_lossy());
+        format!("fnv1a64:{:016x}", fnv1a64(canonical.as_bytes()))
+    }
+}
+
+/// 权限配置状态；任何语义变化都推进 epoch，幂等刷新不推进。
+#[derive(Debug, Clone)]
+pub struct PermissionProfileState {
+    policy: SandboxPolicy,
+    epoch: u64,
+}
+
+impl PermissionProfileState {
+    pub fn new(policy: SandboxPolicy) -> Self {
+        Self { policy, epoch: 0 }
+    }
+
+    pub fn policy(&self) -> &SandboxPolicy {
+        &self.policy
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn replace(&mut self, policy: SandboxPolicy) -> Result<bool, &'static str> {
+        if self.policy.mode == policy.mode && self.policy.workspace_root == policy.workspace_root {
+            return Ok(false);
+        }
+        self.epoch = self
+            .epoch
+            .checked_add(1)
+            .ok_or("permission epoch overflow")?;
+        self.policy = policy;
+        Ok(true)
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -87,5 +140,23 @@ mod tests {
             serde_json::to_value(SandboxMode::WorkspaceWrite).unwrap(),
             "workspace-write"
         );
+    }
+
+    #[test]
+    fn profile_hash_and_epoch_change_only_with_permission_semantics() {
+        let original = policy(SandboxMode::ReadOnly);
+        let original_hash = original.profile_hash();
+        let mut state = PermissionProfileState::new(original.clone());
+        assert!(!state.replace(original).unwrap());
+        assert_eq!(state.epoch(), 0);
+
+        state
+            .replace(SandboxPolicy {
+                mode: SandboxMode::ReadOnly,
+                workspace_root: PathBuf::from("/other"),
+            })
+            .unwrap();
+        assert_eq!(state.epoch(), 1);
+        assert_ne!(state.policy().profile_hash(), original_hash);
     }
 }

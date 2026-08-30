@@ -6,7 +6,7 @@ mod mcp;
 mod schema;
 mod skills;
 
-use protocol::ToolOutcome;
+use protocol::{AuthorizationContext, ToolOutcome};
 use serde::{Deserialize, Serialize};
 
 pub use advertisement::EscalationAvailability;
@@ -44,7 +44,14 @@ pub type AuditedToolFn = dyn Fn(&serde_json::Value) -> ToolExecution + Send + Sy
 /// 工具执行期间需要由 agent-loop 绑定真实 call_id 后落盘的审计事实。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolAudit {
-    ApprovalDecided { approved: bool },
+    ApprovalDecided {
+        approved: bool,
+        authorization: Option<AuthorizationContext>,
+    },
+    AuthorizationInvalidated {
+        previous: AuthorizationContext,
+        current: AuthorizationContext,
+    },
 }
 
 /// 调度结果与其伴随审计事实。工具层不伪造协议 call_id。
@@ -247,13 +254,22 @@ mod tests {
                 outcome: ToolOutcome::Success {
                     value: args["text"].clone(),
                 },
-                audits: vec![ToolAudit::ApprovalDecided { approved: true }],
+                audits: vec![ToolAudit::ApprovalDecided {
+                    approved: true,
+                    authorization: None,
+                }],
             }),
         );
         let run = reg
             .dispatch_with_audit("echo", &serde_json::json!({ "text": "hi" }))
             .unwrap();
-        assert_eq!(run.audits, [ToolAudit::ApprovalDecided { approved: true }]);
+        assert_eq!(
+            run.audits,
+            [ToolAudit::ApprovalDecided {
+                approved: true,
+                authorization: None
+            }]
+        );
     }
 
     #[test]

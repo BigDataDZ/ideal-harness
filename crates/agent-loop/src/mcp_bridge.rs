@@ -78,6 +78,7 @@ impl AgentLoop<'_> {
             Event::ApprovalDecided {
                 call_id: invocation.call_id.clone(),
                 approved: invocation.approved,
+                authorization: None,
             },
         )?;
         if !invocation.approved {

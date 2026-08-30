@@ -107,6 +107,23 @@ pub struct ModelTokenUsage {
     pub total_tokens: u64,
 }
 
+/// 实际执行目标的环境事实；不能用控制端的 OS/home/path 猜测远端语义。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorEnvironment {
+    pub os: String,
+    pub home: String,
+    pub workspace: String,
+    pub generation: u64,
+}
+
+/// 一次授权判断必须绑定的完整上下文。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizationContext {
+    pub policy_epoch: u64,
+    pub permission_profile_hash: String,
+    pub executor: ExecutorEnvironment,
+}
+
 /// 子代理的闭合终态；Started 必须恰好对应一个 Stopped。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -184,6 +201,15 @@ pub enum Event {
     ApprovalDecided {
         call_id: String,
         approved: bool,
+        /// None 仅兼容 TASK-603 之前的审批事件；新批准必须携带绑定。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        authorization: Option<AuthorizationContext>,
+    },
+    /// 审批期间权限或执行目标变化，旧判断不得继续授权。
+    AuthorizationInvalidated {
+        call_id: String,
+        previous: AuthorizationContext,
+        current: AuthorizationContext,
     },
     /// P2/TASK-203：白名单代理拒绝外连时的稳定审计事件。
     NetworkAccessDenied {
@@ -350,6 +376,43 @@ mod tests {
             let json = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
         }
+    }
+
+    #[test]
+    fn authorization_context_and_invalidation_roundtrip() {
+        let previous = AuthorizationContext {
+            policy_epoch: 7,
+            permission_profile_hash: "profile-a".into(),
+            executor: ExecutorEnvironment {
+                os: "windows".into(),
+                home: "C:/Users/test".into(),
+                workspace: "D:/work".into(),
+                generation: 3,
+            },
+        };
+        let event = Event::AuthorizationInvalidated {
+            call_id: "call-1".into(),
+            previous: previous.clone(),
+            current: AuthorizationContext {
+                policy_epoch: 8,
+                ..previous
+            },
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
+    }
+
+    #[test]
+    fn pre_task_603_approval_event_remains_readable() {
+        let old = r#"{"type":"approval_decided","call_id":"c1","approved":true}"#;
+        assert_eq!(
+            serde_json::from_str::<Event>(old).unwrap(),
+            Event::ApprovalDecided {
+                call_id: "c1".into(),
+                approved: true,
+                authorization: None,
+            }
+        );
     }
 
     #[test]

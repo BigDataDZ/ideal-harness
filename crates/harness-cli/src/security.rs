@@ -1,17 +1,21 @@
 //! P2/TASK-206：CLI 安全链路装配（D5/D7/D8/D9）。
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 use std::thread;
 
-use approval::{approve_escalation, validate_escalation_args, Approver, EscalationRequest};
+use approval::{
+    approve_escalation, validate_escalation_args, validate_grant, ApprovalAudit, Approver,
+    AuthorizationContextProvider, EscalationRequest,
+};
 use network_proxy::{ProxyPolicy, ProxyServer};
-use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
+use protocol::{AuthorizationContext, ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use sandbox_exec::{CommandSpec, RestrictedBackend, RestrictedProcessPool};
-use sandbox_policy::SandboxMode;
+use sandbox_policy::{PermissionProfileState, SandboxMode, SandboxPolicy};
 use tools::{ToolAudit, ToolExecution, ToolRegistry, ToolSpec};
 
 pub(crate) struct ProviderProxy {
@@ -128,15 +132,48 @@ fn execute_restricted<B: RestrictedBackend>(
             requested_mode,
             justification: justification.unwrap_or_default().to_string(),
         };
-        let decision = approve_escalation(
+        let environment = match pool.environment() {
+            Ok(environment) => environment,
+            Err(error) => {
+                audits.push(ToolAudit::ApprovalDecided {
+                    approved: false,
+                    authorization: None,
+                });
+                return ToolExecution {
+                    outcome: ToolOutcome::Failure {
+                        error: ErrorEnvelope::new(
+                            ErrorCode::ApprovalRejected,
+                            format!("executor environment is unavailable: {error}"),
+                        ),
+                    },
+                    audits,
+                };
+            }
+        };
+        let profile = PermissionProfileState::new(SandboxPolicy {
+            mode: SandboxMode::ReadOnly,
+            workspace_root: PathBuf::from(&environment.workspace),
+        });
+        let context_provider = ExecAuthorizationContext { pool, profile };
+        let evaluation = approve_escalation(
             SandboxMode::ReadOnly,
             request,
             approver.map(|value| value as &dyn Approver),
+            Some(&context_provider),
         );
-        audits.push(ToolAudit::ApprovalDecided {
-            approved: decision.is_ok(),
-        });
-        if let Err(error) = decision {
+        audits.extend(evaluation.audits.into_iter().map(tool_audit));
+        let grant = match evaluation.result {
+            Ok(grant) => grant,
+            Err(error) => {
+                return ToolExecution {
+                    outcome: ToolOutcome::Failure { error },
+                    audits,
+                };
+            }
+        };
+        let validation = validate_grant(&grant, Some(&context_provider));
+        audits.extend(validation.audits.into_iter().map(tool_audit));
+        if let Err(error) = validation.result {
             return ToolExecution {
                 outcome: ToolOutcome::Failure { error },
                 audits,
@@ -178,15 +215,58 @@ fn execute_restricted<B: RestrictedBackend>(
     ToolExecution { outcome, audits }
 }
 
+struct ExecAuthorizationContext<'a, B> {
+    pool: &'a RestrictedProcessPool<B>,
+    profile: PermissionProfileState,
+}
+
+impl<B: RestrictedBackend> AuthorizationContextProvider for ExecAuthorizationContext<'_, B> {
+    fn current_context(&self) -> Result<AuthorizationContext, ErrorEnvelope> {
+        let executor = self.pool.environment().map_err(|error| {
+            ErrorEnvelope::new(
+                ErrorCode::ApprovalRejected,
+                format!("executor environment is unavailable: {error}"),
+            )
+        })?;
+        if Path::new(&executor.workspace) != self.profile.policy().workspace_root {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ApprovalRejected,
+                "executor workspace no longer matches the permission profile",
+            ));
+        }
+        Ok(AuthorizationContext {
+            policy_epoch: self.profile.epoch(),
+            permission_profile_hash: self.profile.policy().profile_hash(),
+            executor,
+        })
+    }
+}
+
+fn tool_audit(audit: ApprovalAudit) -> ToolAudit {
+    match audit {
+        ApprovalAudit::Decided {
+            approved,
+            authorization,
+        } => ToolAudit::ApprovalDecided {
+            approved,
+            authorization,
+        },
+        ApprovalAudit::Invalidated { previous, current } => {
+            ToolAudit::AuthorizationInvalidated { previous, current }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::openai_tools_json;
     use approval::Decision;
     use model_provider::{ChatMessage, ChatModel, OpenAiCompatClient};
-    use protocol::ModelCallSpec;
+    use protocol::{ExecutorEnvironment, ModelCallSpec};
     use sandbox_exec::{ExecutionOutput, PlatformRestrictedBackend};
     use std::io;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tools::EscalationAvailability;
 
@@ -203,6 +283,15 @@ mod tests {
                 restricted: true,
             })
         }
+
+        fn environment(&self) -> io::Result<ExecutorEnvironment> {
+            Ok(ExecutorEnvironment {
+                os: "windows".into(),
+                home: "C:/Users/test".into(),
+                workspace: "D:/workspace".into(),
+                generation: 1,
+            })
+        }
     }
 
     struct FixedApprover(Decision);
@@ -210,6 +299,35 @@ mod tests {
     impl Approver for FixedApprover {
         fn decide(&self, _: &EscalationRequest) -> Decision {
             self.0
+        }
+    }
+
+    #[derive(Clone)]
+    struct ChangingTargetBackend {
+        environment_reads: Arc<AtomicUsize>,
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl RestrictedBackend for ChangingTargetBackend {
+        fn execute(&self, _: &CommandSpec) -> io::Result<ExecutionOutput> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            FakeRestrictedBackend.execute(&CommandSpec::new("ignored"))
+        }
+
+        fn environment(&self) -> io::Result<ExecutorEnvironment> {
+            let read = self.environment_reads.fetch_add(1, Ordering::SeqCst);
+            let mut environment = FakeRestrictedBackend.environment()?;
+            environment.generation = if read < 2 { 1 } else { 2 };
+            Ok(environment)
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct UnknownEnvironmentBackend;
+
+    impl RestrictedBackend for UnknownEnvironmentBackend {
+        fn execute(&self, _: &CommandSpec) -> io::Result<ExecutionOutput> {
+            panic!("unknown environment must fail before execution")
         }
     }
 
@@ -229,7 +347,13 @@ mod tests {
         let run = registry
             .dispatch_with_audit("exec", &escalation_args())
             .unwrap();
-        assert_eq!(run.audits, [ToolAudit::ApprovalDecided { approved: false }]);
+        assert!(matches!(
+            run.audits.as_slice(),
+            [ToolAudit::ApprovalDecided {
+                approved: false,
+                authorization: Some(_)
+            }]
+        ));
         match run.outcome {
             ToolOutcome::Failure { error } => assert_eq!(error.code, ErrorCode::ApprovalRejected),
             other => panic!("expected approval failure, got {other:?}"),
@@ -248,13 +372,79 @@ mod tests {
         let run = registry
             .dispatch_with_audit("exec", &escalation_args())
             .unwrap();
-        assert_eq!(run.audits, [ToolAudit::ApprovalDecided { approved: true }]);
+        assert!(matches!(
+            run.audits.as_slice(),
+            [ToolAudit::ApprovalDecided {
+                approved: true,
+                authorization: Some(_)
+            }]
+        ));
         match run.outcome {
             ToolOutcome::Success { value } => {
                 assert_eq!(value["restricted"], true);
                 assert_ne!(value["process_id"], std::process::id());
             }
             other => panic!("expected restricted success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn executor_target_change_invalidates_approval_before_execution() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let backend = ChangingTargetBackend {
+            environment_reads: Arc::new(AtomicUsize::new(0)),
+            executions: Arc::clone(&executions),
+        };
+        let mut registry = ToolRegistry::default();
+        registry.set_escalation_availability(EscalationAvailability::RestrictedBackendMounted);
+        register_exec_tool(
+            &mut registry,
+            backend,
+            Some(Arc::new(FixedApprover(Decision::Approved))),
+        );
+
+        let run = registry
+            .dispatch_with_audit("exec", &escalation_args())
+            .unwrap();
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            run.audits.as_slice(),
+            [
+                ToolAudit::ApprovalDecided {
+                    approved: false,
+                    ..
+                },
+                ToolAudit::AuthorizationInvalidated { previous, current }
+            ] if previous.executor.generation == 1 && current.executor.generation == 2
+        ));
+        match run.outcome {
+            ToolOutcome::Failure { error } => assert_eq!(error.code, ErrorCode::ApprovalRejected),
+            other => panic!("expected invalidated approval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_executor_environment_fails_closed_before_execution() {
+        let mut registry = ToolRegistry::default();
+        registry.set_escalation_availability(EscalationAvailability::RestrictedBackendMounted);
+        register_exec_tool(
+            &mut registry,
+            UnknownEnvironmentBackend,
+            Some(Arc::new(FixedApprover(Decision::Approved))),
+        );
+        let run = registry
+            .dispatch_with_audit("exec", &escalation_args())
+            .unwrap();
+        assert_eq!(
+            run.audits,
+            [ToolAudit::ApprovalDecided {
+                approved: false,
+                authorization: None,
+            }]
+        );
+        match run.outcome {
+            ToolOutcome::Failure { error } => assert_eq!(error.code, ErrorCode::ApprovalRejected),
+            other => panic!("expected fail-closed rejection, got {other:?}"),
         }
     }
 

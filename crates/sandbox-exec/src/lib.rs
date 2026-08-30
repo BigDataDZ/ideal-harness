@@ -1,5 +1,6 @@
 //! P2/TASK-202：外部命令只通过独立的 OS 受限子进程执行。
 
+use protocol::ExecutorEnvironment;
 use std::{io, path::PathBuf};
 
 #[cfg(windows)]
@@ -51,6 +52,14 @@ pub struct ExecutionOutput {
 /// OS 受限执行后端。Linux Landlock 后端将实现同一接口。
 pub trait RestrictedBackend {
     fn execute(&self, command: &CommandSpec) -> io::Result<ExecutionOutput>;
+
+    /// 返回执行器自身的 OS/home/workspace 事实；缺失时调用方必须拒绝授权。
+    fn environment(&self) -> io::Result<ExecutorEnvironment> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "restricted backend did not expose executor environment facts",
+        ))
+    }
 }
 
 /// 屏障式执行入口：调用方永远不能绕过所组合的受限后端。
@@ -68,6 +77,10 @@ impl<B: RestrictedBackend> RestrictedProcessPool<B> {
     pub fn execute(&self, command: &CommandSpec) -> io::Result<ExecutionOutput> {
         self.backend.execute(command)
     }
+
+    pub fn environment(&self) -> io::Result<ExecutorEnvironment> {
+        self.backend.environment()
+    }
 }
 
 /// 当前平台的生产后端。没有可用 OS 隔离时拒绝执行，不回退到普通进程。
@@ -79,6 +92,10 @@ impl RestrictedBackend for PlatformRestrictedBackend {
     fn execute(&self, command: &CommandSpec) -> io::Result<ExecutionOutput> {
         windows::execute(command)
     }
+
+    fn environment(&self) -> io::Result<ExecutorEnvironment> {
+        local_executor_environment(0)
+    }
 }
 
 #[cfg(not(windows))]
@@ -89,4 +106,22 @@ impl RestrictedBackend for PlatformRestrictedBackend {
             "no restricted process backend is composed for this platform",
         ))
     }
+
+    fn environment(&self) -> io::Result<ExecutorEnvironment> {
+        local_executor_environment(0)
+    }
+}
+
+fn local_executor_environment(generation: u64) -> io::Result<ExecutorEnvironment> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "executor home is unavailable"))?;
+    let workspace = std::env::current_dir()?;
+    Ok(ExecutorEnvironment {
+        os: std::env::consts::OS.to_string(),
+        home: PathBuf::from(home).to_string_lossy().into_owned(),
+        workspace: workspace.to_string_lossy().into_owned(),
+        generation,
+    })
 }
