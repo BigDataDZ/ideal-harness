@@ -116,6 +116,8 @@ struct ChatTurnConfig<'a> {
     result_middleware: Option<&'a dyn ToolResultMiddleware>,
     /// TASK-702：循环防护；None = 不启用。
     loop_guard: Option<LoopGuard>,
+    /// TASK-704：排队输入水位（采样轮边界吸收后推进）。
+    queued_input_cursor: &'a mut u64,
     agent_path: &'a [String],
 }
 
@@ -146,6 +148,8 @@ pub struct AgentLoop<'a> {
     pub result_middleware: Option<&'a dyn ToolResultMiddleware>,
     /// TASK-702：工具循环防护（同一工具连续等参调用先提醒后拒绝）。
     pub loop_guard: Option<LoopGuard>,
+    /// TASK-704：已被吸收进 chat_history 的 UserInputQueued 事件水位（seq）。
+    pub queued_input_cursor: u64,
     /// TASK-602：从根到当前代理的稳定身份路径；usage 通过它归集到所有祖先。
     agent_path: Vec<String>,
 }
@@ -172,6 +176,7 @@ impl<'a> AgentLoop<'a> {
             hooks: None,
             result_middleware: None,
             loop_guard: None,
+            queued_input_cursor: 0,
             agent_path: vec!["root".into()],
         }
     }
@@ -199,6 +204,7 @@ impl<'a> AgentLoop<'a> {
             hooks: None,
             result_middleware: None,
             loop_guard: None,
+            queued_input_cursor: 0,
             agent_path: vec!["root".into()],
         }
     }
@@ -334,11 +340,8 @@ impl<'a> AgentLoop<'a> {
         let mut completed = 0u64;
         for text in self.inbox.drain() {
             let result = match (self.chat, self.call_spec.clone()) {
-                (Some(chat), Some(spec)) => Self::run_chat_turn(
-                    self.session,
-                    self.tools,
-                    chat,
-                    &ChatTurnConfig {
+                (Some(chat), Some(spec)) => {
+                    let mut cfg = ChatTurnConfig {
                         spec: &spec,
                         tool_definitions: self.tool_definitions.as_ref(),
                         max_tool_rounds: self.max_tool_rounds,
@@ -347,12 +350,19 @@ impl<'a> AgentLoop<'a> {
                         hooks: self.hooks,
                         result_middleware: self.result_middleware,
                         loop_guard: self.loop_guard,
+                        queued_input_cursor: &mut self.queued_input_cursor,
                         agent_path: &self.agent_path,
-                    },
-                    &mut self.chat_history,
-                    turn_id,
-                    &text,
-                ),
+                    };
+                    Self::run_chat_turn(
+                        self.session,
+                        self.tools,
+                        chat,
+                        &mut cfg,
+                        &mut self.chat_history,
+                        turn_id,
+                        &text,
+                    )
+                }
                 _ => {
                     self.session
                         .append(Event::UserMessage { text: text.clone() })
@@ -411,7 +421,7 @@ impl<'a> AgentLoop<'a> {
         session: &mut dyn SessionStore,
         registry: &ToolRegistry,
         chat: &dyn ChatModel,
-        cfg: &ChatTurnConfig<'_>,
+        cfg: &mut ChatTurnConfig<'_>,
         history: &mut Vec<ChatMessage>,
         turn_id: u64,
         user_text: &str,
@@ -428,6 +438,8 @@ impl<'a> AgentLoop<'a> {
         history.push(ChatMessage::user(user_text));
 
         for round in 0..cfg.max_tool_rounds {
+            // TASK-704：采样轮边界吸收排队输入（steer）——先于本次采样可见
+            drain_queued_inputs(session, history, cfg.queued_input_cursor)?;
             let mut overflow_retries = 0;
             let reply = loop {
                 ensure_budget_allows_sample(session)?;
@@ -721,6 +733,28 @@ impl<'a> AgentLoop<'a> {
         self.phase = Phase::Idle;
     }
 
+    /// TASK-704：把 steer 输入入队（事件化 UserInputQueued）。
+    /// 可在 turn 运行中随时调用；运行中的 turn 在下一个采样轮边界吸收它。
+    pub fn enqueue_input(&mut self, text: impl Into<String>) -> Result<(), ErrorEnvelope> {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ToolArgsInvalid,
+                "queued input must not be empty",
+            ));
+        }
+        self.session
+            .append(Event::UserInputQueued { text })
+            .map(|_| ())
+            .map_err(session_append_error)
+    }
+
+    /// TASK-704：resume 后调用——重建历史时投影已含既有排队输入，
+    /// 用当前会话长度推进水位，避免重复吸收。
+    pub fn mark_queued_inputs_consumed(&mut self) {
+        self.queued_input_cursor = self.session.len();
+    }
+
     /// 在同步骨架的安全点中断当前 turn，并触发可审计的 interrupted Hook。
     pub fn interrupt_turn(
         &mut self,
@@ -765,6 +799,26 @@ fn wrap_loop_reminder(outcome: ToolOutcome, times: u32) -> ToolOutcome {
         },
         other => other,
     }
+}
+
+/// TASK-704：把水位之上的 UserInputQueued 事件按序推进 chat_history。
+/// 事件本身已是模型表面事实（投影按闭合批次出账），这里只补齐在线路径的内存历史。
+fn drain_queued_inputs(
+    session: &dyn SessionStore,
+    history: &mut Vec<ChatMessage>,
+    cursor: &mut u64,
+) -> Result<(), ErrorEnvelope> {
+    let events = session.replay_events().map_err(session_replay_error)?;
+    for sequenced in events {
+        if sequenced.seq <= *cursor {
+            continue;
+        }
+        if let Event::UserInputQueued { text } = sequenced.event {
+            history.push(ChatMessage::user(text));
+            *cursor = sequenced.seq;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_budget_allows_sample(session: &dyn SessionStore) -> Result<(), ErrorEnvelope> {
@@ -1102,6 +1156,7 @@ mod tests {
         match e {
             Event::TurnStarted { .. } => "turn_started",
             Event::UserMessage { .. } => "user_message",
+            Event::UserInputQueued { .. } => "user_input_queued",
             Event::AssistantMessage { .. } => "assistant_message",
             Event::ModelChunkReceived { .. } => "model_chunk",
             Event::ToolCallRequested { .. } => "tool_call_requested",

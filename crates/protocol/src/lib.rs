@@ -202,6 +202,11 @@ pub enum Event {
     UserMessage {
         text: String,
     },
+    /// TASK-704：turn 运行中入队的 steer 输入；模型表面视同 User 消息，
+    /// 但在工具批次未闭合时延迟出账以保住 tool_call/result 配对。
+    UserInputQueued {
+        text: String,
+    },
     AssistantMessage {
         text: String,
     },
@@ -385,6 +390,16 @@ mod tests {
             let encoded = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
         }
+    }
+
+    #[test]
+    fn user_input_queued_roundtrips() {
+        let event = Event::UserInputQueued {
+            text: "优先处理 X".into(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("user_input_queued"), "{json}");
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
     }
 
     #[test]

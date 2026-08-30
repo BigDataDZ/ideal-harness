@@ -15,11 +15,18 @@ pub fn project_model_surface(
     let mut pending = BTreeMap::<String, u64>::new();
     let mut completed = BTreeSet::<String>::new();
     let mut declared = BTreeSet::<String>::new();
+    // TASK-704：steer 输入统一延迟出账——工具批次未闭合时不能把 User 消息
+    // 插进 assistant tool_calls 与 tool result 之间（provider 会拒绝该序列）。
+    let mut deferred_inputs: Vec<(u64, String)> = Vec::new();
 
     for sequenced in events {
         match &sequenced.event {
+            Event::UserInputQueued { text } => {
+                deferred_inputs.push((sequenced.seq, text.clone()));
+            }
             Event::UserMessage { text } => {
                 require_closed(&pending, sequenced.seq)?;
+                flush_deferred_inputs(&mut deferred_inputs, &mut out);
                 push(
                     &mut out,
                     ModelSurfaceMessage::User { text: text.clone() },
@@ -28,6 +35,7 @@ pub fn project_model_surface(
             }
             Event::AssistantMessage { text } if !text.is_empty() => {
                 require_closed(&pending, sequenced.seq)?;
+                flush_deferred_inputs(&mut deferred_inputs, &mut out);
                 push(
                     &mut out,
                     ModelSurfaceMessage::Assistant { text: text.clone() },
@@ -39,6 +47,7 @@ pub fn project_model_surface(
                 if calls.is_empty() {
                     return Err(invalid("model tool-call batch must not be empty"));
                 }
+                flush_deferred_inputs(&mut deferred_inputs, &mut out);
                 for call in calls {
                     register_call(call, sequenced.seq, &mut pending, &mut declared, &completed)?;
                 }
@@ -78,6 +87,7 @@ pub fn project_model_surface(
                 source_event_seqs,
             } => {
                 require_closed(&pending, sequenced.seq)?;
+                flush_deferred_inputs(&mut deferred_inputs, &mut out);
                 match compacted_messages {
                     Some(count) => apply_exact_compaction(
                         &mut out,
@@ -101,7 +111,15 @@ pub fn project_model_surface(
         }
     }
     require_closed(&pending, events.last().map_or(0, |event| event.seq + 1))?;
+    flush_deferred_inputs(&mut deferred_inputs, &mut out);
     Ok(out)
+}
+
+/// TASK-704：把已闭合批次的 steer 输入按入队顺序投递为 User 消息。
+fn flush_deferred_inputs(deferred: &mut Vec<(u64, String)>, out: &mut Vec<ModelSurfaceEntry>) {
+    for (seq, text) in deferred.drain(..) {
+        push(out, ModelSurfaceMessage::User { text }, seq);
+    }
 }
 
 fn register_call(
