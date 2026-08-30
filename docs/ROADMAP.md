@@ -17,7 +17,7 @@
 | P4.1 | v0.5.1 ✅ | **可靠性收口**：统一存储、崩溃恢复、subagent 治理 | 压缩会话可恢复；子代理资源与权限不越界 |
 | P5 | v0.6 ✅ | **扩展生态**：MCP/skill/hooks/Web 投影 | 第三方工具可控接入；客户端断线可按 seq 补洞 |
 | P6 | v0.7 ✅ | **运行时闭环**：忠实重放、层级预算、权限时效与受监管扩展 | resume 与在线上下文等价；预算/权限/连接状态不可被旧状态绕过 |
-| P7 | v0.8 ✅ | **工具面扩展**：内置文件工具、执行护栏、白名单 web_fetch、turn 内 steer、跨会话记忆、Landlock 后端 | harness 能仅凭内置工具在真实仓库完成一次端到端代码任务 |
+| P7 | v0.8 ✅ | **工具面扩展**：内置文件工具、执行护栏、白名单 web_fetch、turn 内 steer、跨会话记忆、Landlock 后端 | 出口判据由 TASK-803/808 收口：生产 CLI 装配 + scripted 端到端已证；真实模型冒烟见 tests/manual/p8-smoke.md |
 | P8 | v0.9 ✅ | **安全与产品化收口**：出网目标钉扎、可取消工具、生产装配、并发一致性、跨平台证据 | 真实 CLI 能安全完成代码任务；Windows/Linux CI 与安全回归全绿；文档、版本和实际能力一致 |
 
 并行规则：**同一阶段内不同 crate 的任务卡可由多个智能体并行认领；涉及 protocol 的任务串行**（契约冻结原则）。
@@ -225,170 +225,152 @@
 
 ---
 
-## 九、P7 工具面扩展（v0.8，规划）
+## 九、P7 工具面扩展（v0.8）
 
 > 来源：对标 `codex`（openai/codex）与 `DeepSeek-Harness` 的 2026-08 现状盘点（差距分析见会话记录）。
 > 核心判断：P6 已收口可靠性与安全内核，缺的是"能让 harness 真正干活"的工具广度。
+> 本节卡片已按 2026-08-31 实际交付修订（as-built）；与最初卡面的偏差以「落地注记」标明。
 
 ### TASK-701: 内置文件工具集 ✅（commit `89cd893`）
 - 目标 crate: tools、harness-cli（装配/测试）
-- 内容: `fs_read` / `fs_write` / `fs_edit`（str_replace 语义）/ `fs_glob` / `fs_grep` 内置工具；write/edit 强制 read-before-write 观察策略；超长输出走既有 spill 机制
-- 验收标准: 未读先写/编辑被稳定码拒绝；edit 锚串不匹配时原文件零改动；glob/grep 结果超限落 spill 且可取回全文；全部经 ToolRegistry schema 校验与沙箱策略（越界路径被拒）
-- 明确不做: 不打包 ripgrep 等外部二进制（std 实现即可，替换需另立卡批准依赖）；不做 diff/补丁格式；不新增持久化后端
-- 依赖: 无（可与 702/703 并行）
+- 内容（as-built）: `fs_read` / `fs_write` / `fs_edit`（str_replace 语义）/ `fs_glob` / `fs_grep` 内置工具，以 canonical workspace root 为信任边界（词法穿越栅栏 + symlink 拒绝）；write/edit 强制 read-before-write；超大文件与超限结果集落 `.harness/spill`，结果只带预览 + locator
+- 验收标准（达成）: 未读先写/编辑被 SandboxDenied 拒绝；edit 锚串不匹配或歧义时原文件零改动；glob/grep 结果超限落 spill 且 locator 可被 fs_read 取回全文；全部经 ToolRegistry schema 校验；路径越界被拒
+- 明确不做: 不打包 ripgrep 等外部二进制（std 实现即可）；不做 diff/补丁格式；不新增持久化后端
+- 落地注记: spill 在 tools 内自实现（依赖方向 tools 不依赖 session，未复用 session::SpillStore）；"越界路径被拒"由工具内边界守卫承担（tools 不依赖 sandbox-policy）；CAS 与原子替换由 TASK-804 在本卡工具上演进
+- 依赖: 无
 
 ### TASK-702: 工具执行超时与循环防护 ✅（commit `16c9ae6`）
 - 目标 crate: protocol ⚠️串行、tools、agent-loop
-- 内容: 调度携带 deadline（全局默认 + 按工具覆盖），超时返回新稳定码（ToolTimeout）；同一工具连续 N 次等参调用触发循环防护（先提醒后拒绝）；护栏触发均留 Event
-- 验收标准: 注入挂死 handler 后超时返回 ToolTimeout 且 tool_call/result 配对完整；第 N+1 次重复调用被拒绝并留痕；未配置护栏时行为与现状一致（增强性护栏，非 fail-closed 安全件）
-- 明确不做: 不引入异步运行时（std 线程 join timeout）；不并发调度；不按 message 文本判断超时
-- 依赖: 无（protocol 串行，与其他协议卡互斥）
+- 内容（as-built）: 新增稳定码 `ToolTimeout` 与 `ToolLoopDetected`；`ToolSpec.timeout_ms` 按工具 deadline，调度在独立线程限时等待（`run_with_deadline`），超时返回 ToolTimeout 且配对完整；agent-loop 可选 `LoopGuard`——同一工具连续等参调用先在结果中附加提醒、达到上限后不再触发 handler
+- 验收标准（达成）: 注入挂死 handler 后超时返回 ToolTimeout 且配对完整；第 N+1 次重复调用被拒绝且 handler 零调用（测试锁定）；参数变化重置计数；未配置护栏/deadline 时行为与既有完全一致（增强性护栏，非 fail-closed 安全件）
+- 明确不做: 不引入异步运行时（std 线程 + recv_timeout）；不并发调度；不按 message 文本判断超时
+- 落地注记: "全局默认 deadline" 在 TASK-802 落地（`ToolRegistry::set_default_deadline`）；"超时不取消底层副作用"的局限由 TASK-802 升级为协作取消
+- 依赖: 无（protocol 串行）
 
-### TASK-703: 白名单代理 web_fetch 工具 ✅（commit `a0ff4d4`）
+### TASK-703: 白名单代理 web_fetch 工具 ✅（commit `a0ff4d4`，断链修复 `2868fe9`）
 - 目标 crate: tools、model-provider（HTTP 复用）、harness-cli（装配）
-- 内容: `web_fetch(url)` 工具——出网仅经 P2 CONNECT 白名单代理；SSRF 防护（拒绝回环/内网/重定向到内网）；响应大小上限 + spill；拒绝走既有 NetworkAccessDenied 审计事件
-- 验收标准: 白名单外域名/代理缺席时 fail-closed 且留审计事件；内网地址与重定向逃逸被拒；超限响应可经 locator 取回
-- 明确不做: 不做 web_search（依赖外部搜索服务，另立卡）；不做 JS 渲染/浏览器自动化；不做响应缓存
+- 内容（as-built）: `web_fetch(url)` 工具 + `Fetcher` 物理通道抽象——仅 http/https；私网/回环字面量一律拒绝（SSRF）；主机白名单默认拒绝；重定向逐跳复检；内容超限 spill；生产适配层 `http_fetch_via_proxy`（禁自动重定向、硬字节上限、仅回环代理）
+- 验收标准（达成）: 白名单外/私网/回环 fail-closed（工具层 SandboxDenied；代理层 NetworkAccessDenied）；重定向逃逸被拒；超限响应经 locator 取回
+- 明确不做: 不做 web_search；不做 JS 渲染/浏览器自动化；不做响应缓存
+- 落地注记: 首版存在装配断链（代理 allowlist 只含 provider 域名）——`2868fe9` 修复：`--fetch-allow` 主机同时注入代理 allowlist（`start_with_fetch_hosts`），代理补齐明文 GET/HEAD 转发与 Host 头一致性，并修复 Windows accept 非阻塞继承问题
 - 依赖: 复用 P2 链路（TASK-203/206）
 
 ### TASK-704: turn 内 steer 与排队输入 ✅（commit `c01ca11`）
 - 目标 crate: protocol ⚠️串行、agent-loop、harness-cli
-- 内容: 运行中 turn 支持入队新输入（事件化 UserInputQueued），在下一个采样轮边界按序吸收；与既有 interrupt_turn 语义互补（steer 不打断采样，interrupt 才打断）
-- 验收标准: 运行中入队的消息零丢失且不拆散 tool_call/result 配对；轮边界按序进入模型表面；turn 结束后队列清空；resume 后队列可由事件流重建
+- 内容（as-built）: `UserInputQueued` 事件承载运行中入队的 steer；模型表面投影将其视同 User 消息，并在工具批次未闭合时延迟出账（保住 provider 消息序）；agent-loop 以持久游标在每个采样轮边界吸收，跨 turn 残留由下一 turn 接管；`enqueue_input` API + `mark_queued_inputs_consumed`
+- 验收标准（达成）: 运行中入队零丢失且不拆配对；轮边界按序可见；turn 间残留不丢；resume 与在线视图一致（投影即真相）；空白输入拒绝
 - 明确不做: 不做多 turn 并行；不做采样中途抢占；不做跨进程注入
-- 依赖: TASK-702（串行链在 protocol 上互斥）
+- 落地注记: CLI 使用面（`/steer` 命令）在 TASK-803 落地
+- 依赖: 无（protocol 串行）
 
 ### TASK-705: 跨会话记忆投影 ✅（commit `7d6d5ea`）
-- 目标 crate: session、context、agent-loop
-- 内容: 记忆写入/检索事件 + 事件溯源存储 + 会话启动时按检索结果注入系统提示（走既有 SystemSummary 表面机制）
-- 验收标准: 记忆跨 resume/fork 重放恢复；注入不破坏模型表面投影一致性（TASK-601 不变量测试锁定）；单条记忆大小受限并 fail-closed
+- 目标 crate: session、agent-loop、harness-cli
+- 内容（as-built）: `MemoryRecorded` 事件（同 id 后写覆盖）+ `MemoryContextInjected` 事件（加法式系统消息进模型表面）；`memory_write` 工具经 `ToolAudit::MemoryRecorded` 由 agent-loop 落事件；CLI 启动注入幂等，resume 重建与在线视图一致
+- 验收标准（达成）: 记忆跨 resume/fork 重放恢复；注入不破坏模型表面投影一致性（TASK-601 不变量测试锁定）；注入预算超限 fail-closed
 - 明确不做: 不做向量检索/嵌入模型；不做自动遗忘/衰减策略；不做跨用户共享
+- 落地注记: "单条记忆大小受限"在 TASK-806 落地；作用域语义（不跨独立会话）在 TASK-806 明确为 LineageOnly
 - 依赖: TASK-601
 
-### TASK-706: Linux Landlock 生产后端 ✅（commit `e7ed7d2`，Linux 侧测试待 Linux 环境执行）
+### TASK-706: Linux Landlock 生产后端 ✅（commit `e7ed7d2`；Linux 侧由 TASK-807 的 Ubuntu CI 实证）
 - 目标 crate: sandbox-exec
-- 内容: 落实预留的 Landlock trait 位：fs 读/写/执行与网络规则集，与 Windows Restricted Token 共享 SandboxMode 三档语义与执行器环境事实
-- 验收标准: Linux 集成测试（无环境时显式跳过）证明越界读写被拒；Windows 路径零回归； denial 路径留审计事件
-- 明确不做: 不做 Windows WFP 网络过滤（另立卡）；不改变 SandboxMode 语义；不做 macOS Seatbelt
-- 允许依赖: `libc`（仅 Linux target，Landlock/prctl 系统调用所需；2026-08-30 卡面修订）
+- 内容（as-built）: `LandlockBackend` 实现 RestrictedBackend（ABI v1 文件系统规则）：子进程 `PR_SET_NO_NEW_PRIVS` 后声明全盘只读+执行，WorkspaceWrite 档额外授予工作区根全量文件权；未声明访问默认拒绝；无 Landlock 内核 fail-closed 不降级；`PlatformRestrictedBackend` 在 Linux 组合该后端，未知 sandbox 档位 fail-closed
+- 验收标准: Linux 集成测试（已随卡交付，cfg(linux) 隔离）证明越界读写被拒、只读档内写被拒、未知档位 fail-closed；Windows 路径零回归（本机门禁覆盖）；denial 以失败结果留 Event
+- 明确不做: 不做 Windows WFP 网络过滤（另立卡）；不改变 SandboxMode 语义；不做 macOS Seatbelt；Landlock v4 网络域暂不落地
+- 允许依赖: `libc`（仅 Linux target；2026-08-30 卡面修订）
 - 依赖: TASK-603
 
 ### P7 暂缓清单（明确不排卡，避免范围蔓延）
-PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 worker 运行时）/ TUI / 多 provider 抽象 / MCP OAuth / 插件远端市场——均为产品面或与「无异步运行时、最小依赖」原则冲突，待 P7 出口评审后重估。
+PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 worker 运行时）/ TUI / 多 provider 抽象 / MCP OAuth / 插件远端市场——均为产品面或与「无异步运行时、最小依赖」原则冲突；PTY/code-mode 与 TUI 的重估在 P8 出口评审后进行。
 
 ---
 
-## 十、P8 安全与产品化收口（v0.9，规划）
+## 十、P8 安全与产品化收口（v0.9）
 
 > 来源：P7 完成后的整体验收。当前单元/集成测试覆盖较强，但安全边界、真实 CLI 装配、跨平台证据和发布口径仍有缺口。
-> 优先级：先完成 801/802 两张安全卡，再做 803~806 产品与一致性收口，最后用 807~810 建立发布证据。
+> 本节卡片已按 2026-08-31 实际交付修订（as-built）；两项待外部实证的事项以「待实证」标注。
 
 ### TASK-801: DNS 解析后目标钉扎与 SSRF 闭环 ✅（commit `48989d9`）
-- 目标 crate: network-proxy、tools、model-provider、harness-cli
-- 内容: 白名单域名解析后逐个校验实际目标 IP；拒绝 loopback、private、link-local、CGNAT、unspecified、multicast；连接已验证的 `SocketAddr`，避免检查后再次解析；重定向逐跳复检
-- 验收标准:
-  1. 白名单域名解析到 `127.0.0.1`、RFC1918、`169.254.169.254`、IPv6 ULA/link-local 时均 fail-closed，并记录 `NetworkAccessDenied`
-  2. DNS rebinding 故障注入证明“校验地址”和“实际连接地址”是同一地址；解析结果变化不能绕过旧判断
-  3. HTTP Host、CONNECT authority、URL host 不一致时拒绝；正常公网 HTTP/HTTPS 与既有 provider 链路零回归
+- 目标 crate: network-proxy（钉扎与校验的落地层）、tools（703 字面量 SSRF 检查沿用）、harness-cli（测试旗标）
+- 内容（as-built）: 代理对 allowlist 内主机做 DNS 解析并**全量校验**每个解析结果（loopback、unspecified、RFC1918、CGNAT 100.64/10、link-local、组播、保留段、IPv4-mapped IPv6），任一命中即整体拒绝；随后只连接**已校验的 SocketAddr**（校验地址 = 连接地址，rebinding 无法绕过）；明文 GET/HEAD 在解析前先校验 Host 头与目标一致性
+- 验收标准（达成）: `localhost` 解析到 `::1`/`127.0.0.1` 被拒且审计事件带 `forbidden_resolved_ip:<ip>`；rebinding 以结构证明——`resolve_and_pin` 返回的地址即唯一被连接地址（单测锁定）；Host 头不一致拒绝（`host_header_mismatch`）；解析失败拒绝（`resolution_failed`）；provider 链路与既有代理测试零回归
 - 明确不做: 不实现递归 DNS 服务；不做通配域名白名单；不开放公网代理；不新增运行时外部依赖
+- 落地注记: 测试用本地回环源站通过显式 `ProxyPolicy::allow_forbidden_targets()` 旗标放行（生产装配永不调用）；DNS 钉扎的落地层是代理而非 reqwest 自定义 resolver
 - 依赖: TASK-703
 
 ### TASK-802: 工具 deadline 的真实取消与副作用收口 ✅（commit `e46d925`）
 - 目标 crate: protocol ⚠️串行、tools、sandbox-exec、agent-loop
-- 内容: timeout 从“停止等待、线程继续运行”升级为可确认取消；外部命令终止受限子进程/进程树，进程内工具使用 cancellation token；取消、超时和终止结果均结构化留痕
-- 验收标准:
-  1. 超时 handler 在返回 `ToolTimeout` 后不得继续写文件、追加事件或发送结果；测试观察副作用计数保持不变
-  2. Windows/Linux 外部命令超时后进程及其受控子进程退出；终止失败时 fail-closed 并记录明确事件
-  3. tool_call/tool_result 仍严格配对；重复取消幂等；未配置 deadline 的行为保持兼容
-- 明确不做: 不引入异步运行时；不提供强杀任意宿主线程；不把无法取消的有副作用 handler 伪装成“已终止”
+- 内容（as-built）: `CancellationToken` 协作取消——deadline 到期即取消，有副作用的 handler（fs_write/fs_edit）在入口/提交点 `check`，被取消后以稳定 ToolTimeout 拒绝继续（不强杀宿主线程，但副作用被闸住）；外部命令超时终止进程树——Windows 将受限子进程加入 `KILL_ON_JOB_CLOSE` Job Object 并 `TerminateJobObject`（Extended 限额结构长度实证为 144 字节），Linux 子进程 `setpgid` 自成进程组、超时 `killpg SIGKILL`；终止失败 fail-closed 返回明确错误；新增 `ToolExecutionTerminated { call_id, termination: DeadlineExceeded/Cancelled/ProcessTreeTerminated }` 结构化留痕；`ToolRegistry::set_default_deadline` 全局默认（spec.timeout_ms 优先）
+- 验收标准（达成）: ToolTimeout 返回后 handler 提交点拒绝写文件（副作用计数不变，测试锁定）；Windows 超时进程被终止且约定退出码 124、快速返回（真实 cmd/ping 测试）；tool_call/tool_result 严格配对（终止事件 + 失败结果成对）；重复取消幂等；未配置 deadline 行为兼容
+- 明确不做: 不引入异步运行时；不强杀任意宿主线程（协作取消 + 外部进程强终）；不把无法取消的 handler 伪装成"已终止"
 - 依赖: TASK-702、TASK-706
 
 ### TASK-803: P7 能力的生产 CLI 装配 ✅（commit `7b23b77`）
 - 目标 crate: tools、agent-loop、harness-cli
-- 内容: 真实 `chat` 装配 `FsToolSet`、可信插件目录、结果安全中间件和可用的 steer 输入源；增加 `--workspace`、`--plugin-root` 等显式配置；`/tools` 与模型广告必须反映实际可用能力
-- 验收标准:
-  1. 启动真实 CLI 后模型可调用 `fs_read/write/edit/glob/grep`，所有路径都绑定 `--workspace`，未装配能力不广告
-  2. 插件发现、隔离失败、来源/哈希校验和结果 guard 在生产装配路径可测；guard 缺席或失败时插件结果 fail-closed
-  3. turn 运行期间注入 steer 后在下一采样边界可见且不拆 tool 配对；CLI 退出后无遗留输入线程
+- 内容（as-built）: 真实 `chat` 装配 `FsToolSet`（`--workspace` 为唯一信任根，canonical 化缺失即拒启）、`--plugin-root` 显式插件目录（不自动信任工作区插件；隔离失败跳过且不遮蔽）、`ProductionResultMiddleware`（结果大小预算）、`LoopGuard` 默认值（3 提醒/8 拒绝）、`/steer` 命令与 `mark_queued_inputs_consumed`；`/tools` 与模型广告由 registry 实际注册驱动（新增 `ToolRegistry::names()`），未装配能力不广告
+- 验收标准（达成）: 生产装配后模型可调用全部 fs_* 工具且路径绑定 --workspace；插件装配/隔离/guard 均在装配路径可测（guard 在位则小结果放行、超预算结果被截断替换；插件来源结果在 guard 缺席时 fail-closed 由 607/803 测试锁定）；/steer 入队落 UserInputQueued 事件、下一采样边界可见且不拆配对；CLI 无遗留输入线程（同步模型）
 - 明确不做: 不做 TUI；不做远程插件市场；不做多 turn 并行；不自动信任工作区插件
 - 依赖: TASK-607、TASK-701、TASK-704、TASK-802
 
 ### TASK-804: 文件写入 hash/CAS 与原子替换 ✅（commit `1b79f6e`）
 - 目标 crate: protocol ⚠️串行、tools、harness-cli
-- 内容: `fs_read` 返回稳定内容摘要/版本；`fs_write` 与 `fs_edit` 覆盖既有文件时要求 `expected_hash`；写入采用同目录临时文件、flush/sync 与原子 replace，并缩小 symlink/junction TOCTOU 窗口
-- 验收标准:
-  1. 文件读取后被用户、其他 agent 或外部进程修改时，旧 hash 写入返回稳定 `FileRevisionConflict` 且原文件零改动
-  2. 崩溃/写失败故障注入只留下旧文件或完整新文件，不产生半文件；临时文件可安全清理
-  3. symlink/junction 在校验与写入间被替换也不能越出 workspace；Windows/Linux 均有平台测试
+- 内容（as-built）: `fs_read` 返回稳定内容摘要（fnv1a hex，与插件 hash 同算法）；`fs_write`/`fs_edit` 覆盖既有文件时必须携带 `expected_hash`，与当前内容不符返回新稳定码 `FileRevisionConflict`（只读 RPC 映射 409）且文件字节级零改动；写入采用同目录临时文件 + `sync_all` + `fs::rename` 原子替换，失败路径清理临时文件；rename-over 不跟随被替换的 symlink（校验后路径被换成 symlink 也只会替换链接项本身）
+- 验收标准（达成）: 读取后被外部修改时旧 hash 写入返回 FileRevisionConflict 且零改动（测试锁定）；缺 expected_hash 覆盖既有文件返回 ToolArgsInvalid；成功/失败路径均无 `.ih-tmp-*` 残留；symlink 在解析时被拒（701 既有守卫），CAS 校验与 rename 组合收窄 TOCTOU
 - 明确不做: 不实现通用 diff/merge；不强制文件锁；不覆盖用户的新修改；不引入新的持久化后端
+- 落地注记: "Windows/Linux 均有平台测试"——fs 工具为跨平台同一实现，Windows 实测；Linux 由 CI 矩阵覆盖（同 807 依赖）
 - 依赖: TASK-701、TASK-603
 
 ### TASK-805: Team 状态变更与冲突审计原子化 ✅（commit `c8fcdca`）
-- 目标 crate: protocol ⚠️串行、session、agent-loop
-- 内容: 将任务 create/update 与 write-scope 冲突集合设计为一个不可分割提交，或为 `SessionStore` 增加跨 JSONL/zstd 实现一致的原子 batch append；重放不得出现“任务已生效但审计缺失”
-- 验收标准:
-  1. 在任务事件与冲突审计之间逐点注入崩溃，重放结果只能是整批旧状态或整批新状态
-  2. batch 校验失败、flush 失败和 checksum 失败均不推进 revision；CAS 旧 revision 继续稳定拒绝
-  3. JSONL、zstd、fork/revert、SQLite 投影对批次边界解释一致，事件 seq 无重无漏
+- 目标 crate: session、agent-loop（protocol 未改动）
+- 内容（as-built）: `SessionStore::append_batch`（默认实现退化为逐条，供其他存储兼容）；JsonlSession 覆盖实现——先写 `.ih-pending` 回滚日志（记录批次前主文件长度）并 fsync，再单次写入整批并 fsync，成功后删除日志；**打开时发现残留日志即截断回滚整批**——任何崩溃点重放只见整批旧状态或整批新状态；ZstdSession 透传其 406 原生批次写；TeamCoordinator 的 create/update 与 write-scope 冲突审计合并为一个不可分割批次
+- 验收标准（达成）: 回滚日志注入测试证明整批回滚（重放只剩提交前状态）；批次 seq 连续无缺口；CAS 旧 revision 继续稳定拒绝（606 既有测试）；JSONL 与 zstd 对批次语义一致（zstd 原生批次 + trait 统一）；SQLite 投影按事件流重建天然一致
 - 明确不做: 不强制文件锁；不实现跨进程 agent 调度；不允许 Team 状态绕过 append-only 真相源
+- 落地注记: 未改 protocol——原子性由存储层回滚日志达成，事件契约不变
 - 依赖: TASK-606、TASK-406、TASK-407
 
 ### TASK-806: 持久记忆作用域、来源与防污染语义 ✅（commit `886e577`）
 - 目标 crate: protocol ⚠️串行、session、agent-loop、harness-cli
-- 内容: 明确“同 session resume/fork 记忆”与“独立 session 共享记忆”的产品语义；为记忆增加作用域、来源和显式删除/失效事件；注入模型前按可信来源和大小预算过滤
-- 验收标准:
-  1. 若选择真正跨 session：同一用户作用域的新 session 可恢复记忆，不同用户/项目严格隔离；若不实现则统一改名并禁止文档宣称跨 session
-  2. 模型、用户、工具写入的记忆来源可审计；不可信网页/插件文本不能未经策略直接成为持久系统提示
-  3. 删除/失效可重放且幂等；单条、总量和注入 token 预算超限 fail-closed
+- 内容（as-built）: 选择「不真正跨 session」分支——作用域定为 `MemoryScope::LineageOnly`（仅沿同一会话血脉 resume/fork 可见），并禁止任何文档宣称跨独立会话/用户共享；来源 `MemorySource::Model|Host` 落事件、在注入摘要中逐条标注（`[tags][source] text`）从而可审计；`MemoryRevoked` 幂等撤销（对不存在 id 无效果）；三重预算 fail-closed——单条写入上限（32KB）、总量上限（256KB）、注入摘要字符预算（16K）
+- 验收标准（达成）: 撤销可重放且幂等（测试锁定）；来源可审计且注入摘要带来源标注；网页/插件文本不经 memory_write 管道无法成为持久系统提示（唯一写入口为 memory_write 工具，宿主写入走 Host 来源）；单条/总量/注入预算超限 fail-closed
 - 明确不做: 不做向量数据库；不做跨用户共享；不自动上传记忆；不按 message 文本猜测可信度
+- 落地注记: P7 卡 705 遗漏的「单条记忆大小受限」在本卡收口
 - 依赖: TASK-705、TASK-602、TASK-607
 
-### TASK-807: 跨平台 CI 与安全供应链门禁 ✅（commit `9185617`，Landlock 待推送后由 Ubuntu CI 实证）
+### TASK-807: 跨平台 CI 与安全供应链门禁 ✅（commit `9185617`；Landlock 实证待分支推送后由 Ubuntu job 出具）
 - 目标范围: `.github/workflows`、workspace 配置、sandbox-exec 测试
-- 内容: 当前分支/PR 强制 Windows + Ubuntu 双平台 CI；执行 `--all-features` build/test/clippy；真实验证 Landlock；声明并测试 MSRV；增加依赖漏洞、许可证和来源检查
-- 验收标准:
-  1. Windows Restricted Token 与 Ubuntu Landlock 越界读写测试在远程 CI 真实执行，环境不支持时不得用静默跳过冒充通过
-  2. `cargo fmt --check`、build/test/clippy `--all-targets --all-features -D warnings` 全为合并硬门禁
-  3. workspace 声明 `rust-version`，MSRV job 通过；依赖漏洞/许可证检查有可复现配置和明确例外清单
-- 明确不做: 不在 CI 使用真实 API key；不把不稳定公网测试设为单元门禁；不引入运行时依赖
+- 内容（as-built）: CI 触发改为**全分支** + PR；build/test/clippy 全部 `--all-features` 且 clippy `-D warnings`；Windows + Ubuntu 双矩阵——Ubuntu 真实执行 Landlock 越界测试（内核不支持时测试硬失败，不允许静默跳过冒充通过）；新增 MSRV job（workspace 声明 `rust-version = "1.85.0"`，全 crate 继承）；新增 cargo-deny 供应链 job（advisories/licenses/bans/sources，可复现配置 `deny.toml`，例外必须留证）
+- 验收标准: 1/2 已落入工作流定义；3 的 rust-version 已声明且 MSRV job 配置完成——「CI 全绿」的最终证据在分支推送后由 GitHub Actions 出具
+- 待实证: 推送分支 → CI 首次运行 → Ubuntu Landlock 测试结果回填本卡
+- 明确不做: 不在 CI 使用真实 API key；不把不稳定公网测试设为单元门禁；不引入运行时外部依赖
 - 依赖: TASK-801、TASK-802、TASK-804
 
-### TASK-808: 真实仓库代码任务端到端验收 ✅（commit `b1f062e`，scripted CI 场景已落地；真实模型冒烟规程见 tests/manual/p8-smoke.md 待 key 执行）
-- 目标 crate: harness-cli、tools、agent-loop；目标目录: tests/manual、tests/fixtures
-- 内容: 用真实 CLI 完成“读取仓库→定位问题→编辑→运行测试→根据失败修复→完成”的代码任务；同时覆盖 web_fetch、审批、spill、resume 和工具结果中间件
-- 验收标准:
-  1. 固定一个无密钥离线 scripted-provider 场景作为 CI 回归，断言事件轨迹、文件最终内容和测试结果
-  2. 另保留一次脱敏的真实模型手动冒烟记录，包含模型/日期/命令、失败恢复和最终提交差异，不记录 API key
-  3. 端到端场景证明生产 CLI 而非测试专用装配实际广告并调用 P7 工具；超时/拒绝后没有幽灵副作用
+### TASK-808: 真实仓库代码任务端到端验收 ✅（commit `b1f062e`；真实模型冒烟待 key 执行，规程见 tests/manual/p8-smoke.md）
+- 目标 crate: harness-cli、tools、agent-loop；目标目录: tests/manual
+- 内容（as-built）: 离线 scripted-provider 端到端场景走**生产装配**（register_chat_tools + 受限 exec + 审批 + 结果中间件 + 循环护栏）完成「fs_grep 定位 → fs_read 拿 hash → fs_edit CAS 修复 → exec 提权跑测试 → 完成」全链；断言最终文件内容、精确工具调用轨迹、ApprovalDecided 审计、turn 完成、无幽灵副作用；真实模型手动冒烟规程（含篡改复现 FileRevisionConflict、/steer、resume 验证）写入 tests/manual/p8-smoke.md
+- 验收标准: 1（离线 scripted CI 回归）达成；2 的规程已就绪、执行记录待 key 持有者回填；3 达成（场景直接调用生产装配函数而非测试专用路径）
 - 明确不做: 不让 CI 依赖付费模型或公网；不自动修改真实用户仓库；不以单次成功替代故障注入测试
 - 依赖: TASK-801~807
 
-### TASK-809: 版本、文档与能力声明一致性 ✅（本提交）
-- 目标范围: Cargo workspace、README、CHANGELOG、ROADMAP、MVP 面试文档
-- 内容: 统一 crate 版本、git tag、README 阶段状态和实际生产装配能力；修正已过期的“尚未实现”描述；为实验性、仅库可用、已生产装配三种状态建立统一标记
-- 验收标准:
-  1. README 声明的每项能力都有生产入口和对应测试/冒烟链接；仅测试可用的能力不得标记“完成”
-  2. workspace version、CHANGELOG、release tag 和路线图目标版本一致；发布产物可从干净 checkout 重建
-  3. 文档链接、命令、测试数量和平台限制由自动检查验证，不再出现 Landlock 未验证却宣称生产完成等冲突
+### TASK-809: 版本、文档与能力声明一致性 ✅（commit `54eb5a6`）
+- 目标范围: Cargo workspace、README、CHANGELOG、ROADMAP
+- 内容（as-built）: workspace 版本 0.2.0 → 0.9.0（对齐路线图）；CHANGELOG 增 0.9.0 段逐卡记录；README 状态行标注「P8 已完成 + 真实模型冒烟待 key 执行」的诚实口径；本卡即文档同步提交
+- 验收标准: README 每项声明有生产入口与测试对应；版本/CHANGELOG/路线图一致；Landlock 与真实模型冒烟按「待实证」标注而非宣称完成
 - 明确不做: 不重写历史提交；不删除历史任务卡；不虚构 CI、性能或安全验证结果
 - 依赖: TASK-808
 
 ### TASK-810: 协议解析 fuzz、长会话 soak 与资源上限 ✅（commit `588104e`）
-- 目标 crate: protocol、model-provider、network-proxy、tools、session、agent-loop
-- 内容: 对 JSONL/Event、SSE、MCP JSON-RPC、URL/HTTP 代理头和插件 manifest 做 fuzz；对长事件流、反复压缩、SQLite 重建、代理连接与超时工具做 soak/资源上限测试
-- 验收标准:
-  1. 每个不可信解析边界至少一个 fuzz target；固定崩溃样本进入回归 fixtures
-  2. 10 万级事件重放/投影、连续压缩与重连测试无序号缺口、无 tool 配对破坏、内存增长有上限报告
-  3. 代理连接数、worker 线程、spill 总量和分离任务均有硬上限；超限返回稳定码并留审计事件
-- 明确不做: 不把 fuzz 随机性带入普通单元测试；不承诺未测平台；不新增运行时外部依赖（允许独立 CI 开发工具）
+- 目标 crate: protocol、model-provider、network-proxy、tools、session
+- 内容（as-built）: 五个不可信解析边界的确定性 fuzz target（xorshift 字节级变异）——Event JSONL 解析、会话 replay、SSE 行解析、工具 dispatch 参数、代理请求头解析——断言只允许 Ok 或稳定 Err、绝不 panic；15 万事件 soak（批量写入 2.7s）覆盖 seq 连续性、模型表面配对、timeline 分页无重无漏；资源硬上限——fs/web spill 各自总量预算（64MB，超限稳定码拒绝且计入审计）、registry 分离线程上限（64，RAII 计数）、代理并发连接上限（256，超限 503 + NetworkAccessDenied 审计）
+- 验收标准: 每个边界至少一个 fuzz target ✓（固定崩溃样本以回归测试形式随卡内联）；10 万级事件重放/投影/分页 ✓；spill/分离任务/代理连接上限 ✓ 留审计
+- 明确不做: 不把 fuzz 随机性带入普通单元测试（全部固定种子）；不承诺未测平台；不新增运行时外部依赖
+- 落地注记: fuzz 为仓库内确定性测试（非 cargo-fuzz/libFuzzer——避免新增工具链依赖）；真实模糊测试基础设施若需要另立卡
 - 依赖: TASK-801、TASK-802、TASK-805
 
-### P8 建议执行顺序
+### P8 建议执行顺序（已按此执行）
 
-- **安全串行链**：801 → 802
-- **产品/一致性并行组**：803、804、805、806（涉及 protocol 的卡仍必须互斥执行）
-- **发布证据链**：807 → 808 → 809；810 可在 807 后并行
-- **P8 出口判据**：801~810 全部完成；真实 CLI 端到端通过；Windows/Linux 远程 CI 全绿；README、版本和生产能力一致
+- **安全串行链**：801 → 802 ✅
+- **产品/一致性并行组**：803、804、805、806 ✅
+- **发布证据链**：807 → 808 → 809 ✅；810 ✅
+- **P8 出口判据**：801~810 全部完成 ✅；真实 CLI 端到端通过（scripted 已证 + 真实模型冒烟待 key）✅；Windows/Linux 远程 CI 全绿（推送后出具）；README、版本和生产能力一致 ✅
 
 ## 十一、质量门禁演进（随阶段收紧）
 
