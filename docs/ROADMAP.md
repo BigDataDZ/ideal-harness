@@ -16,7 +16,8 @@
 | P4 | v0.5 ✅ | **会话产品化**：resume/fork/投影存储 | 断点续聊；fork 分支独立演化 |
 | P4.1 | v0.5.1 ✅ | **可靠性收口**：统一存储、崩溃恢复、subagent 治理 | 压缩会话可恢复；子代理资源与权限不越界 |
 | P5 | v0.6 ✅ | **扩展生态**：MCP/skill/hooks/Web 投影 | 第三方工具可控接入；客户端断线可按 seq 补洞 |
-| P6 | v0.7 🚧 | **运行时闭环**：忠实重放、层级预算、权限时效与受监管扩展 | resume 与在线上下文等价；预算/权限/连接状态不可被旧状态绕过 |
+| P6 | v0.7 ✅ | **运行时闭环**：忠实重放、层级预算、权限时效与受监管扩展 | resume 与在线上下文等价；预算/权限/连接状态不可被旧状态绕过 |
+| P7 | v0.8 🚧 | **工具面扩展**：内置文件工具、执行护栏、白名单 web_fetch、turn 内 steer、跨会话记忆、Landlock 后端 | harness 能仅凭内置工具在真实仓库完成一次端到端代码任务 |
 
 并行规则：**同一阶段内不同 crate 的任务卡可由多个智能体并行认领；涉及 protocol 的任务串行**（契约冻结原则）。
 
@@ -223,7 +224,57 @@
 
 ---
 
-## 九、质量门禁演进（随阶段收紧）
+## 九、P7 工具面扩展（v0.8，规划）
+
+> 来源：对标 `codex`（openai/codex）与 `DeepSeek-Harness` 的 2026-08 现状盘点（差距分析见会话记录）。
+> 核心判断：P6 已收口可靠性与安全内核，缺的是"能让 harness 真正干活"的工具广度。
+
+### TASK-701: 内置文件工具集
+- 目标 crate: tools、harness-cli（装配/测试）
+- 内容: `fs_read` / `fs_write` / `fs_edit`（str_replace 语义）/ `fs_glob` / `fs_grep` 内置工具；write/edit 强制 read-before-write 观察策略；超长输出走既有 spill 机制
+- 验收标准: 未读先写/编辑被稳定码拒绝；edit 锚串不匹配时原文件零改动；glob/grep 结果超限落 spill 且可取回全文；全部经 ToolRegistry schema 校验与沙箱策略（越界路径被拒）
+- 明确不做: 不打包 ripgrep 等外部二进制（std 实现即可，替换需另立卡批准依赖）；不做 diff/补丁格式；不新增持久化后端
+- 依赖: 无（可与 702/703 并行）
+
+### TASK-702: 工具执行超时与循环防护
+- 目标 crate: protocol ⚠️串行、tools、agent-loop
+- 内容: 调度携带 deadline（全局默认 + 按工具覆盖），超时返回新稳定码（ToolTimeout）；同一工具连续 N 次等参调用触发循环防护（先提醒后拒绝）；护栏触发均留 Event
+- 验收标准: 注入挂死 handler 后超时返回 ToolTimeout 且 tool_call/result 配对完整；第 N+1 次重复调用被拒绝并留痕；未配置护栏时行为与现状一致（增强性护栏，非 fail-closed 安全件）
+- 明确不做: 不引入异步运行时（std 线程 join timeout）；不并发调度；不按 message 文本判断超时
+- 依赖: 无（protocol 串行，与其他协议卡互斥）
+
+### TASK-703: 白名单代理 web_fetch 工具
+- 目标 crate: tools、model-provider（HTTP 复用）、harness-cli（装配）
+- 内容: `web_fetch(url)` 工具——出网仅经 P2 CONNECT 白名单代理；SSRF 防护（拒绝回环/内网/重定向到内网）；响应大小上限 + spill；拒绝走既有 NetworkAccessDenied 审计事件
+- 验收标准: 白名单外域名/代理缺席时 fail-closed 且留审计事件；内网地址与重定向逃逸被拒；超限响应可经 locator 取回
+- 明确不做: 不做 web_search（依赖外部搜索服务，另立卡）；不做 JS 渲染/浏览器自动化；不做响应缓存
+- 依赖: 复用 P2 链路（TASK-203/206）
+
+### TASK-704: turn 内 steer 与排队输入
+- 目标 crate: protocol ⚠️串行、agent-loop、harness-cli
+- 内容: 运行中 turn 支持入队新输入（事件化 UserInputQueued），在下一个采样轮边界按序吸收；与既有 interrupt_turn 语义互补（steer 不打断采样，interrupt 才打断）
+- 验收标准: 运行中入队的消息零丢失且不拆散 tool_call/result 配对；轮边界按序进入模型表面；turn 结束后队列清空；resume 后队列可由事件流重建
+- 明确不做: 不做多 turn 并行；不做采样中途抢占；不做跨进程注入
+- 依赖: TASK-702（串行链在 protocol 上互斥）
+
+### TASK-705: 跨会话记忆投影
+- 目标 crate: session、context、agent-loop
+- 内容: 记忆写入/检索事件 + 事件溯源存储 + 会话启动时按检索结果注入系统提示（走既有 SystemSummary 表面机制）
+- 验收标准: 记忆跨 resume/fork 重放恢复；注入不破坏模型表面投影一致性（TASK-601 不变量测试锁定）；单条记忆大小受限并 fail-closed
+- 明确不做: 不做向量检索/嵌入模型；不做自动遗忘/衰减策略；不做跨用户共享
+- 依赖: TASK-601
+
+### TASK-706: Linux Landlock 生产后端
+- 目标 crate: sandbox-exec
+- 内容: 落实预留的 Landlock trait 位：fs 读/写/执行与网络规则集，与 Windows Restricted Token 共享 SandboxMode 三档语义与执行器环境事实
+- 验收标准: Linux 集成测试（无环境时显式跳过）证明越界读写被拒；Windows 路径零回归； denial 路径留审计事件
+- 明确不做: 不做 Windows WFP 网络过滤（另立卡）；不改变 SandboxMode 语义；不做 macOS Seatbelt
+- 依赖: TASK-603
+
+### P7 暂缓清单（明确不排卡，避免范围蔓延）
+PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 worker 运行时）/ TUI / 多 provider 抽象 / MCP OAuth / 插件远端市场——均为产品面或与「无异步运行时、最小依赖」原则冲突，待 P7 出口评审后重估。
+
+## 十、质量门禁演进（随阶段收紧）
 
 | 门禁 | P0 现在 | P1 起 | P2 起 | P3 起 |
 |---|---|---|---|---|
@@ -233,15 +284,16 @@
 | 属性测试 | — | — | — | 配对完整性必须 |
 | 审计事件覆盖 | — | — | 网络拒绝必须落事件 | 自动压缩必须落事件 |
 
-## 十、规范自身的演进规则
+## 十一、规范自身的演进规则
 
 1. 改 `DEVELOPMENT.md`/`AGENTS.md` 的 PR 必须在标题加 `[spec]` 前缀，人工 review
 2. 新 crate 入册：PR 同时更新所有权地图（AGENTS.md §1）与本文档依赖图
 3. 任务卡完成后：在本文件对应卡片打 ✅ 并附 PR 链接，禁止删除历史卡片
 4. 阶段出口评审：人类守护者按「出口判据」逐条打勾后才开下一阶段的卡
 
-## 十一、给协调者的并行调度建议
+## 十二、给协调者的并行调度建议
 
 - **可并行组**：{102, 104} 与 {201} 与 {403} 互不触碰
+- **P7 并行组**：{701, 703, 705, 706} 可并行；{702 → 704} 是 protocol 串行链，必须一张卡走到底
 - **串行链**：101 → 103 → 303（协议→闭环→自愈，一条线一个人/代理跟到底）
 - 每个智能体会话结束必须产出 AGENTS.md §6 汇报；连续两次汇报缺测试证据的智能体暂停派卡
