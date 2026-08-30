@@ -7,6 +7,8 @@
 //!
 //! 明确不做：多 provider 抽象层。一个够用，接口留 [`ChatModel`] trait。
 
+mod fetch;
+
 use std::io::{BufRead, Read};
 use std::time::Duration;
 
@@ -321,6 +323,9 @@ fn map_transport_error(e: reqwest::Error) -> ErrorEnvelope {
         ErrorEnvelope::new(ErrorCode::Internal, format!("请求未送达上游: {e}"))
     }
 }
+
+/// agent-loop 依赖的唯一抽象边界（TASK-103 的接入点）。
+pub use fetch::{http_fetch_via_proxy, HttpFetchOutcome};
 
 /// agent-loop 依赖的唯一抽象边界（TASK-103 的接入点）。
 pub trait ChatModel {

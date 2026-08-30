@@ -8,6 +8,7 @@ mod mcp_registry;
 mod plugins;
 mod schema;
 mod skills;
+mod web;
 
 use protocol::{AuthorizationContext, ErrorEnvelope, ToolOutcome};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,7 @@ pub use plugins::{
 };
 pub use schema::validate_args;
 pub use skills::{SkillCatalog, SkillRefresh, VerifiedSkill, VerifiedSkillScope};
+pub use web::{is_private_host, FetchRequest, FetchResponse, Fetcher, WebFetchTool};
 
 /// 工具规格：schema 即文档，schema 即校验器输入。
 #[derive(Debug, Clone, Serialize, Deserialize)]

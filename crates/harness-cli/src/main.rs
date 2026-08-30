@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use agent_loop::{AgentLoop, ModelProvider};
 use approval::TerminalApprover;
 use model_provider::{ChatMessage, OpenAiCompatClient};
-use protocol::{ErrorEnvelope, Event, ModelCallSpec, ToolOutcome};
+use protocol::{ErrorCode, ErrorEnvelope, Event, ModelCallSpec, ToolOutcome};
 use sandbox_exec::PlatformRestrictedBackend;
 use sandbox_policy::{SandboxMode, SandboxPolicy};
 use session::{replay_session, JsonlSession, SessionStore};
@@ -44,6 +44,8 @@ struct ChatArgs {
     session: PathBuf,
     base_url: String,
     model: String,
+    /// TASK-703：web_fetch 允许的主机白名单；默认空 = 全部拒绝（fail-closed）。
+    fetch_allow: Vec<String>,
 }
 
 impl Default for ChatArgs {
@@ -52,6 +54,7 @@ impl Default for ChatArgs {
             session: std::env::temp_dir().join("ideal-harness-chat.jsonl"),
             base_url: "https://api.deepseek.com/v1".into(),
             model: "deepseek-chat".into(),
+            fetch_allow: Vec::new(),
         }
     }
 }
@@ -70,6 +73,7 @@ fn parse_chat_args(args: &[String]) -> anyhow::Result<ChatArgs> {
             "--session" => out.session = PathBuf::from(next_value(args, i, "--session")?),
             "--base-url" => out.base_url = next_value(args, i, "--base-url")?,
             "--model" => out.model = next_value(args, i, "--model")?,
+            "--fetch-allow" => out.fetch_allow.push(next_value(args, i, "--fetch-allow")?),
             other => anyhow::bail!(
                 "未知参数 {other}；用法: ideal-harness chat [--session <path>] [--base-url <url>] [--model <name>]"
             ),
@@ -98,6 +102,7 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
 
     let mut registry = ToolRegistry::default();
     register_demo_tools(&mut registry);
+    register_web_fetch_tool(&mut registry, &proxy.url, &cfg.fetch_allow)?;
     registry.set_escalation_availability(EscalationAvailability::RestrictedBackendMounted);
     let terminal_approver = Arc::new(TerminalApprover::new(
         std::io::BufReader::new(std::io::stdin()),
@@ -118,7 +123,7 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
 
     let mut lp = AgentLoop::with_chat(&mut js, &registry, &client, spec);
     lp.tool_definitions = Some(
-        openai_tools_json(&registry, &["echo", "now", "exec"])
+        openai_tools_json(&registry, &["echo", "now", "web_fetch", "exec"])
             .map_err(|error| anyhow::anyhow!(error.message))?,
     );
     lp.chat_history = history;
@@ -153,7 +158,7 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         match text {
             "/exit" | "/quit" => break,
             "/tools" => {
-                for name in ["echo", "now", "exec"] {
+                for name in ["echo", "now", "web_fetch", "exec"] {
                     if let Some(s) = registry.get(name) {
                         println!("  {} — {}", s.name, s.description);
                     }
@@ -185,6 +190,63 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
     drop(lp);
     drop(client);
     proxy.shutdown()?;
+    Ok(())
+}
+
+/// TASK-703：把物理出网接到本地 CONNECT 白名单代理的 Fetcher 适配器。
+struct ProxiedHttpFetcher {
+    proxy_url: String,
+}
+
+impl tools::Fetcher for ProxiedHttpFetcher {
+    fn fetch(&self, request: &tools::FetchRequest) -> Result<tools::FetchResponse, ErrorEnvelope> {
+        let outcome = model_provider::http_fetch_via_proxy(
+            Some(&self.proxy_url),
+            &request.url,
+            request.max_bytes,
+            std::time::Duration::from_secs(30),
+        )?;
+        Ok(tools::FetchResponse {
+            status: outcome.status,
+            location: outcome.location,
+            body: outcome.body,
+            truncated: outcome.truncated,
+        })
+    }
+}
+
+/// TASK-703：注册 web_fetch 工具（主机默认拒绝，`--fetch-allow` 显式放行）。
+fn register_web_fetch_tool(
+    registry: &mut ToolRegistry,
+    proxy_url: &str,
+    allowed_hosts: &[String],
+) -> anyhow::Result<()> {
+    let fetcher: std::sync::Arc<dyn tools::Fetcher> = std::sync::Arc::new(ProxiedHttpFetcher {
+        proxy_url: proxy_url.to_string(),
+    });
+    let spill_root = std::env::current_dir()?.join(".harness").join("spill");
+    let tool = tools::WebFetchTool::new(
+        fetcher,
+        allowed_hosts.iter().cloned().collect(),
+        spill_root,
+        ".harness/spill",
+        1024 * 1024,
+    );
+    registry.register(
+        ToolSpec {
+            name: "web_fetch".into(),
+            description:
+                "抓取白名单内主机的 http(s) 页面文本；仅经本地白名单代理出网，私网/回环一律拒绝"
+                    .into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "required": ["url"],
+                "properties": { "url": { "type": "string" } }
+            }),
+            escalation_capable: false,
+        },
+        Box::new(move |args| tool.fetch(args)),
+    );
     Ok(())
 }
 
@@ -524,6 +586,83 @@ mod tests {
         assert_eq!(v[0]["type"], "function");
         assert_eq!(v[0]["function"]["name"], "echo");
         assert_eq!(v[1]["function"]["name"], "now");
+    }
+
+    struct CannedFetcher;
+    impl tools::Fetcher for CannedFetcher {
+        fn fetch(&self, _: &tools::FetchRequest) -> Result<tools::FetchResponse, ErrorEnvelope> {
+            Ok(tools::FetchResponse {
+                status: 200,
+                location: None,
+                body: b"hello via proxy".to_vec(),
+                truncated: false,
+            })
+        }
+    }
+
+    /// TASK-703 装配冒烟：默认拒绝 + 白名单放行 + 代理通道断言不可绕过。
+    #[test]
+    fn web_fetch_assembly_denies_by_default_and_serves_allowlisted_host() {
+        let spill = tmp("web-spill");
+        let _ = std::fs::remove_dir_all(&spill);
+        let tool = tools::WebFetchTool::new(
+            std::sync::Arc::new(CannedFetcher),
+            ["docs.example".to_string()].into_iter().collect(),
+            spill.join(".harness").join("spill"),
+            ".harness/spill",
+            64 * 1024,
+        );
+        let mut registry = ToolRegistry::default();
+        registry.register(
+            ToolSpec {
+                name: "web_fetch".into(),
+                description: "demo".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": { "url": { "type": "string" } }
+                }),
+                escalation_capable: false,
+            },
+            Box::new(move |args| tool.fetch(args)),
+        );
+        // 未在白名单内的主机 fail-closed（空策略也安全）
+        let denied = registry
+            .dispatch(
+                "web_fetch",
+                &serde_json::json!({ "url": "https://evil.example/x" }),
+            )
+            .unwrap();
+        match denied {
+            ToolOutcome::Failure { error } => {
+                assert_eq!(error.code, ErrorCode::SandboxDenied);
+                assert!(error.message.contains("not allowlisted"));
+            }
+            other => panic!("expected denial, got {other:?}"),
+        }
+        let allowed = registry
+            .dispatch(
+                "web_fetch",
+                &serde_json::json!({ "url": "https://docs.example/x" }),
+            )
+            .unwrap();
+        match allowed {
+            ToolOutcome::Success { value } => assert_eq!(value["content"], "hello via proxy"),
+            other => panic!("expected fetch success, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&spill).ok();
+    }
+
+    #[test]
+    fn parse_chat_args_collects_fetch_allow_hosts() {
+        let parsed = parse_chat_args(&[
+            "--fetch-allow".into(),
+            "docs.example".into(),
+            "--fetch-allow".into(),
+            "wiki.example".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.fetch_allow, vec!["docs.example", "wiki.example"]);
     }
 
     /// TASK-701 装配冒烟：工作区 → FsToolSet 注册 → read/write/edit 闭环。
