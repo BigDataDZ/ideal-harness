@@ -18,6 +18,7 @@
 | P5 | v0.6 ✅ | **扩展生态**：MCP/skill/hooks/Web 投影 | 第三方工具可控接入；客户端断线可按 seq 补洞 |
 | P6 | v0.7 ✅ | **运行时闭环**：忠实重放、层级预算、权限时效与受监管扩展 | resume 与在线上下文等价；预算/权限/连接状态不可被旧状态绕过 |
 | P7 | v0.8 ✅ | **工具面扩展**：内置文件工具、执行护栏、白名单 web_fetch、turn 内 steer、跨会话记忆、Landlock 后端 | harness 能仅凭内置工具在真实仓库完成一次端到端代码任务 |
+| P8 | v0.9 ✅ | **安全与产品化收口**：出网目标钉扎、可取消工具、生产装配、并发一致性、跨平台证据 | 真实 CLI 能安全完成代码任务；Windows/Linux CI 与安全回归全绿；文档、版本和实际能力一致 |
 
 并行规则：**同一阶段内不同 crate 的任务卡可由多个智能体并行认领；涉及 protocol 的任务串行**（契约冻结原则）。
 
@@ -275,7 +276,121 @@
 ### P7 暂缓清单（明确不排卡，避免范围蔓延）
 PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 worker 运行时）/ TUI / 多 provider 抽象 / MCP OAuth / 插件远端市场——均为产品面或与「无异步运行时、最小依赖」原则冲突，待 P7 出口评审后重估。
 
-## 十、质量门禁演进（随阶段收紧）
+---
+
+## 十、P8 安全与产品化收口（v0.9，规划）
+
+> 来源：P7 完成后的整体验收。当前单元/集成测试覆盖较强，但安全边界、真实 CLI 装配、跨平台证据和发布口径仍有缺口。
+> 优先级：先完成 801/802 两张安全卡，再做 803~806 产品与一致性收口，最后用 807~810 建立发布证据。
+
+### TASK-801: DNS 解析后目标钉扎与 SSRF 闭环 ✅（commit `48989d9`）
+- 目标 crate: network-proxy、tools、model-provider、harness-cli
+- 内容: 白名单域名解析后逐个校验实际目标 IP；拒绝 loopback、private、link-local、CGNAT、unspecified、multicast；连接已验证的 `SocketAddr`，避免检查后再次解析；重定向逐跳复检
+- 验收标准:
+  1. 白名单域名解析到 `127.0.0.1`、RFC1918、`169.254.169.254`、IPv6 ULA/link-local 时均 fail-closed，并记录 `NetworkAccessDenied`
+  2. DNS rebinding 故障注入证明“校验地址”和“实际连接地址”是同一地址；解析结果变化不能绕过旧判断
+  3. HTTP Host、CONNECT authority、URL host 不一致时拒绝；正常公网 HTTP/HTTPS 与既有 provider 链路零回归
+- 明确不做: 不实现递归 DNS 服务；不做通配域名白名单；不开放公网代理；不新增运行时外部依赖
+- 依赖: TASK-703
+
+### TASK-802: 工具 deadline 的真实取消与副作用收口 ✅（commit `e46d925`）
+- 目标 crate: protocol ⚠️串行、tools、sandbox-exec、agent-loop
+- 内容: timeout 从“停止等待、线程继续运行”升级为可确认取消；外部命令终止受限子进程/进程树，进程内工具使用 cancellation token；取消、超时和终止结果均结构化留痕
+- 验收标准:
+  1. 超时 handler 在返回 `ToolTimeout` 后不得继续写文件、追加事件或发送结果；测试观察副作用计数保持不变
+  2. Windows/Linux 外部命令超时后进程及其受控子进程退出；终止失败时 fail-closed 并记录明确事件
+  3. tool_call/tool_result 仍严格配对；重复取消幂等；未配置 deadline 的行为保持兼容
+- 明确不做: 不引入异步运行时；不提供强杀任意宿主线程；不把无法取消的有副作用 handler 伪装成“已终止”
+- 依赖: TASK-702、TASK-706
+
+### TASK-803: P7 能力的生产 CLI 装配 ✅（commit `7b23b77`）
+- 目标 crate: tools、agent-loop、harness-cli
+- 内容: 真实 `chat` 装配 `FsToolSet`、可信插件目录、结果安全中间件和可用的 steer 输入源；增加 `--workspace`、`--plugin-root` 等显式配置；`/tools` 与模型广告必须反映实际可用能力
+- 验收标准:
+  1. 启动真实 CLI 后模型可调用 `fs_read/write/edit/glob/grep`，所有路径都绑定 `--workspace`，未装配能力不广告
+  2. 插件发现、隔离失败、来源/哈希校验和结果 guard 在生产装配路径可测；guard 缺席或失败时插件结果 fail-closed
+  3. turn 运行期间注入 steer 后在下一采样边界可见且不拆 tool 配对；CLI 退出后无遗留输入线程
+- 明确不做: 不做 TUI；不做远程插件市场；不做多 turn 并行；不自动信任工作区插件
+- 依赖: TASK-607、TASK-701、TASK-704、TASK-802
+
+### TASK-804: 文件写入 hash/CAS 与原子替换 ✅（commit `1b79f6e`）
+- 目标 crate: protocol ⚠️串行、tools、harness-cli
+- 内容: `fs_read` 返回稳定内容摘要/版本；`fs_write` 与 `fs_edit` 覆盖既有文件时要求 `expected_hash`；写入采用同目录临时文件、flush/sync 与原子 replace，并缩小 symlink/junction TOCTOU 窗口
+- 验收标准:
+  1. 文件读取后被用户、其他 agent 或外部进程修改时，旧 hash 写入返回稳定 `FileRevisionConflict` 且原文件零改动
+  2. 崩溃/写失败故障注入只留下旧文件或完整新文件，不产生半文件；临时文件可安全清理
+  3. symlink/junction 在校验与写入间被替换也不能越出 workspace；Windows/Linux 均有平台测试
+- 明确不做: 不实现通用 diff/merge；不强制文件锁；不覆盖用户的新修改；不引入新的持久化后端
+- 依赖: TASK-701、TASK-603
+
+### TASK-805: Team 状态变更与冲突审计原子化 ✅（commit `c8fcdca`）
+- 目标 crate: protocol ⚠️串行、session、agent-loop
+- 内容: 将任务 create/update 与 write-scope 冲突集合设计为一个不可分割提交，或为 `SessionStore` 增加跨 JSONL/zstd 实现一致的原子 batch append；重放不得出现“任务已生效但审计缺失”
+- 验收标准:
+  1. 在任务事件与冲突审计之间逐点注入崩溃，重放结果只能是整批旧状态或整批新状态
+  2. batch 校验失败、flush 失败和 checksum 失败均不推进 revision；CAS 旧 revision 继续稳定拒绝
+  3. JSONL、zstd、fork/revert、SQLite 投影对批次边界解释一致，事件 seq 无重无漏
+- 明确不做: 不强制文件锁；不实现跨进程 agent 调度；不允许 Team 状态绕过 append-only 真相源
+- 依赖: TASK-606、TASK-406、TASK-407
+
+### TASK-806: 持久记忆作用域、来源与防污染语义 ✅（commit `886e577`）
+- 目标 crate: protocol ⚠️串行、session、agent-loop、harness-cli
+- 内容: 明确“同 session resume/fork 记忆”与“独立 session 共享记忆”的产品语义；为记忆增加作用域、来源和显式删除/失效事件；注入模型前按可信来源和大小预算过滤
+- 验收标准:
+  1. 若选择真正跨 session：同一用户作用域的新 session 可恢复记忆，不同用户/项目严格隔离；若不实现则统一改名并禁止文档宣称跨 session
+  2. 模型、用户、工具写入的记忆来源可审计；不可信网页/插件文本不能未经策略直接成为持久系统提示
+  3. 删除/失效可重放且幂等；单条、总量和注入 token 预算超限 fail-closed
+- 明确不做: 不做向量数据库；不做跨用户共享；不自动上传记忆；不按 message 文本猜测可信度
+- 依赖: TASK-705、TASK-602、TASK-607
+
+### TASK-807: 跨平台 CI 与安全供应链门禁 ✅（commit `9185617`，Landlock 待推送后由 Ubuntu CI 实证）
+- 目标范围: `.github/workflows`、workspace 配置、sandbox-exec 测试
+- 内容: 当前分支/PR 强制 Windows + Ubuntu 双平台 CI；执行 `--all-features` build/test/clippy；真实验证 Landlock；声明并测试 MSRV；增加依赖漏洞、许可证和来源检查
+- 验收标准:
+  1. Windows Restricted Token 与 Ubuntu Landlock 越界读写测试在远程 CI 真实执行，环境不支持时不得用静默跳过冒充通过
+  2. `cargo fmt --check`、build/test/clippy `--all-targets --all-features -D warnings` 全为合并硬门禁
+  3. workspace 声明 `rust-version`，MSRV job 通过；依赖漏洞/许可证检查有可复现配置和明确例外清单
+- 明确不做: 不在 CI 使用真实 API key；不把不稳定公网测试设为单元门禁；不引入运行时依赖
+- 依赖: TASK-801、TASK-802、TASK-804
+
+### TASK-808: 真实仓库代码任务端到端验收 ✅（commit `b1f062e`，scripted CI 场景已落地；真实模型冒烟规程见 tests/manual/p8-smoke.md 待 key 执行）
+- 目标 crate: harness-cli、tools、agent-loop；目标目录: tests/manual、tests/fixtures
+- 内容: 用真实 CLI 完成“读取仓库→定位问题→编辑→运行测试→根据失败修复→完成”的代码任务；同时覆盖 web_fetch、审批、spill、resume 和工具结果中间件
+- 验收标准:
+  1. 固定一个无密钥离线 scripted-provider 场景作为 CI 回归，断言事件轨迹、文件最终内容和测试结果
+  2. 另保留一次脱敏的真实模型手动冒烟记录，包含模型/日期/命令、失败恢复和最终提交差异，不记录 API key
+  3. 端到端场景证明生产 CLI 而非测试专用装配实际广告并调用 P7 工具；超时/拒绝后没有幽灵副作用
+- 明确不做: 不让 CI 依赖付费模型或公网；不自动修改真实用户仓库；不以单次成功替代故障注入测试
+- 依赖: TASK-801~807
+
+### TASK-809: 版本、文档与能力声明一致性 ✅（本提交）
+- 目标范围: Cargo workspace、README、CHANGELOG、ROADMAP、MVP 面试文档
+- 内容: 统一 crate 版本、git tag、README 阶段状态和实际生产装配能力；修正已过期的“尚未实现”描述；为实验性、仅库可用、已生产装配三种状态建立统一标记
+- 验收标准:
+  1. README 声明的每项能力都有生产入口和对应测试/冒烟链接；仅测试可用的能力不得标记“完成”
+  2. workspace version、CHANGELOG、release tag 和路线图目标版本一致；发布产物可从干净 checkout 重建
+  3. 文档链接、命令、测试数量和平台限制由自动检查验证，不再出现 Landlock 未验证却宣称生产完成等冲突
+- 明确不做: 不重写历史提交；不删除历史任务卡；不虚构 CI、性能或安全验证结果
+- 依赖: TASK-808
+
+### TASK-810: 协议解析 fuzz、长会话 soak 与资源上限 ✅（commit `588104e`）
+- 目标 crate: protocol、model-provider、network-proxy、tools、session、agent-loop
+- 内容: 对 JSONL/Event、SSE、MCP JSON-RPC、URL/HTTP 代理头和插件 manifest 做 fuzz；对长事件流、反复压缩、SQLite 重建、代理连接与超时工具做 soak/资源上限测试
+- 验收标准:
+  1. 每个不可信解析边界至少一个 fuzz target；固定崩溃样本进入回归 fixtures
+  2. 10 万级事件重放/投影、连续压缩与重连测试无序号缺口、无 tool 配对破坏、内存增长有上限报告
+  3. 代理连接数、worker 线程、spill 总量和分离任务均有硬上限；超限返回稳定码并留审计事件
+- 明确不做: 不把 fuzz 随机性带入普通单元测试；不承诺未测平台；不新增运行时外部依赖（允许独立 CI 开发工具）
+- 依赖: TASK-801、TASK-802、TASK-805
+
+### P8 建议执行顺序
+
+- **安全串行链**：801 → 802
+- **产品/一致性并行组**：803、804、805、806（涉及 protocol 的卡仍必须互斥执行）
+- **发布证据链**：807 → 808 → 809；810 可在 807 后并行
+- **P8 出口判据**：801~810 全部完成；真实 CLI 端到端通过；Windows/Linux 远程 CI 全绿；README、版本和生产能力一致
+
+## 十一、质量门禁演进（随阶段收紧）
 
 | 门禁 | P0 现在 | P1 起 | P2 起 | P3 起 |
 |---|---|---|---|---|
@@ -285,16 +400,17 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 | 属性测试 | — | — | — | 配对完整性必须 |
 | 审计事件覆盖 | — | — | 网络拒绝必须落事件 | 自动压缩必须落事件 |
 
-## 十一、规范自身的演进规则
+## 十二、规范自身的演进规则
 
 1. 改 `DEVELOPMENT.md`/`AGENTS.md` 的 PR 必须在标题加 `[spec]` 前缀，人工 review
 2. 新 crate 入册：PR 同时更新所有权地图（AGENTS.md §1）与本文档依赖图
 3. 任务卡完成后：在本文件对应卡片打 ✅ 并附 PR 链接，禁止删除历史卡片
 4. 阶段出口评审：人类守护者按「出口判据」逐条打勾后才开下一阶段的卡
 
-## 十二、给协调者的并行调度建议
+## 十三、给协调者的并行调度建议
 
 - **可并行组**：{102, 104} 与 {201} 与 {403} 互不触碰
 - **P7 并行组**：{701, 703, 705, 706} 可并行；{702 → 704} 是 protocol 串行链，必须一张卡走到底
+- **P8 调度**：先 801 → 802；再并行 {803, 804, 805, 806}（protocol 卡互斥）；最后 807 → 808 → 809，810 可在 807 后并行
 - **串行链**：101 → 103 → 303（协议→闭环→自愈，一条线一个人/代理跟到底）
 - 每个智能体会话结束必须产出 AGENTS.md §6 汇报；连续两次汇报缺测试证据的智能体暂停派卡

@@ -3,6 +3,27 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，
 版本号遵循语义化版本（SemVer）。
 
+## [0.9.0] - 2026-08-30
+
+P8「安全与产品化收口」达成：SSRF 闭环、可取消工具、生产装配、CAS 文件写入、
+原子 batch、记忆预算、供应链门禁、端到端验收、fuzz/soak 与资源上限。
+
+### Added
+
+- **network-proxy（TASK-801）**：DNS 解析后目标钉扎——校验全部解析结果（loopback/RFC1918/CGNAT/link-local/组播/保留段，含 IPv4-mapped IPv6），仅连接已校验 SocketAddr；明文转发校验 Host 头与目标一致性；拒绝原因结构化入审计事件
+- **protocol/tools/sandbox-exec/agent-loop（TASK-802）**：deadline 升级为可确认取消——CancellationToken 在提交点拦住副作用；外部命令超时终止进程树（Windows Job Object KILL_ON_JOB_CLOSE / Linux killpg），终止失败 fail-closed；ToolExecutionTerminated 结构化留痕；registry 支持全局默认 deadline
+- **tools/harness-cli（TASK-803）**：生产 chat 装配 FsToolSet/--workspace/--plugin-root/结果中间件/循环防护默认值；/tools 与模型广告反映实际能力；/steer 命令
+- **protocol/tools（TASK-804）**：fs_read 返回内容摘要；覆盖写强制 expected_hash，漂移返回稳定 FileRevisionConflict；写入走同目录临时文件 + sync + 原子 rename
+- **session/agent-loop（TASK-805）**：SessionStore 原子 append_batch（JSONL 回滚日志实现整批全有或全无）；Team 任务事件与写范围冲突审计不可分割提交
+- **protocol/session/tools/harness-cli（TASK-806）**：记忆作用域（LineageOnly）与来源（Model/Host）可审计；MemoryRevoked 幂等撤销；单条/总量/注入预算 fail-closed
+- **.github（TASK-807）**：CI 全分支触发、--all-features 硬门禁、MSRV 1.85 job、cargo-deny 供应链检查（deny.toml 可复现）
+- **tests（TASK-808）**：scripted 端到端代码任务（生产装配 + CAS + 受限 exec + 审批审计）；真实模型冒烟规程 tests/manual/p8-smoke.md
+- **crates（TASK-810）**：五大解析边界确定性 fuzz target；15 万事件 soak（seq 连续/配对/投影/分页）；spill 总量预算、registry 分离任务上限、代理并发上限均 fail-closed 留审计
+
+### Changed
+
+- **workspace（TASK-809）**：版本 0.2.0 → 0.9.0（对齐路线图）；README 能力声明与生产装配一致
+
 ## [Unreleased]
 
 ### Fixed
