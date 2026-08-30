@@ -7,6 +7,12 @@
 
 ### Added
 
+- **tools/harness-cli（TASK-701）**：内置文件工具集 `fs_read/fs_write/fs_edit/fs_glob/fs_grep`——以 canonical 工作区根为信任边界（symlink 拒绝 + 词法穿越栅栏），覆盖写与编辑强制 read-before-write，超大文件与超限结果集全文落 `.harness/spill`、结果仅带预览 + 可被 `fs_read` 取回的 locator
+- **tools/model-provider/harness-cli（TASK-703）**：`web_fetch` 工具——仅 http/https、私网/回环主机一律拒绝（SSRF）、主机白名单默认拒绝、重定向逐跳复检、内容超限 spill；物理出网由 `Fetcher` 抽象承载，生产实现经本地 CONNECT 白名单代理（`http_fetch_via_proxy`：禁自动重定向、硬字节上限、仅回环代理）
+- **protocol/tools/agent-loop（TASK-702）**：新增 `ToolTimeout`/`ToolLoopDetected` 稳定错误码；`ToolSpec.timeout_ms` 为单次工具执行设 deadline（独立线程限时等待，超时不取消底层副作用）；agent-loop 可选 `LoopGuard` 对同一工具连续等参调用先在结果中附提醒、达到上限后不再触发 handler 并以稳定码拒绝，未配置时行为与既有完全一致
+- **protocol/agent-loop/session（TASK-704）**：`UserInputQueued` 事件承载 turn 运行中入队的 steer 输入；模型表面投影将其视同 User 消息并在工具批次未闭合时延迟出账以保住配对；agent-loop 以持久游标在每个采样轮边界吸收排队输入，跨 turn 残留由下一 turn 接管，resume 与在线视图一致
+- **protocol/session/tools/agent-loop/harness-cli（TASK-705）**：`MemoryRecorded` 事件存储跨会话记忆（同 id 后写覆盖），`MemoryContextInjected` 事件把记忆摘要以加法式系统消息送入模型表面；`memory_write` 工具经 `ToolAudit::MemoryRecorded` 由 agent-loop 落事件；CLI 注入幂等，resume 重建与在线视图一致
+- **sandbox-exec（TASK-706，libc 仅 Linux target）**：Linux Landlock 生产后端——子进程 `PR_SET_NO_NEW_PRIVS` 后按 ABI v1 声明全盘只读+执行、WorkspaceWrite 档额外授予工作区根全量文件权，未声明访问默认拒绝，无 Landlock 内核 fail-closed 不降级；`PlatformRestrictedBackend` 在 Linux 组合该后端
 - **tools/agent-loop/harness-cli（TASK-607，D17）**：新增可信插件目录（`.harness/plugins/*/manifest.json`）与工具结果安全中间件；manifest 声明 payload 哈希与工具能力，未知字段拒绝，路径逃逸/哈希漂移/未声明能力在注册与调度两个时点 fail-closed，坏插件被隔离而不遮蔽好插件；工具结果进模型表面前可检查、脱敏或拒绝，插件来源结果在中间件缺席或失败时 fail-closed 并经 `ToolResultAdded` 留痕
 - **protocol/session/agent-loop/harness-cli（TASK-601）**：新增唯一 Model Surface 契约与事件投影；模型工具调用批次和压缩 replace-prefix/source seq 可忠实重放，Hook 等纯审计调用不会混入 resume 上下文；旧 JSONL 保持可读
 - **protocol/context/model-provider/agent-loop（TASK-602）**：新增可重放根 Token 预算与 usage 事件账本；provider usage 优先、启发式兜底，主代理和两层 subagent 用量按 agent path 汇总 own/subtree，耗尽后在下一次 provider/runner 调用前拒绝
