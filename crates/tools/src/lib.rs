@@ -3,6 +3,7 @@
 
 mod advertisement;
 mod mcp;
+mod mcp_registry;
 mod schema;
 mod skills;
 
@@ -11,6 +12,10 @@ use serde::{Deserialize, Serialize};
 
 pub use advertisement::EscalationAvailability;
 pub use mcp::{McpCallResult, McpClient, McpServerConfig, McpTool};
+pub use mcp_registry::{
+    McpFailureStage, McpRegistration, McpRegistry, McpServiceFailure, McpServiceRequirement,
+    McpServiceSnapshot, McpServiceStatus, McpToolHandle,
+};
 pub use schema::validate_args;
 pub use skills::{SkillCatalog, SkillRefresh, VerifiedSkill, VerifiedSkillScope};
 

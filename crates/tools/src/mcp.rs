@@ -3,11 +3,15 @@
 use protocol::{ErrorCode, ErrorEnvelope};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::Duration;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
+const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_MCP_WIRE_BYTES: usize = 17 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServerConfig {
@@ -79,15 +83,26 @@ pub struct McpClient {
     source: String,
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    responses: Receiver<Result<Value, String>>,
     tools: BTreeMap<String, McpTool>,
     next_id: u64,
     max_output_bytes: usize,
+    response_timeout: Duration,
 }
 
 impl McpClient {
     pub fn connect(config: McpServerConfig) -> Result<Self, ErrorEnvelope> {
+        Self::connect_with_timeout(config, DEFAULT_RESPONSE_TIMEOUT)
+    }
+
+    pub fn connect_with_timeout(
+        config: McpServerConfig,
+        response_timeout: Duration,
+    ) -> Result<Self, ErrorEnvelope> {
         config.validate()?;
+        if response_timeout.is_zero() {
+            return Err(args_error("MCP response timeout must be greater than zero"));
+        }
         let mut child = Command::new(&config.program)
             .args(&config.args)
             .stdin(Stdio::piped())
@@ -103,14 +118,16 @@ impl McpClient {
             .stdout
             .take()
             .ok_or_else(|| internal("MCP server stdout unavailable"))?;
+        let responses = spawn_response_reader(stdout);
         let mut client = Self {
             source: config.source,
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            responses,
             tools: BTreeMap::new(),
             next_id: 1,
             max_output_bytes: config.max_output_bytes,
+            response_timeout,
         };
         client.initialize()?;
         client.discover_tools()?;
@@ -266,19 +283,79 @@ impl McpClient {
     }
 
     fn read_message(&mut self) -> Result<Value, ErrorEnvelope> {
-        let mut line = String::new();
-        let read = self
-            .stdout
-            .read_line(&mut line)
-            .map_err(|error| internal(format!("failed to read MCP response: {error}")))?;
-        if read == 0 {
-            let status = self.child.try_wait().ok().flatten();
-            return Err(internal(format!(
-                "MCP server exited before response: {status:?}"
-            )));
+        match self.responses.recv_timeout(self.response_timeout) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(message)) => {
+                let status = self.child.try_wait().ok().flatten();
+                Err(internal(format!("{message}; process status: {status:?}")))
+            }
+            Err(RecvTimeoutError::Timeout) => Err(internal(
+                "MCP response exceeded the configured grace period",
+            )),
+            Err(RecvTimeoutError::Disconnected) => {
+                Err(internal("MCP response reader disconnected"))
+            }
         }
-        serde_json::from_str(&line)
-            .map_err(|error| internal(format!("invalid MCP JSON response: {error}")))
+    }
+}
+
+fn spawn_response_reader(stdout: ChildStdout) -> Receiver<Result<Value, String>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_bounded_line(&mut reader, MAX_MCP_WIRE_BYTES) {
+                Ok(None) => {
+                    let _ = sender.send(Err("MCP server exited before response".into()));
+                    break;
+                }
+                Ok(Some(line)) => {
+                    let response = String::from_utf8(line)
+                        .map_err(|error| format!("MCP response is not UTF-8: {error}"))
+                        .and_then(|line| {
+                            serde_json::from_str(&line)
+                                .map_err(|error| format!("invalid MCP JSON response: {error}"))
+                        });
+                    if sender.send(response).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(format!("failed to read MCP response: {error}")));
+                    break;
+                }
+            }
+        }
+    });
+    receiver
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if line.len().saturating_add(take) > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "MCP response exceeds the hard wire-size limit",
+            ));
+        }
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if line.last() == Some(&b'\n') {
+            return Ok(Some(line));
+        }
     }
 }
 
@@ -328,4 +405,29 @@ fn args_error(message: impl Into<String>) -> ErrorEnvelope {
 
 fn internal(message: impl Into<String>) -> ErrorEnvelope {
     ErrorEnvelope::new(ErrorCode::Internal, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn response_reader_enforces_hard_limit_before_unbounded_allocation() {
+        let mut allowed = Cursor::new(b"1234\n5678\n".to_vec());
+        assert_eq!(
+            read_bounded_line(&mut allowed, 5).unwrap().unwrap(),
+            b"1234\n"
+        );
+        assert_eq!(
+            read_bounded_line(&mut allowed, 5).unwrap().unwrap(),
+            b"5678\n"
+        );
+
+        let mut oversized = Cursor::new(b"123456\n".to_vec());
+        assert_eq!(
+            read_bounded_line(&mut oversized, 5).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 }

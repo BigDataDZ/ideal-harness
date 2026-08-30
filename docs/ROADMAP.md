@@ -186,14 +186,14 @@
 - 明确不做: 不实现计费；不按 message 文本推断错误；不允许子策略扩大根预算
 - 依赖: TASK-601
 
-### TASK-603: 权限 epoch 与执行环境事实 ✅（完成，提交见 git 历史）
+### TASK-603: 权限 epoch 与执行环境事实 ✅（commit `05d9df5`）
 - 目标 crate: protocol ⚠️串行、sandbox-policy、sandbox-exec、approval、tools
 - 内容: 审批绑定 policy epoch、权限配置摘要和 executor OS/home/workspace facts；状态变化使旧授权失效
 - 验收标准: policy/workspace/target 任一变化后旧决定不可复用；未知或过期环境 fail-closed；授权与失效均留 Event
 - 明确不做: 不实现远程执行协议；不缓存凭据；不改变 SandboxMode 三档语义
 - 依赖: TASK-602
 
-### TASK-604: 受监管 MCP registry
+### TASK-604: 受监管 MCP registry ✅（完成，提交见 git 历史）
 - 目标 crate: tools、agent-loop
 - 内容: required/optional 服务状态机、发现宽限、connection generation、结构化错误、按工具输出限制与安全结果中间件
 - 验收标准: optional 超时可降级而 required 失败拒绝启动；旧 generation 调用被拒；单服务失败不隐藏其他有效目录

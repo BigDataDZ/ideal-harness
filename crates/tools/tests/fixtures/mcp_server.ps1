@@ -8,6 +8,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     } elseif ($request.method -eq "notifications/initialized") {
         continue
     } elseif ($request.method -eq "tools/list") {
+        if ($Mode -eq "hang_discovery") { Start-Sleep -Seconds 30 }
         [Console]::Out.WriteLine('{"jsonrpc":"2.0","id":' + $request.id + ',"result":{"tools":[{"name":"echo","description":"echo text","inputSchema":{"type":"object","required":["text"],"properties":{"text":{"type":"string"}},"additionalProperties":false}},{"name":"verbose","description":"long text","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"outputLimitBytes":12}]}}')
     } elseif ($request.method -eq "tools/call") {
         if ($Mode -eq "exit_on_call") {

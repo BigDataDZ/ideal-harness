@@ -4,7 +4,7 @@ use crate::{AgentLoop, HookContext, HookPoint};
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use session::SpillStore;
 use std::path::{Path, PathBuf};
-use tools::{McpCallResult, McpClient};
+use tools::{McpCallResult, McpClient, McpRegistry, McpToolHandle};
 
 #[derive(Debug, Clone)]
 pub struct McpInvocation {
@@ -54,15 +54,49 @@ impl AgentLoop<'_> {
         client: &mut McpClient,
         invocation: &McpInvocation,
     ) -> Result<ToolOutcome, ErrorEnvelope> {
+        let source = client.source().to_string();
+        self.run_mcp_tool_with(&source, invocation, || {
+            client.call(&invocation.tool, &invocation.arguments)
+        })
+    }
+
+    /// 通过受监管 registry 执行；handle 的 generation 会在真正调用前校验。
+    pub fn run_registered_mcp_tool(
+        &mut self,
+        registry: &mut McpRegistry,
+        handle: &McpToolHandle,
+        invocation: &McpInvocation,
+    ) -> Result<ToolOutcome, ErrorEnvelope> {
+        let source = handle.source.clone();
+        self.run_mcp_tool_with(&source, invocation, || {
+            if invocation.tool != handle.name {
+                return Err(ErrorEnvelope::new(
+                    ErrorCode::ToolArgsInvalid,
+                    "MCP invocation tool does not match the managed handle",
+                ));
+            }
+            registry.call(handle, &invocation.arguments)
+        })
+    }
+
+    fn run_mcp_tool_with<F>(
+        &mut self,
+        source: &str,
+        invocation: &McpInvocation,
+        call: F,
+    ) -> Result<ToolOutcome, ErrorEnvelope>
+    where
+        F: FnOnce() -> Result<McpCallResult, ErrorEnvelope>,
+    {
         append(
             self.session,
             Event::ToolCallRequested {
                 call_id: invocation.call_id.clone(),
-                tool: format!("mcp:{}:{}", client.source(), invocation.tool),
+                tool: format!("mcp:{source}:{}", invocation.tool),
                 args: invocation.arguments.clone(),
             },
         )?;
-        let tool_name = format!("mcp:{}:{}", client.source(), invocation.tool);
+        let tool_name = format!("mcp:{source}:{}", invocation.tool);
         if let Err(error) = self.execute_hook(HookContext::tool(
             HookPoint::PreToolUse,
             None,
@@ -90,7 +124,7 @@ impl AgentLoop<'_> {
             return self.finish_failed_mcp_hook(invocation, &tool_name, error);
         }
 
-        let result = match client.call(&invocation.tool, &invocation.arguments) {
+        let result = match call() {
             Ok(result) => result,
             Err(error) => {
                 append_failure(self.session, &invocation.call_id, &error)?;

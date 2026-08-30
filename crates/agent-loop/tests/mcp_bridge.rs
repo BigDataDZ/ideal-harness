@@ -2,7 +2,10 @@ use agent_loop::{AgentLoop, McpInvocation, ModelProvider};
 use protocol::{ErrorCode, ErrorEnvelope, Event, ToolOutcome};
 use session::{replay, JsonlSession, SpillLocator, SpillStore};
 use std::path::PathBuf;
-use tools::{McpClient, McpServerConfig, ToolRegistry};
+use std::time::Duration;
+use tools::{
+    McpClient, McpRegistration, McpRegistry, McpServerConfig, McpServiceRequirement, ToolRegistry,
+};
 
 struct Unused;
 
@@ -132,4 +135,46 @@ fn rejection_protocol_error_and_child_exit_each_leave_complete_pair() {
         }
         let _ = std::fs::remove_file(session_path);
     }
+}
+
+#[test]
+fn managed_mcp_rejects_stale_generation_and_keeps_complete_pair() {
+    let session_path = tmp("stale-generation.jsonl");
+    let spill_root = tmp("stale-generation-spill");
+    let _ = std::fs::remove_file(&session_path);
+    let mut managed = McpRegistry::start(vec![McpRegistration {
+        config: config("normal"),
+        requirement: McpServiceRequirement::Required,
+        discovery_grace: Duration::from_secs(5),
+    }])
+    .unwrap();
+    let stale = managed.tool("fixture", "echo").unwrap().clone();
+    managed.refresh("fixture").unwrap();
+
+    let mut session = JsonlSession::create(session_path.clone()).unwrap();
+    let tools = ToolRegistry::default();
+    let mut agent = AgentLoop::new(&mut session, &tools, &Unused);
+    let invocation = McpInvocation::new(
+        "mcp-stale",
+        "echo",
+        serde_json::json!({ "text": "x" }),
+        true,
+        spill_root,
+    )
+    .unwrap();
+    let error = agent
+        .run_registered_mcp_tool(&mut managed, &stale, &invocation)
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ToolArgsInvalid);
+
+    let events = replay(&session_path).unwrap();
+    assert_eq!(events.len(), 3);
+    assert!(matches!(
+        events[2].event,
+        Event::ToolResultAdded {
+            outcome: ToolOutcome::Failure { .. },
+            ..
+        }
+    ));
+    let _ = std::fs::remove_file(session_path);
 }

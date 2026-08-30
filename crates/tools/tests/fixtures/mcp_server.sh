@@ -8,6 +8,7 @@ while IFS= read -r line; do
       printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{},"serverInfo":{"name":"fixture","version":"1"}}}\n' "$id" ;;
     *'"method":"notifications/initialized"'*) ;;
     *'"method":"tools/list"'*)
+      [ "$mode" = "hang_discovery" ] && sleep 30
       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo text","inputSchema":{"type":"object","required":["text"],"properties":{"text":{"type":"string"}},"additionalProperties":false}},{"name":"verbose","description":"long text","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"outputLimitBytes":12}]}}\n' "$id" ;;
     *'"method":"tools/call"'*)
       if [ "$mode" = "exit_on_call" ]; then
