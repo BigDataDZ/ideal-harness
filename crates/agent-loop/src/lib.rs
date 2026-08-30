@@ -23,8 +23,10 @@ pub use subagent::{SubagentReport, SubagentRunner, SubagentTask, SubagentTrace};
 pub use subagent_lifecycle::{SubagentCancellation, SubagentDelegation};
 pub use subagent_policy::{SubagentPolicy, SubagentRequest};
 
-use protocol::{ErrorCode, ErrorEnvelope, Event, ModelToolCall, ToolOutcome};
+use context::{BudgetLedger, TokenMeter, TokenSource};
+use protocol::{ErrorCode, ErrorEnvelope, Event, ModelToolCall, TokenUsageSource, ToolOutcome};
 use session::SessionStore;
+use std::collections::BTreeSet;
 use tools::{ToolAudit, ToolExecution, ToolRegistry};
 
 use model_provider::ChatMessage;
@@ -94,6 +96,7 @@ struct ChatTurnConfig<'a> {
     external_events: Option<&'a dyn Fn() -> Vec<Event>>,
     overflow_recovery: Option<OverflowRecovery<'a>>,
     hooks: Option<&'a HookRegistry>,
+    agent_path: &'a [String],
 }
 
 pub struct AgentLoop<'a> {
@@ -119,6 +122,8 @@ pub struct AgentLoop<'a> {
     pub overflow_recovery: Option<OverflowRecovery<'a>>,
     /// TASK-503：同步生命周期 Hook；注册表本身不持有 session 写能力。
     pub hooks: Option<&'a HookRegistry>,
+    /// TASK-602：从根到当前代理的稳定身份路径；usage 通过它归集到所有祖先。
+    agent_path: Vec<String>,
 }
 
 impl<'a> AgentLoop<'a> {
@@ -141,6 +146,7 @@ impl<'a> AgentLoop<'a> {
             external_events: None,
             overflow_recovery: None,
             hooks: None,
+            agent_path: vec!["root".into()],
         }
     }
 
@@ -165,7 +171,50 @@ impl<'a> AgentLoop<'a> {
             external_events: None,
             overflow_recovery: None,
             hooks: None,
+            agent_path: vec!["root".into()],
         }
+    }
+
+    /// 配置或幂等恢复根预算。已有会话中的预算不可被改写。
+    pub fn configure_root_token_budget(
+        &mut self,
+        root_agent_id: impl Into<String>,
+        token_budget: u64,
+    ) -> Result<(), ErrorEnvelope> {
+        let root_agent_id = root_agent_id.into();
+        let events = self.session.replay_events().map_err(session_replay_error)?;
+        let ledger = BudgetLedger::replay(&events)?;
+        let candidate = Event::TokenBudgetConfigured {
+            root_agent_id: root_agent_id.clone(),
+            token_budget,
+        };
+        let mut checked = ledger.clone();
+        checked.apply(&candidate)?;
+        if ledger.token_budget().is_none() {
+            self.session
+                .append(candidate)
+                .map_err(session_append_error)?;
+        }
+        self.agent_path = vec![root_agent_id];
+        Ok(())
+    }
+
+    /// 子代理显式继承完整 lineage；空白、环或与已配置根不一致均拒绝。
+    pub fn set_agent_path(&mut self, agent_path: Vec<String>) -> Result<(), ErrorEnvelope> {
+        validate_agent_path(&agent_path)?;
+        let events = self.session.replay_events().map_err(session_replay_error)?;
+        let ledger = BudgetLedger::replay(&events)?;
+        if ledger
+            .root_agent_id()
+            .is_some_and(|root| root != agent_path[0])
+        {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::Internal,
+                "agent path does not inherit the configured root",
+            ));
+        }
+        self.agent_path = agent_path;
+        Ok(())
     }
 
     /// TASK-404：在进程内运行隔离子代理，只把最终 report 成对回传父事件流。
@@ -268,17 +317,30 @@ impl<'a> AgentLoop<'a> {
                         external_events: self.external_events,
                         overflow_recovery: self.overflow_recovery,
                         hooks: self.hooks,
+                        agent_path: &self.agent_path,
                     },
                     &mut self.chat_history,
                     turn_id,
                     &text,
                 ),
                 _ => {
-                    self.session.append(Event::UserMessage { text }).ok();
-                    self.model.complete("").map(|reply| {
+                    self.session
+                        .append(Event::UserMessage { text: text.clone() })
+                        .ok();
+                    let result = ensure_budget_allows_sample(self.session)
+                        .and_then(|_| self.model.complete(&text));
+                    result.and_then(|reply| {
+                        record_usage(
+                            self.session,
+                            &self.agent_path,
+                            format!("turn-{turn_id}-legacy"),
+                            None,
+                            &[text.as_str(), reply.as_str()],
+                        )?;
                         self.session
                             .append(Event::AssistantMessage { text: reply })
-                            .ok();
+                            .map(|_| ())
+                            .map_err(session_append_error)
                     })
                 }
             };
@@ -335,6 +397,7 @@ impl<'a> AgentLoop<'a> {
         for round in 0..cfg.max_tool_rounds {
             let mut overflow_retries = 0;
             let reply = loop {
+                ensure_budget_allows_sample(session)?;
                 let reply = chat.stream_chat(cfg.spec, history, cfg.tool_definitions);
                 if let Some(source) = cfg.external_events {
                     for event in source() {
@@ -364,6 +427,20 @@ impl<'a> AgentLoop<'a> {
                     other => break other?,
                 }
             };
+
+            let mut visible = history
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>();
+            visible.push(reply.text.as_str());
+            visible.extend(reply.tool_calls.iter().map(|call| call.arguments.as_str()));
+            record_usage(
+                session,
+                cfg.agent_path,
+                format!("turn-{turn_id}-sample-{round}"),
+                reply.usage.map(|usage| usage.total_tokens),
+                &visible,
+            )?;
 
             if !reply.text.is_empty() {
                 session
@@ -592,6 +669,67 @@ impl<'a> AgentLoop<'a> {
     }
 }
 
+fn ensure_budget_allows_sample(session: &dyn SessionStore) -> Result<(), ErrorEnvelope> {
+    let events = session.replay_events().map_err(session_replay_error)?;
+    BudgetLedger::replay(&events)?.ensure_can_sample()
+}
+
+fn record_usage(
+    session: &mut dyn SessionStore,
+    agent_path: &[String],
+    usage_id: String,
+    provider_total: Option<u64>,
+    visible_segments: &[&str],
+) -> Result<(), ErrorEnvelope> {
+    validate_agent_path(agent_path)?;
+    let measurement = TokenMeter::default().measure(provider_total, visible_segments);
+    let event = Event::TokenUsageRecorded {
+        usage_id,
+        agent_path: agent_path.to_vec(),
+        total_tokens: measurement.usage.total,
+        source: match measurement.source {
+            TokenSource::ProviderUsage => TokenUsageSource::Provider,
+            TokenSource::Heuristic => TokenUsageSource::Heuristic,
+        },
+    };
+    let events = session.replay_events().map_err(session_replay_error)?;
+    let mut ledger = BudgetLedger::replay(&events)?;
+    ledger.apply(&event)?;
+    session
+        .append(event)
+        .map(|_| ())
+        .map_err(session_append_error)
+}
+
+fn validate_agent_path(agent_path: &[String]) -> Result<(), ErrorEnvelope> {
+    let mut seen = BTreeSet::new();
+    if agent_path.is_empty()
+        || agent_path
+            .iter()
+            .any(|agent| agent.trim().is_empty() || !seen.insert(agent))
+    {
+        return Err(ErrorEnvelope::new(
+            ErrorCode::Internal,
+            "agent path must be non-empty, non-blank and acyclic",
+        ));
+    }
+    Ok(())
+}
+
+fn session_replay_error(error: std::io::Error) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorCode::Internal,
+        format!("failed to replay token budget ledger: {error}"),
+    )
+}
+
+fn session_append_error(error: std::io::Error) -> ErrorEnvelope {
+    ErrorEnvelope::new(
+        ErrorCode::Internal,
+        format!("failed to append token budget event: {error}"),
+    )
+}
+
 fn execute_hook(
     hooks: Option<&HookRegistry>,
     context: HookContext,
@@ -610,6 +748,7 @@ mod tests {
     use protocol::{ErrorEnvelope, SequencedEvent};
     use session::JsonlSession;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     struct Echo;
@@ -685,9 +824,9 @@ mod tests {
         assert_eq!(lp.run_turn(), 1);
         assert_eq!(lp.phase, Phase::Idle);
 
-        // started / user / assistant / completed
+        // started / user / usage / assistant / completed
         let evs = events(&path);
-        assert_eq!(evs.len(), 4);
+        assert_eq!(evs.len(), 5);
         assert_eq!(
             evs.last().unwrap().event,
             Event::TurnCompleted { turn_id: 0 }
@@ -705,7 +844,7 @@ mod tests {
         assert_eq!(lp.phase, Phase::Idle);
         drop(lp);
 
-        assert_eq!(memory.events.len(), 4);
+        assert_eq!(memory.events.len(), 5);
         assert_eq!(
             memory.events.last().unwrap().event,
             Event::TurnCompleted { turn_id: 0 }
@@ -802,6 +941,7 @@ mod tests {
                     name: "echo".into(),
                     arguments: r#"{"text":"hi"}"#.into(),
                 }],
+                usage: None,
             })
         }
     }
@@ -815,6 +955,7 @@ mod tests {
                 name: "echo".into(),
                 arguments: r#"{"text":"hi"}"#.into(),
             }],
+            usage: None,
         }
     }
 
@@ -823,6 +964,7 @@ mod tests {
             text: "结果是 hi".into(),
             finish_reason: Some("stop".into()),
             tool_calls: vec![],
+            usage: None,
         }
     }
 
@@ -831,6 +973,7 @@ mod tests {
             text: "r2".into(),
             finish_reason: Some("stop".into()),
             tool_calls: vec![],
+            usage: None,
         }
     }
 
@@ -866,6 +1009,8 @@ mod tests {
             Event::ToolResultAdded { .. } => "tool_result_added",
             Event::ModelToolCallsRequested { .. } => "model_tool_calls_requested",
             Event::CompactionApplied { .. } => "compaction",
+            Event::TokenBudgetConfigured { .. } => "token_budget_configured",
+            Event::TokenUsageRecorded { .. } => "token_usage_recorded",
             Event::ApprovalDecided { .. } => "approval",
             Event::NetworkAccessDenied { .. } => "network_access_denied",
             Event::SubagentStarted { .. } => "subagent_started",
@@ -902,16 +1047,18 @@ mod tests {
             vec![
                 "turn_started",
                 "user_message",
+                "token_usage_recorded",
                 "model_chunk", // 第 1 轮采样文本留痕
                 "model_tool_calls_requested",
                 "tool_call_requested",
                 "tool_result_added", // 与调用严格配对
+                "token_usage_recorded",
                 "model_chunk",       // 第 2 轮采样文本
                 "assistant_message", // 最终文本答复
                 "turn_completed",
             ]
         );
-        match &evs[5].event {
+        match &evs[6].event {
             Event::ToolResultAdded { outcome, .. } => match outcome {
                 ToolOutcome::Success { value } => assert_eq!(value, "hi"),
                 other => panic!("expected success outcome, got {other:?}"),
@@ -976,6 +1123,7 @@ mod tests {
                     name: "nope".into(),
                     arguments: "{}".into(),
                 }],
+                usage: None,
             },
             text_reply(),
         ]));
@@ -984,7 +1132,7 @@ mod tests {
         assert_eq!(lp.run_turn(), 1);
 
         let evs = events(&path);
-        match &evs[4].event {
+        match &evs[5].event {
             Event::ToolResultAdded { outcome, .. } => match outcome {
                 ToolOutcome::Failure { error } => {
                     assert_eq!(error.code, ErrorCode::ToolArgsInvalid)
@@ -1015,6 +1163,7 @@ mod tests {
                     name: "echo".into(),
                     arguments: "{oops".into(),
                 }],
+                usage: None,
             },
             text_reply(),
         ]));
@@ -1023,7 +1172,7 @@ mod tests {
         assert_eq!(lp.run_turn(), 1);
 
         let evs = events(&path);
-        match &evs[4].event {
+        match &evs[5].event {
             Event::ToolResultAdded { outcome, .. } => match outcome {
                 ToolOutcome::Failure { error } => {
                     assert_eq!(error.code, ErrorCode::ToolArgsInvalid)
@@ -1058,6 +1207,64 @@ mod tests {
         assert_eq!(seen[1][1], ChatMessage::assistant("结果是 hi"));
         assert_eq!(seen[1][2], ChatMessage::user("b"));
         std::fs::remove_file(&path).ok();
+    }
+
+    struct UsageModel<'a>(&'a AtomicUsize);
+
+    impl ChatModel for UsageModel<'_> {
+        fn stream_chat(
+            &self,
+            _: &ModelCallSpec,
+            _: &[ChatMessage],
+            _: Option<&serde_json::Value>,
+        ) -> Result<ChatReply, ErrorEnvelope> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatReply {
+                text: "done".into(),
+                finish_reason: Some("stop".into()),
+                tool_calls: vec![],
+                usage: Some(protocol::ModelTokenUsage { total_tokens: 2 }),
+            })
+        }
+    }
+
+    #[test]
+    fn root_budget_replays_and_rejects_next_sample_before_provider_call() {
+        let path = tmp("root-budget.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let tools = ToolRegistry::default();
+        let first_calls = AtomicUsize::new(0);
+        {
+            let mut session = JsonlSession::create(path.clone()).unwrap();
+            let model = UsageModel(&first_calls);
+            let mut agent = AgentLoop::with_chat(&mut session, &tools, &model, chat_spec());
+            agent.configure_root_token_budget("root", 1).unwrap();
+            agent.inbox.push("first");
+            assert_eq!(agent.run_turn(), 1);
+        }
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+
+        let second_calls = AtomicUsize::new(0);
+        {
+            let mut resumed = JsonlSession::create(path.clone()).unwrap();
+            let model = UsageModel(&second_calls);
+            let mut agent = AgentLoop::with_chat(&mut resumed, &tools, &model, chat_spec());
+            agent.inbox.push("second");
+            assert_eq!(agent.run_turn(), 0);
+        }
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+        let events = session::replay(&path).unwrap();
+        let ledger = BudgetLedger::replay(&events).unwrap();
+        assert_eq!(ledger.root_remaining(), Some(0));
+        assert!(events.iter().any(|record| matches!(
+            record.event,
+            Event::TokenUsageRecorded {
+                total_tokens: 2,
+                source: TokenUsageSource::Provider,
+                ..
+            }
+        )));
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

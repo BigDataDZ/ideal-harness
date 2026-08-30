@@ -82,6 +82,8 @@ fn happy_path_aggregates_deltas_and_finish_reason() {
         "\n\n",
         r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         "\n\n",
+        r#"data: {"choices":[],"usage":{"total_tokens":37}}"#,
+        "\n\n",
         "data: [DONE]\n\n",
     );
     let base = spawn_mock(move |mut stream| {
@@ -94,6 +96,7 @@ fn happy_path_aggregates_deltas_and_finish_reason() {
         .expect("正常路径不应失败");
     assert_eq!(reply.text, "你好, world");
     assert_eq!(reply.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(reply.usage.unwrap().total_tokens, 37);
 }
 
 /// 故障注入 ①：上游接受连接后挂起不响应——300ms 客户端超时必须触发，

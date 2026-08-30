@@ -10,7 +10,7 @@
 use std::io::{BufRead, Read};
 use std::time::Duration;
 
-use protocol::{ErrorCode, ErrorEnvelope, ModelCallSpec, ModelSurfaceMessage};
+use protocol::{ErrorCode, ErrorEnvelope, ModelCallSpec, ModelSurfaceMessage, ModelTokenUsage};
 use serde::{Deserialize, Serialize};
 
 /// API key 的环境变量名（任务卡指定）。
@@ -201,6 +201,7 @@ pub struct StreamDelta {
     pub content: Option<String>,
     pub finish_reason: Option<String>,
     pub tool_calls: Vec<ToolCallFragment>,
+    pub usage: Option<ModelTokenUsage>,
 }
 
 /// 一次流式采样的聚合结果。
@@ -212,6 +213,8 @@ pub struct ChatReply {
     pub finish_reason: Option<String>,
     /// 聚合完成的工具调用请求（按分片 index 重组，arguments 已拼接）。
     pub tool_calls: Vec<ToolCallRequest>,
+    /// provider 未返回 usage 时为 None，由 agent-loop 启发式兜底。
+    pub usage: Option<ModelTokenUsage>,
 }
 
 /// SSE 单行三分类结果（纯解析，无 IO）。
@@ -248,6 +251,7 @@ pub fn extract_delta(data_line: &str) -> Result<StreamDelta, ErrorEnvelope> {
     struct ChunkPayload {
         #[serde(default)]
         choices: Vec<ChunkChoice>,
+        usage: Option<ModelTokenUsage>,
     }
     #[derive(Deserialize)]
     struct ChunkChoice {
@@ -271,6 +275,7 @@ pub fn extract_delta(data_line: &str) -> Result<StreamDelta, ErrorEnvelope> {
                 tool_calls: choice
                     .map(|c| c.delta.tool_calls.clone())
                     .unwrap_or_default(),
+                usage: parsed.usage,
             })
         }
         Err(e) => Err(ErrorEnvelope::new(
@@ -338,6 +343,12 @@ struct ChatRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a serde_json::Value>,
+    stream_options: StreamOptions,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 /// OpenAI 兼容客户端（阻塞式）。Clone 安全：内部仅是连接池句柄与密钥副本。
@@ -475,6 +486,9 @@ impl ChatModel for OpenAiCompatClient {
             stream: true,
             temperature: spec.temperature,
             tools,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
         };
 
         let response = self
@@ -526,6 +540,9 @@ fn consume_sse_stream(response: reqwest::blocking::Response) -> Result<ChatReply
                 }
                 if let Some(f) = delta.finish_reason.filter(|f| !f.is_empty()) {
                     reply.finish_reason = Some(f);
+                }
+                if delta.usage.is_some() {
+                    reply.usage = delta.usage;
                 }
                 for frag in delta.tool_calls {
                     if tool_slots.len() <= frag.index {
@@ -600,6 +617,12 @@ mod tests {
         assert_eq!(d.content, None);
         assert_eq!(d.finish_reason, None);
         assert!(d.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn extract_delta_reads_provider_usage_without_choices() {
+        let delta = extract_delta(r#"{"choices":[],"usage":{"total_tokens":37}}"#).unwrap();
+        assert_eq!(delta.usage, Some(ModelTokenUsage { total_tokens: 37 }));
     }
 
     #[test]

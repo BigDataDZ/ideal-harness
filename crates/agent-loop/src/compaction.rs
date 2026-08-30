@@ -289,6 +289,7 @@ mod tests {
                     text: "recovered".into(),
                     finish_reason: Some("stop".into()),
                     tool_calls: Vec::new(),
+                    usage: None,
                 })
             }
         }

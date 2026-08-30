@@ -1,7 +1,7 @@
 //! P3 / TASK-404：进程内子代理数据模型；内部 trace 与父会话隔离。
 
 use crate::subagent_lifecycle::SubagentCancellation;
-use protocol::{ErrorCode, ErrorEnvelope, Event};
+use protocol::{ErrorCode, ErrorEnvelope, Event, TokenUsageSource};
 
 /// 一次子代理委派。ID 用于父事件流中的稳定配对。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +97,31 @@ impl SubagentTrace {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+
+    /// 记录子代理或其后代的模型用量；生命周期层只提升这种结构化事件。
+    pub fn record_token_usage(
+        &mut self,
+        usage_id: impl Into<String>,
+        agent_path: Vec<String>,
+        total_tokens: u64,
+        source: TokenUsageSource,
+    ) -> Result<(), ErrorEnvelope> {
+        crate::validate_agent_path(&agent_path)?;
+        let usage_id = usage_id.into();
+        if usage_id.trim().is_empty() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::Internal,
+                "subagent token usage id must not be blank",
+            ));
+        }
+        self.events.push(Event::TokenUsageRecorded {
+            usage_id,
+            agent_path,
+            total_tokens,
+            source,
+        });
+        Ok(())
+    }
 }
 
 /// 可注入的进程内子代理执行器；故障测试可在隔离 trace 中制造半截执行。
@@ -113,7 +138,10 @@ pub trait SubagentRunner {
 mod tests {
     use super::*;
     use crate::{AgentLoop, ModelProvider, SubagentPolicy, SubagentRequest};
-    use protocol::{SequencedEvent, SubagentOutcome, SubagentReportDelivery, ToolOutcome};
+    use context::BudgetLedger;
+    use protocol::{
+        SequencedEvent, SubagentOutcome, SubagentReportDelivery, TokenUsageSource, ToolOutcome,
+    };
     use session::JsonlSession;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -333,5 +361,87 @@ mod tests {
             other => panic!("expected failed result event, got {other:?}"),
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    struct NestedUsage;
+
+    impl SubagentRunner for NestedUsage {
+        fn run(
+            &self,
+            _: &SubagentTask,
+            trace: &mut SubagentTrace,
+            _: &SubagentCancellation,
+        ) -> Result<String, ErrorEnvelope> {
+            trace.record_token_usage(
+                "child-sample",
+                vec!["root".into(), "child".into()],
+                20,
+                TokenUsageSource::Provider,
+            )?;
+            trace.record_token_usage(
+                "grand-sample",
+                vec!["root".into(), "child".into(), "grand".into()],
+                30,
+                TokenUsageSource::Heuristic,
+            )?;
+            Ok("budgeted result".into())
+        }
+    }
+
+    #[test]
+    fn nested_subagent_usage_is_promoted_and_rolls_up_to_root() {
+        let path = tmp("nested-usage");
+        std::fs::remove_file(&path).ok();
+        let mut session = JsonlSession::create(path.clone()).unwrap();
+        let tools = ToolRegistry::default();
+        let mut parent = AgentLoop::new(&mut session, &tools, &Unused);
+        parent.configure_root_token_budget("root", 100).unwrap();
+        let task =
+            SubagentTask::with_lineage("budget-task", "measure descendants", "root", "child")
+                .unwrap();
+        parent.run_subagent(&task, &NestedUsage).unwrap();
+
+        let ledger = BudgetLedger::replay(&replay(&path)).unwrap();
+        assert_eq!(ledger.agent_usage("root").subtree_tokens, 50);
+        assert_eq!(ledger.agent_usage("child").own_tokens, 20);
+        assert_eq!(ledger.agent_usage("child").subtree_tokens, 50);
+        assert_eq!(ledger.agent_usage("grand").own_tokens, 30);
+        assert_eq!(ledger.root_remaining(), Some(50));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn exhausted_root_budget_rejects_subagent_before_runner_call() {
+        let path = tmp("budget-reject");
+        std::fs::remove_file(&path).ok();
+        let mut session = JsonlSession::create(path.clone()).unwrap();
+        session
+            .append(Event::TokenBudgetConfigured {
+                root_agent_id: "root".into(),
+                token_budget: 10,
+            })
+            .unwrap();
+        session
+            .append(Event::TokenUsageRecorded {
+                usage_id: "spent".into(),
+                agent_path: vec!["root".into()],
+                total_tokens: 10,
+                source: TokenUsageSource::Provider,
+            })
+            .unwrap();
+        let tools = ToolRegistry::default();
+        let mut parent = AgentLoop::new(&mut session, &tools, &Unused);
+        let task = SubagentTask::new("blocked-child", "must not run").unwrap();
+        let calls = AtomicUsize::new(0);
+        let error = parent
+            .run_subagent(&task, &CountingRunner(&calls))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ContextWindowExceeded);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let events = replay(&path);
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event.event, Event::SubagentStarted { .. })));
+        std::fs::remove_file(path).ok();
     }
 }

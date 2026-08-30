@@ -93,6 +93,20 @@ pub struct ModelSurfaceEntry {
     pub source_event_seqs: Vec<u64>,
 }
 
+/// Token 用量来源：provider 返回值优先，缺失时才允许启发式估算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenUsageSource {
+    Provider,
+    Heuristic,
+}
+
+/// provider 对一次完整采样返回的 Token 用量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelTokenUsage {
+    pub total_tokens: u64,
+}
+
 /// 子代理的闭合终态；Started 必须恰好对应一个 Stopped。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,6 +168,18 @@ pub enum Event {
         /// 被替换表面消息对应的事件序号，按首次出现顺序去重。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         source_event_seqs: Vec<u64>,
+    },
+    /// TASK-602：根预算配置是可重放事实；同一会话只允许幂等重复。
+    TokenBudgetConfigured {
+        root_agent_id: String,
+        token_budget: u64,
+    },
+    /// 每次成功模型采样恰好记录一次；agent_path 从根到实际消费者。
+    TokenUsageRecorded {
+        usage_id: String,
+        agent_path: Vec<String>,
+        total_tokens: u64,
+        source: TokenUsageSource,
     },
     ApprovalDecided {
         call_id: String,
@@ -304,6 +330,26 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
+    }
+
+    #[test]
+    fn token_budget_and_usage_events_roundtrip() {
+        let events = [
+            Event::TokenBudgetConfigured {
+                root_agent_id: "root".into(),
+                token_budget: 1_000,
+            },
+            Event::TokenUsageRecorded {
+                usage_id: "sample-1".into(),
+                agent_path: vec!["root".into(), "child".into()],
+                total_tokens: 37,
+                source: TokenUsageSource::Provider,
+            },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
+        }
     }
 
     #[test]

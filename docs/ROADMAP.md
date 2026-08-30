@@ -169,7 +169,7 @@
 
 ## 八、P6 运行时闭环（v0.7）
 
-### TASK-601: 模型可见历史统一投影 ✅（完成，待提交）
+### TASK-601: 模型可见历史统一投影 ✅（commit `91fe432`）
 - 目标 crate: protocol ⚠️串行、session、model-provider、agent-loop、harness-cli
 - 内容: 区分模型表面事件与纯审计事件；压缩记录确定性的 replace-prefix 操作及来源事件；resume 统一从事件流投影模型历史
 - 验收标准:
@@ -179,7 +179,7 @@
 - 明确不做: 不改变 provider HTTP 协议；不修复历史文件；不新增持久化后端或外部依赖
 - 依赖: TASK-504
 
-### TASK-602: 根预算与子树 Token 用量账本
+### TASK-602: 根预算与子树 Token 用量账本 ✅（完成，待提交）
 - 目标 crate: protocol ⚠️串行、context、agent-loop、session
 - 内容: provider usage 优先、估算兜底；记录 own/subtree/root remaining；嵌套 subagent 消耗归集根预算
 - 验收标准: 主代理与两层子代理消费均落 Event；重放可恢复余额；超限在下一次采样前稳定拒绝且 runner/provider 零调用

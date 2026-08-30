@@ -82,11 +82,13 @@ fn tool_then_text(tool: &str) -> Scripted {
                 name: tool.into(),
                 arguments: "{}".into(),
             }],
+            usage: None,
         },
         ChatReply {
             text: "done".into(),
             finish_reason: Some("stop".into()),
             tool_calls: vec![],
+            usage: None,
         },
     ]))
 }

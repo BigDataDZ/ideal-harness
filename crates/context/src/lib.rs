@@ -1,11 +1,13 @@
 //! P3：token 计量与压缩触发。
 //! 双触发：① 压力阈值主动压缩 ② 溢出错误强制压缩后重试。
 
+mod budget_ledger;
 mod compaction;
 mod token_meter;
 
 use protocol::ErrorCode;
 
+pub use budget_ledger::{AgentTokenUsage, BudgetLedger};
 pub use compaction::{
     safe_prefix_len, CompactionEntry, CompactionKind, CompactionPlan, SummaryProvider,
     ToolResultPruner, TwoStageCompactor,

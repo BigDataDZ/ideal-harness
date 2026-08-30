@@ -2,6 +2,7 @@
 
 use crate::subagent::{SubagentReport, SubagentRunner, SubagentTask, SubagentTrace};
 use crate::subagent_policy::{validate_delegation, SubagentPolicy, SubagentRequest};
+use context::BudgetLedger;
 use protocol::{
     ErrorCode, ErrorEnvelope, Event, SubagentOutcome, SubagentReportDelivery, ToolOutcome,
 };
@@ -96,6 +97,10 @@ pub(crate) fn run(
         append_failure(parent, task, &error)?;
         return Err(error);
     }
+    if let Err(error) = ensure_root_budget(parent) {
+        append_failure(parent, task, &error)?;
+        return Err(error);
+    }
 
     append_parent_event(
         parent,
@@ -112,6 +117,11 @@ pub(crate) fn run(
 
     let mut trace = SubagentTrace::default();
     let result = runner.run(task, &mut trace, delegation.cancellation);
+    if let Err(error) = promote_usage(parent, task, &trace) {
+        append_stopped(parent, task, SubagentOutcome::Failed)?;
+        append_failure(parent, task, &error)?;
+        return Err(error);
+    }
     if let Some(reason) = delegation.cancellation.reason()? {
         return finish_cancelled(parent, task, reason);
     }
@@ -124,6 +134,65 @@ pub(crate) fn run(
             Err(error)
         }
     }
+}
+
+fn ensure_root_budget(parent: &dyn SessionStore) -> Result<(), ErrorEnvelope> {
+    let events = parent.replay_events().map_err(|error| {
+        ErrorEnvelope::new(
+            ErrorCode::Internal,
+            format!("failed to replay parent budget before delegation: {error}"),
+        )
+    })?;
+    BudgetLedger::replay(&events)?.ensure_can_sample()
+}
+
+fn promote_usage(
+    parent: &mut dyn SessionStore,
+    task: &SubagentTask,
+    trace: &SubagentTrace,
+) -> Result<(), ErrorEnvelope> {
+    let usages: Vec<Event> = trace
+        .events()
+        .iter()
+        .filter(|event| matches!(event, Event::TokenUsageRecorded { .. }))
+        .cloned()
+        .collect();
+    if usages.is_empty() {
+        return Ok(());
+    }
+    for event in &usages {
+        let Event::TokenUsageRecorded { agent_path, .. } = event else {
+            unreachable!("filtered token usage events")
+        };
+        let inherits_task = agent_path
+            .windows(2)
+            .any(|pair| pair[0] == task.parent_id() && pair[1] == task.child_id());
+        if !inherits_task {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::Internal,
+                "subagent usage path does not inherit delegated lineage",
+            ));
+        }
+    }
+
+    let mut records = parent.replay_events().map_err(|error| {
+        ErrorEnvelope::new(
+            ErrorCode::Internal,
+            format!("failed to replay parent budget before usage promotion: {error}"),
+        )
+    })?;
+    let next_seq = records.last().map_or(0, |record| record.seq + 1);
+    records.extend(usages.iter().cloned().enumerate().map(|(offset, event)| {
+        protocol::SequencedEvent {
+            seq: next_seq + offset as u64,
+            event,
+        }
+    }));
+    BudgetLedger::replay(&records)?;
+    for event in usages {
+        append_parent_event(parent, event)?;
+    }
+    Ok(())
 }
 
 fn finish_success(
