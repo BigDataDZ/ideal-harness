@@ -26,6 +26,7 @@ pub use timeline::{
 pub use zstd_frames::{migrate_session, replay_auto, replay_zstd, SessionEncoding, ZstdSession};
 
 use protocol::{Event, SequencedEvent};
+use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -35,6 +36,16 @@ use std::path::{Path, PathBuf};
 /// AgentLoop 只依赖追加、序号和物理定位，不感知 JSONL/zstd/投影实现。
 pub trait SessionStore {
     fn append(&mut self, event: Event) -> std::io::Result<SequencedEvent>;
+
+    /// TASK-805：原子批量追加——重放后要么看到整批，要么整批缺席；
+    /// 默认实现退化为逐条追加（覆盖实现必须提供崩溃原子性）。
+    fn append_batch(&mut self, events: Vec<Event>) -> std::io::Result<Vec<SequencedEvent>> {
+        let mut records = Vec::with_capacity(events.len());
+        for event in events {
+            records.push(self.append(event)?);
+        }
+        Ok(records)
+    }
     fn len(&self) -> u64;
     fn path(&self) -> &Path;
     fn replay_events(&self) -> std::io::Result<Vec<SequencedEvent>>;
@@ -51,9 +62,40 @@ pub struct JsonlSession {
     file: File,
 }
 
+/// TASK-805：批量回滚日志路径（`<session>.ih-pending`，内容为批次前的主文件长度）。
+fn pending_batch_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".ih-pending");
+    PathBuf::from(name)
+}
+
+/// 打开时发现残留回滚日志 → 截断回滚整批（崩溃恢复：整批旧状态）。
+fn recover_pending_batch(path: &Path) -> std::io::Result<()> {
+    let pending = pending_batch_path(path);
+    if !pending.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&pending)?;
+    let pre_len: u64 = content.trim().parse().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "corrupt pending batch log")
+    })?;
+    if pre_len == 0 {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+    } else if path.exists() {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(pre_len)?;
+    }
+    fs::remove_file(&pending)?;
+    Ok(())
+}
+
 impl JsonlSession {
-    /// 打开（不存在则创建）。恢复语义 = 重放到末尾后继续追加。
+    /// 打开（不存在则创建）。恢复语义 = 重放到末尾后继续追加；
+    /// 若存在残留批量回滚日志，先整批回滚（TASK-805）。
     pub fn create(path: PathBuf) -> std::io::Result<Self> {
+        recover_pending_batch(&path)?;
         let existing = replay(&path)?.len() as u64;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
@@ -61,6 +103,41 @@ impl JsonlSession {
             next_seq: existing,
             file,
         })
+    }
+
+    /// TASK-805：原子批量追加。
+    /// 流程：记录主文件长度到回滚日志 → 单次写入整批 → fsync → 删除回滚日志。
+    /// 任何一步崩溃，下次打开都会整批回滚——重放只见整批旧状态或整批新状态。
+    fn append_batch_impl(&mut self, events: Vec<Event>) -> std::io::Result<Vec<SequencedEvent>> {
+        let mut records = Vec::with_capacity(events.len());
+        for event in events {
+            let seq = self.next_seq + records.len() as u64;
+            records.push(SequencedEvent { seq, event });
+        }
+        let mut buffer = String::new();
+        for record in &records {
+            buffer.push_str(&serde_json::to_string(record)?);
+            buffer.push('\n');
+        }
+        let pending = pending_batch_path(&self.path);
+        let pre_len = if self.path.exists() {
+            fs::metadata(&self.path)?.len()
+        } else {
+            0
+        };
+        {
+            let mut pending_file = fs::File::create(&pending)?;
+            writeln!(pending_file, "{}", pre_len)?;
+            pending_file.sync_all()?;
+        }
+        if !buffer.is_empty() {
+            self.file.write_all(buffer.as_bytes())?;
+            self.file.flush()?;
+            self.file.sync_all()?;
+        }
+        fs::remove_file(&pending)?;
+        self.next_seq += records.len() as u64;
+        Ok(records)
     }
 
     pub fn append(&mut self, event: Event) -> std::io::Result<SequencedEvent> {
@@ -88,6 +165,10 @@ impl JsonlSession {
 impl SessionStore for JsonlSession {
     fn append(&mut self, event: Event) -> std::io::Result<SequencedEvent> {
         JsonlSession::append(self, event)
+    }
+
+    fn append_batch(&mut self, events: Vec<Event>) -> std::io::Result<Vec<SequencedEvent>> {
+        JsonlSession::append_batch_impl(self, events)
     }
 
     fn len(&self) -> u64 {
@@ -149,6 +230,75 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ih-session-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn batch_append_is_contiguous_and_replays_in_order() {
+        let path = std::env::temp_dir().join(format!("ih-805-batch-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut session = JsonlSession::create(path.clone()).unwrap();
+        let events = vec![
+            Event::UserMessage { text: "a".into() },
+            Event::AssistantMessage { text: "b".into() },
+            Event::UserMessage { text: "c".into() },
+        ];
+        let records = session.append_batch(events).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].seq, 0);
+        assert_eq!(records[1].seq, 1);
+        assert_eq!(records[2].seq, 2);
+        assert_eq!(session.len(), 3);
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.len(), 3);
+        for (sequenced, original) in replayed.iter().zip(records.iter()) {
+            assert_eq!(sequenced, original);
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn pending_batch_log_rolls_back_whole_batch_on_open() {
+        // 模拟崩溃：主文件已含第 1 条 + 整批第二条；回滚日志记录批次前长度
+        let path =
+            std::env::temp_dir().join(format!("ih-805-rollback-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut session = JsonlSession::create(path.clone()).unwrap();
+        session
+            .append(Event::UserMessage {
+                text: "committed".into(),
+            })
+            .unwrap();
+        let pre_len = std::fs::metadata(&path).unwrap().len();
+        session
+            .append(Event::UserMessage {
+                text: "from batch".into(),
+            })
+            .unwrap();
+        // 手工构造：回滚日志指向第 1 条之后，主文件多出批次内容
+        std::fs::write(
+            std::path::PathBuf::from(format!("{}.ih-pending", path.display())),
+            format!("{pre_len}\n"),
+        )
+        .unwrap();
+        drop(session);
+        // 重新打开：整批回滚
+        let mut session = JsonlSession::create(path.clone()).unwrap();
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.len(), 1, "批次必须整体回滚");
+        assert!(matches!(
+            &replayed[0].event,
+            Event::UserMessage { text } if text == "committed"
+        ));
+        assert!(!path.with_extension("jsonl.ih-pending").exists());
+        assert!(!std::path::PathBuf::from(format!("{}.ih-pending", path.display())).exists());
+        // 回滚后可正常继续追加
+        session
+            .append(Event::AssistantMessage {
+                text: "after".into(),
+            })
+            .unwrap();
+        assert_eq!(replay(&path).unwrap().len(), 2);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

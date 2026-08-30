@@ -99,6 +99,10 @@ impl SessionStore for ZstdSession {
         ZstdSession::append(self, event)
     }
 
+    fn append_batch(&mut self, events: Vec<Event>) -> io::Result<Vec<SequencedEvent>> {
+        ZstdSession::append_batch(self, events)
+    }
+
     fn len(&self) -> u64 {
         ZstdSession::len(self)
     }

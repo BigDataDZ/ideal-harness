@@ -67,8 +67,14 @@ impl<'a> TeamCoordinator<'a> {
         task: TeamTask,
     ) -> Result<Vec<TeamWriteScopeConflict>, ErrorEnvelope> {
         let conflicts = self.state.validate_new_task(&task)?;
-        self.append(Event::TeamTaskCreated { task })?;
-        self.append_conflicts(&conflicts)?;
+        // TASK-805：任务事件与冲突审计是不可分割提交——原子批量追加
+        let mut events = vec![Event::TeamTaskCreated { task }];
+        for conflict in &conflicts {
+            events.push(Event::TeamWriteScopeConflictDetected {
+                conflict: conflict.clone(),
+            });
+        }
+        self.append_batch(events)?;
         Ok(conflicts)
     }
 
@@ -78,22 +84,30 @@ impl<'a> TeamCoordinator<'a> {
         task: TeamTask,
     ) -> Result<Vec<TeamWriteScopeConflict>, ErrorEnvelope> {
         let conflicts = self.state.validate_task_update(expected_revision, &task)?;
-        self.append(Event::TeamTaskUpdated {
+        // TASK-805：同上——任务更新与冲突审计整批落盘
+        let mut events = vec![Event::TeamTaskUpdated {
             expected_revision,
             task,
-        })?;
-        self.append_conflicts(&conflicts)?;
+        }];
+        for conflict in &conflicts {
+            events.push(Event::TeamWriteScopeConflictDetected {
+                conflict: conflict.clone(),
+            });
+        }
+        self.append_batch(events)?;
         Ok(conflicts)
     }
 
-    fn append_conflicts(
-        &mut self,
-        conflicts: &[TeamWriteScopeConflict],
-    ) -> Result<(), ErrorEnvelope> {
-        for conflict in conflicts {
-            self.append(Event::TeamWriteScopeConflictDetected {
-                conflict: conflict.clone(),
-            })?;
+    /// TASK-805：原子批量追加并按序应用到内存状态。
+    fn append_batch(&mut self, events: Vec<Event>) -> Result<(), ErrorEnvelope> {
+        let records = self.session.append_batch(events).map_err(|error| {
+            ErrorEnvelope::new(
+                ErrorCode::Internal,
+                format!("failed to append team event batch: {error}"),
+            )
+        })?;
+        for record in records {
+            self.state.apply(record.seq, &record.event)?;
         }
         Ok(())
     }

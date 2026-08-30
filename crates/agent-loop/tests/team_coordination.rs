@@ -185,3 +185,44 @@ fn expanded_member_policy_is_rejected_before_roster_mutation() {
     assert!(replay_session(&path).unwrap().is_empty());
     std::fs::remove_file(path).ok();
 }
+
+#[test]
+fn task_and_conflict_events_form_one_atomic_contiguous_batch() {
+    // TASK-805：任务生效与冲突审计整批落盘，seq 连续、重放一致
+    let path = tmp("atomic-batch");
+    std::fs::remove_file(&path).ok();
+    let mut session = JsonlSession::create(path.clone()).unwrap();
+    let mut coordinator = TeamCoordinator::open(&mut session, "root").unwrap();
+    register_pair(&mut coordinator);
+    let base = replay_session(&path).unwrap().len() as u64;
+    let conflicts = coordinator
+        .create_task(task("task-x", "member-a", 1, &[], &["crates/session"]))
+        .unwrap();
+    assert_eq!(conflicts.len(), 0);
+    let conflicts = coordinator
+        .create_task(task("task-y", "member-b", 1, &[], &["crates/session/src"]))
+        .unwrap();
+    assert_eq!(conflicts.len(), 1);
+    // 事件序连续无缺口：任务事件与其冲突审计相邻
+    let events = replay_session(&path).unwrap();
+    for (index, record) in events.iter().enumerate() {
+        assert_eq!(record.seq, index as u64, "重放无缺口");
+    }
+    let tail_kinds: Vec<&str> = events
+        .iter()
+        .skip(base as usize)
+        .map(|record| match &record.event {
+            Event::TeamTaskCreated { .. } => "created",
+            Event::TeamWriteScopeConflictDetected { .. } => "conflict",
+            _ => "other",
+        })
+        .collect();
+    // 第二个任务批次 = created + conflict 相邻（一个不可分割提交）
+    let window: Vec<&str> = tail_kinds[tail_kinds.len() - 2..].to_vec();
+    assert_eq!(window, vec!["created", "conflict"]);
+    assert_eq!(coordinator.state().conflicts().len(), 1);
+    // 重放恢复一致
+    let reopened = TeamCoordinator::open(&mut session, "root").unwrap();
+    assert_eq!(reopened.state().conflicts().len(), 1);
+    std::fs::remove_file(path).ok();
+}
