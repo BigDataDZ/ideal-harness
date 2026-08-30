@@ -2,6 +2,7 @@
 name = "agent-loop"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 protocol = { workspace = true }

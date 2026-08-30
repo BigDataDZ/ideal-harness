@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
 
 env:
@@ -35,11 +35,36 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Build
-        run: cargo build --workspace --all-targets
+      - name: Build（全部 feature）
+        run: cargo build --workspace --all-targets --all-features
 
+      # TASK-807：Landlock 集成测试在 Ubuntu 真实执行（无 Landlock 内核会硬失败，
+      # 不允许静默跳过冒充通过）；Windows 受限 token 测试在 windows 矩阵执行。
       - name: Clippy（P1 起为合并硬门禁）
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Test
-        run: cargo test --workspace
+      - name: Test（全部 feature；Ubuntu 覆盖 Landlock 后端）
+        run: cargo test --workspace --all-features
+
+  msrv:
+    # TASK-807：MSRV 门禁——workspace 声明的最低工具链必须可构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85.0"
+      - name: Build（MSRV）
+        run: cargo build --workspace
+
+  supply-chain:
+    # TASK-807：依赖漏洞 / 许可证 / 来源检查（cargo-deny，可复现配置见 deny.toml）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@cargo-deny
+      - name: cargo-deny check（advisories + licenses + sources + bans）
+        run: cargo deny --workspace check advisories bans licenses sources

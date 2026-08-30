@@ -1,0 +1,36 @@
+# TASK-807：依赖供应链门禁（cargo-deny）。CI 逐项执行；例外必须在此留痕并注明理由。
+
+[advisories]
+version = 2
+# 已知漏洞：出现时必须升级依赖或在下方逐条留证豁免。
+ignore = []
+
+[licenses]
+version = 2
+# 运行时与开发依赖允许的许可证；Apache-2.0/MIT 双许可生态为主。
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+
+[bans]
+# 禁止多版本重复依赖（通融清单在此逐条留证）。
+multiple-versions = "warn"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# 来源只允许 crates.io 与本仓库路径依赖；禁止任意 git 依赖混入。
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
