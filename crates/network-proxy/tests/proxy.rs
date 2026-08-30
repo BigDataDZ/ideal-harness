@@ -59,7 +59,8 @@ fn explicitly_allowed_provider_host_tunnels_bytes() {
         stream.write_all(b"pong").unwrap();
     });
 
-    let policy = ProxyPolicy::for_provider("127.0.0.1").unwrap();
+    let mut policy = ProxyPolicy::for_provider("127.0.0.1").unwrap();
+    policy.allow_forbidden_targets();
     let server = ProxyServer::bind(localhost(0), policy, |_| Ok(())).unwrap();
     let proxy_address = server.local_addr().unwrap();
     let proxy_worker = thread::spawn(move || server.serve_once());

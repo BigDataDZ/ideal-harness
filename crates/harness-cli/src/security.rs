@@ -32,6 +32,25 @@ impl ProviderProxy {
         fetch_hosts: &[String],
         events: Arc<Mutex<Vec<Event>>>,
     ) -> anyhow::Result<Self> {
+        Self::start_proxy(base_url, fetch_hosts, events, false)
+    }
+
+    /// 仅测试：允许解析到 loopback 的目标（本地源站），生产装配不得使用。
+    #[cfg(test)]
+    pub(crate) fn start_with_fetch_hosts_for_tests(
+        base_url: &str,
+        fetch_hosts: &[String],
+        events: Arc<Mutex<Vec<Event>>>,
+    ) -> anyhow::Result<Self> {
+        Self::start_proxy(base_url, fetch_hosts, events, true)
+    }
+
+    fn start_proxy(
+        base_url: &str,
+        fetch_hosts: &[String],
+        events: Arc<Mutex<Vec<Event>>>,
+        allow_forbidden_targets: bool,
+    ) -> anyhow::Result<Self> {
         let provider = reqwest::Url::parse(base_url)?;
         let host = provider
             .host_str()
@@ -41,6 +60,9 @@ impl ProviderProxy {
             policy
                 .allow_host(fetch_host)
                 .map_err(|reason| anyhow::anyhow!("fetch allowlist 条目非法: {reason}"))?;
+        }
+        if allow_forbidden_targets {
+            policy.allow_forbidden_targets();
         }
         let server = ProxyServer::bind(
             SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
@@ -298,7 +320,7 @@ mod tests {
             }
         });
         let events = Arc::new(Mutex::new(Vec::new()));
-        let mut proxy = ProviderProxy::start_with_fetch_hosts(
+        let mut proxy = ProviderProxy::start_with_fetch_hosts_for_tests(
             "https://provider.example/v1",
             &["127.0.0.1".to_string()],
             Arc::clone(&events),

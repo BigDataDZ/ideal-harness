@@ -5,6 +5,9 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, Default)]
 pub struct ProxyPolicy {
     allowed_hosts: BTreeSet<String>,
+    /// TASK-801：是否放行解析到 loopback/私网的目标。仅测试环境显式开启；
+    /// 生产装配永不调用（fail-closed 默认）。
+    allow_forbidden_targets: bool,
 }
 
 impl ProxyPolicy {
@@ -31,6 +34,16 @@ impl ProxyPolicy {
         normalize_host(host)
             .map(|host| self.allowed_hosts.contains(&host))
             .unwrap_or(false)
+    }
+
+    /// 测试逃生口：允许解析到 loopback/私网的目标（CI 里的本地源站）。
+    /// 仅供测试代码调用；生产装配不得使用。
+    pub fn allow_forbidden_targets(&mut self) {
+        self.allow_forbidden_targets = true;
+    }
+
+    pub fn forbidden_targets_allowed(&self) -> bool {
+        self.allow_forbidden_targets
     }
 }
 

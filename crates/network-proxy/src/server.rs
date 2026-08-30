@@ -4,7 +4,7 @@ use crate::ProxyPolicy;
 use protocol::Event;
 use std::{
     io::{self, Read, Write},
-    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     thread,
@@ -102,7 +102,52 @@ fn handle_client<S: AuditSink>(
         return Ok(());
     }
 
-    let upstream = match TcpStream::connect((request.host.as_str(), request.port)) {
+    // TASK-801：明文转发时 Host 头必须与目标一致（CONNECT 无 Host 语义，跳过）；
+    // 头级检查先于 DNS，避免为注定拒绝的请求做解析。
+    if request.kind == RequestKind::PlainHttp {
+        if let Some(header_host) = host_header_host(&head) {
+            if header_host != request.host {
+                client.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")?;
+                audit.record(Event::NetworkAccessDenied {
+                    host: request.host,
+                    port: request.port,
+                    reason: format!("host_header_mismatch:{header_host}"),
+                })?;
+                return Ok(());
+            }
+        }
+    }
+
+    // TASK-801：DNS 解析后钉扎——校验全部解析结果并只连接已校验地址，
+    // 校验地址与连接地址同源，解析结果变化无法绕过已做判断。
+    let pinned = match resolve_and_pin(
+        &request.host,
+        request.port,
+        policy.forbidden_targets_allowed(),
+    ) {
+        Ok(address) => address,
+        Err(PinError::Forbidden(ip)) => {
+            let reason = format!("forbidden_resolved_ip:{ip}");
+            client.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")?;
+            audit.record(Event::NetworkAccessDenied {
+                host: request.host,
+                port: request.port,
+                reason,
+            })?;
+            return Ok(());
+        }
+        Err(PinError::Resolution(_) | PinError::Empty) => {
+            client.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")?;
+            audit.record(Event::NetworkAccessDenied {
+                host: request.host,
+                port: request.port,
+                reason: "resolution_failed".into(),
+            })?;
+            return Ok(());
+        }
+    };
+
+    let upstream = match TcpStream::connect(pinned) {
         Ok(upstream) => upstream,
         Err(error) => {
             client.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")?;
@@ -131,6 +176,7 @@ struct ConnectRequest {
     port: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestKind {
     /// 隧道化 HTTPS：已建立上游后双向透传。
     Connect,
@@ -217,6 +263,102 @@ fn parse_request_head(head: &[u8]) -> io::Result<ConnectRequest> {
             "only CONNECT and plain-form GET/HEAD requests are supported",
         )),
     }
+}
+
+/// TASK-801：解析目标主机并校验**全部**解析结果；任一禁用地址即整体拒绝。
+/// 返回的 SocketAddr 是调用方唯一应连接的地址（校验地址 = 连接地址）。
+#[derive(Debug)]
+enum PinError {
+    Resolution(#[allow(dead_code)] io::Error),
+    Forbidden(IpAddr),
+    Empty,
+}
+
+fn resolve_and_pin(
+    host: &str,
+    port: u16,
+    allow_forbidden_targets: bool,
+) -> Result<SocketAddr, PinError> {
+    let addrs: Vec<SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(PinError::Resolution)?
+        .collect();
+    if addrs.is_empty() {
+        return Err(PinError::Empty);
+    }
+    let mut pinned = None;
+    for address in addrs {
+        if !allow_forbidden_targets && is_forbidden_target_ip(address.ip()) {
+            return Err(PinError::Forbidden(address.ip()));
+        }
+        if pinned.is_none() {
+            pinned = Some(address);
+        }
+    }
+    pinned.ok_or(PinError::Empty)
+}
+
+/// TASK-801：SSRF 禁用地址集——loopback、unspecified、RFC1918、CGNAT、
+/// link-local、组播、保留段，以及映射到上述段的 IPv6。
+fn is_forbidden_target_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            matches!(
+                (a, b),
+                (0, _)
+                    | (10, _)
+                    | (127, _)
+                    | (100, 64..=127)
+                    | (169, 254)
+                    | (172, 16..=31)
+                    | (192, 168)
+                    | (224..=239, _)
+                    | (240..=255, _)
+            )
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            let segments = v6.segments();
+            if segments[0] == 0
+                && segments[1] == 0
+                && segments[2] == 0
+                && segments[3] == 0
+                && segments[4] == 0
+                && segments[5] == 0xffff
+            {
+                let mapped = Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                );
+                return is_forbidden_target_ip(IpAddr::V4(mapped));
+            }
+            let first = segments[0];
+            (first & 0xffc0) == 0xfe80      // fe80::/10 link-local
+                || (first & 0xfe00) == 0xfc00  // fc00::/7 ULA
+                || (first & 0xff00) == 0xff00 // ff00::/8 multicast
+        }
+    }
+}
+
+/// 从请求头提取 Host 头的主机部分（去端口、小写）；无 Host 头返回 None。
+fn host_header_host(head: &[u8]) -> Option<String> {
+    let header = std::str::from_utf8(head).ok()?;
+    for line in header.lines() {
+        if let Some(value) = line
+            .split_once(':')
+            .filter(|(name, _)| name.eq_ignore_ascii_case("Host"))
+            .map(|(_, value)| value.trim())
+        {
+            let host = value.rsplit_once(':').map_or(value, |(host, _)| host);
+            return Some(host.trim_matches(['[', ']']).to_ascii_lowercase());
+        }
+    }
+    None
 }
 
 fn parse_authority(authority: &str, message: &str) -> io::Result<(String, u16)> {
@@ -314,9 +456,11 @@ mod tests {
     #[test]
     fn plain_http_get_to_allowlisted_host_is_forwarded() {
         let upstream = origin("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        let mut policy = ProxyPolicy::for_provider("127.0.0.1").unwrap();
+        policy.allow_forbidden_targets();
         let proxy = ProxyServer::bind(
             "127.0.0.1:0".parse().unwrap(),
-            ProxyPolicy::for_provider("127.0.0.1").unwrap(),
+            policy,
             EventCollector(Mutex::new(Vec::new())),
         )
         .unwrap();
@@ -354,10 +498,62 @@ mod tests {
     }
 
     #[test]
-    fn non_get_connect_methods_are_rejected_without_upstream() {
+    fn resolved_loopback_target_is_denied_with_structured_audit() {
+        // allowlist 放行 localhost，但解析结果是 127.0.0.1 —— 必须在钉扎层拒绝
+        let events = EventCollector(Mutex::new(Vec::new()));
         let proxy = ProxyServer::bind(
             "127.0.0.1:0".parse().unwrap(),
-            ProxyPolicy::for_provider("127.0.0.1").unwrap(),
+            ProxyPolicy::for_provider("localhost").unwrap(),
+            events,
+        )
+        .unwrap();
+        let address = serve_background(proxy);
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"GET http://localhost/x HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let response = read_to_end(&mut client);
+        assert!(String::from_utf8_lossy(&response).contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn host_header_mismatch_is_denied_before_resolution() {
+        let proxy = ProxyServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            ProxyPolicy::for_provider("provider.example").unwrap(),
+            EventCollector(Mutex::new(Vec::new())),
+        )
+        .unwrap();
+        let address = serve_background(proxy);
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"GET http://provider.example/x HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+            .unwrap();
+        let response = read_to_end(&mut client);
+        assert!(String::from_utf8_lossy(&response).contains("403 Forbidden"));
+    }
+
+    #[test]
+    fn pin_validates_every_resolved_address_and_returns_the_pinned_one() {
+        // 校验地址与连接地址同源：pin 返回的 SocketAddr 就是唯一会被连接的地址
+        let probe = resolve_and_pin("localhost", 80, false);
+        println!("probe localhost pin: {probe:?}");
+        assert!(matches!(probe, Err(PinError::Forbidden(_))));
+        let pinned = resolve_and_pin("localhost", 80, true).unwrap();
+        assert!(
+            is_forbidden_target_ip(pinned.ip()),
+            "旗标开启时返回钉扎地址"
+        );
+        assert!(pinned.port() == 80);
+    }
+
+    #[test]
+    fn non_get_connect_methods_are_rejected_without_upstream() {
+        let mut policy = ProxyPolicy::for_provider("127.0.0.1").unwrap();
+        policy.allow_forbidden_targets();
+        let proxy = ProxyServer::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            policy,
             EventCollector(Mutex::new(Vec::new())),
         )
         .unwrap();
