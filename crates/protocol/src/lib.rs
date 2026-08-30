@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 mod session_rpc;
 
 pub use session_rpc::{
-    RpcErrorResponse, SessionEventFrame, SessionEventQuery, SessionTimelinePage,
-    SessionTimelineQuery, SessionTurnStatus, SessionTurnSummary,
+    RpcErrorResponse, SessionEventFrame, SessionEventQuery, SessionRpcCapabilities,
+    SessionTimelinePage, SessionTimelineQuery, SessionTurnStatus, SessionTurnSummary,
 };
 
 /// 会话标识。newtype 化用 String 承载，避免裸 String 混淆语义。

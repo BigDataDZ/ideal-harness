@@ -1,12 +1,16 @@
-//! P5/TASK-504：loopback-only 只读 HTTP RPC 与按 seq SSE 补洞。
+//! P5/TASK-504/TASK-605：只读 HTTP RPC、generation 与无窗口 SSE 补洞。
 
 use protocol::{
     ErrorCode, ErrorEnvelope, RpcErrorResponse, SessionEventFrame, SessionEventQuery,
-    SessionTimelinePage, SessionTimelineQuery, SessionTurnStatus, SessionTurnSummary,
+    SessionRpcCapabilities, SessionTimelinePage, SessionTimelineQuery, SessionTurnStatus,
+    SessionTurnSummary,
 };
 use session::{replay_session, timeline_page, TurnStatus};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod http;
 use http::{handle_connection, HttpResponse};
@@ -14,6 +18,7 @@ use http::{handle_connection, HttpResponse};
 const DEFAULT_BIND: &str = "127.0.0.1:8765";
 const DEFAULT_TIMELINE_LIMIT: u32 = 20;
 const MAX_TIMELINE_LIMIT: u32 = 1_000;
+static NEXT_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 struct ServeArgs {
     root: PathBuf,
@@ -60,6 +65,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<ServeArgs> {
 struct ReadOnlySessionServer {
     listener: TcpListener,
     root: PathBuf,
+    generation: u64,
 }
 
 impl ReadOnlySessionServer {
@@ -79,9 +85,15 @@ impl ReadOnlySessionServer {
                 root.display()
             );
         }
+        let generation = NEXT_CONNECTION_GENERATION
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("read-only RPC generation overflow"))?;
         Ok(Self {
             listener: TcpListener::bind(address)?,
             root: root.to_path_buf(),
+            generation,
         })
     }
 
@@ -91,33 +103,62 @@ impl ReadOnlySessionServer {
 
     fn run(self) -> anyhow::Result<()> {
         for stream in self.listener.incoming() {
-            handle_connection(stream?, &self.root, route)?;
+            handle_connection(
+                stream?,
+                &self.root,
+                |root, method, target, last_event_id| {
+                    route_with_generation(root, method, target, last_event_id, self.generation)
+                },
+            )?;
         }
         Ok(())
     }
 }
 
+#[cfg(test)]
 fn route(root: &Path, method: &str, target: &str) -> HttpResponse {
+    route_with_generation(root, method, target, None, 1)
+}
+
+fn route_with_generation(
+    root: &Path,
+    method: &str,
+    target: &str,
+    last_event_id: Option<&str>,
+    generation: u64,
+) -> HttpResponse {
     if method != "GET" {
         return error_response(
             405,
             ErrorEnvelope::new(ErrorCode::SandboxDenied, "read-only RPC accepts GET only"),
         );
     }
-    match parse_target(target) {
-        Ok(Route::Timeline(query)) => timeline_response(root, query),
-        Ok(Route::Events(query)) => event_response(root, query),
+    match parse_target(target, last_event_id, generation) {
+        Ok(Route::Capabilities) => capabilities_response(generation),
+        Ok(Route::Timeline(query)) => timeline_response(root, query, generation),
+        Ok(Route::Events(query)) => event_response(root, query, generation),
         Err(error) => error_response(400, error),
     }
 }
 
 enum Route {
+    Capabilities,
     Timeline(SessionTimelineQuery),
     Events(SessionEventQuery),
 }
 
-fn parse_target(target: &str) -> Result<Route, ErrorEnvelope> {
+fn parse_target(
+    target: &str,
+    last_event_id: Option<&str>,
+    generation: u64,
+) -> Result<Route, ErrorEnvelope> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path.trim_matches('/') == "v1/capabilities" {
+        if !query.is_empty() || last_event_id.is_some() {
+            return Err(cursor_error("capabilities route does not accept cursors"));
+        }
+        return Ok(Route::Capabilities);
+    }
     let parts: Vec<_> = path.trim_matches('/').split('/').collect();
     if parts.len() != 4 || parts[0] != "v1" || parts[1] != "sessions" {
         return Err(cursor_error("unknown read-only RPC route"));
@@ -125,7 +166,15 @@ fn parse_target(target: &str) -> Result<Route, ErrorEnvelope> {
     let session_id = validate_session_id(parts[2])?;
     match parts[3] {
         "timeline" => {
-            let values = parse_query(query, &["cursor", "limit"])?;
+            if last_event_id.is_some() {
+                return Err(cursor_error(
+                    "Last-Event-ID is only valid for event streams",
+                ));
+            }
+            let values = parse_query(query, &["cursor", "limit", "generation"])?;
+            let connection_generation =
+                parse_optional_u64(values.get("generation").copied(), "generation")?;
+            validate_generation(connection_generation, generation)?;
             let cursor = parse_optional_u64(values.get("cursor").copied(), "cursor")?;
             let limit = parse_optional_u64(values.get("limit").copied(), "limit")?
                 .unwrap_or(u64::from(DEFAULT_TIMELINE_LIMIT));
@@ -137,19 +186,40 @@ fn parse_target(target: &str) -> Result<Route, ErrorEnvelope> {
             }
             Ok(Route::Timeline(SessionTimelineQuery {
                 session_id,
+                connection_generation,
                 cursor,
                 limit,
             }))
         }
         "events" => {
-            let values = parse_query(query, &["last_seq"])?;
+            let values = parse_query(query, &["last_seq", "generation"])?;
+            let connection_generation =
+                parse_optional_u64(values.get("generation").copied(), "generation")?;
+            validate_generation(connection_generation, generation)?;
+            if values.contains_key("last_seq") && last_event_id.is_some() {
+                return Err(cursor_error(
+                    "last_seq and Last-Event-ID cannot be supplied together",
+                ));
+            }
+            let last_seq = match last_event_id {
+                Some(value) => parse_optional_u64(Some(value), "Last-Event-ID")?,
+                None => parse_optional_u64(values.get("last_seq").copied(), "last_seq")?,
+            };
             Ok(Route::Events(SessionEventQuery {
                 session_id,
-                last_seq: parse_optional_u64(values.get("last_seq").copied(), "last_seq")?,
+                connection_generation,
+                last_seq,
             }))
         }
         _ => Err(cursor_error("unknown read-only RPC route")),
     }
+}
+
+fn validate_generation(requested: Option<u64>, current: u64) -> Result<(), ErrorEnvelope> {
+    if requested.is_some_and(|generation| generation != current) {
+        return Err(cursor_error("connection generation is stale"));
+    }
+    Ok(())
 }
 
 fn parse_query<'a>(
@@ -215,7 +285,7 @@ fn session_path(root: &Path, session_id: &str) -> Result<PathBuf, ErrorEnvelope>
     Ok(canonical_path)
 }
 
-fn timeline_response(root: &Path, query: SessionTimelineQuery) -> HttpResponse {
+fn timeline_response(root: &Path, query: SessionTimelineQuery, generation: u64) -> HttpResponse {
     let result = (|| {
         let path = session_path(root, &query.session_id)?;
         let events = replay_session(&path).map_err(internal_io)?;
@@ -245,6 +315,7 @@ fn timeline_response(root: &Path, query: SessionTimelineQuery) -> HttpResponse {
             .collect();
         Ok(SessionTimelinePage {
             session_id: query.session_id,
+            connection_generation: generation,
             turns,
             next_cursor: (end < all.turns.len()).then_some(end as u64),
         })
@@ -255,10 +326,29 @@ fn timeline_response(root: &Path, query: SessionTimelineQuery) -> HttpResponse {
     }
 }
 
-fn event_response(root: &Path, query: SessionEventQuery) -> HttpResponse {
+fn event_response(root: &Path, query: SessionEventQuery, generation: u64) -> HttpResponse {
+    event_response_with_hook(root, query, generation, || {})
+}
+
+fn event_response_with_hook<F>(
+    root: &Path,
+    query: SessionEventQuery,
+    generation: u64,
+    after_page: F,
+) -> HttpResponse
+where
+    F: FnOnce(),
+{
     let result = (|| {
         let path = session_path(root, &query.session_id)?;
-        let events = replay_session(&path).map_err(internal_io)?;
+        // Open the follow source before reading history. Appends that race with
+        // the page read remain visible on this same file description.
+        let file = File::open(&path).map_err(internal_io)?;
+        let mut reader = BufReader::new(file);
+        let mut events = Vec::new();
+        read_follow_events(&mut reader, &mut events)?;
+        after_page();
+        read_follow_events(&mut reader, &mut events)?;
         for (expected, event) in events.iter().enumerate() {
             if event.seq != expected as u64 {
                 return Err(ErrorEnvelope::new(
@@ -287,6 +377,7 @@ fn event_response(root: &Path, query: SessionEventQuery) -> HttpResponse {
         for record in &events[start..] {
             let frame = SessionEventFrame {
                 session_id: query.session_id.clone(),
+                connection_generation: generation,
                 record: record.clone(),
             };
             let data = serde_json::to_string(&frame).map_err(|error| {
@@ -309,6 +400,38 @@ fn event_response(root: &Path, query: SessionEventQuery) -> HttpResponse {
     }
 }
 
+fn read_follow_events(
+    reader: &mut BufReader<File>,
+    events: &mut Vec<protocol::SequencedEvent>,
+) -> Result<(), ErrorEnvelope> {
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line).map_err(internal_io)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let event = serde_json::from_str(line.trim_end()).map_err(|error| {
+            ErrorEnvelope::new(
+                ErrorCode::Internal,
+                format!("session follow decode failed: {error}"),
+            )
+        })?;
+        events.push(event);
+    }
+}
+
+fn capabilities_response(generation: u64) -> HttpResponse {
+    json_response(&SessionRpcCapabilities {
+        connection_generation: generation,
+        read_only: true,
+        timeline: true,
+        event_stream: true,
+        last_event_id: true,
+        follow_before_page: true,
+        retry_business_errors: false,
+    })
+}
+
 fn rpc_error_response(error: ErrorEnvelope) -> HttpResponse {
     let status = match error.code {
         ErrorCode::SessionNotFound => 404,
@@ -320,6 +443,10 @@ fn rpc_error_response(error: ErrorEnvelope) -> HttpResponse {
 }
 
 fn timeline_json_response(value: &SessionTimelinePage) -> HttpResponse {
+    json_response(value)
+}
+
+fn json_response<T: serde::Serialize>(value: &T) -> HttpResponse {
     match serde_json::to_string(value) {
         Ok(body) => HttpResponse {
             status: 200,
@@ -337,8 +464,11 @@ fn timeline_json_response(value: &SessionTimelinePage) -> HttpResponse {
 }
 
 fn error_response(status: u16, error: ErrorEnvelope) -> HttpResponse {
-    let body = serde_json::to_string(&RpcErrorResponse { error })
-        .unwrap_or_else(|_| r#"{"error":{"code":"internal","message":"encoding failed"}}"#.into());
+    let body = serde_json::to_string(&RpcErrorResponse {
+        error,
+        retryable: false,
+    })
+    .unwrap_or_else(|_| r#"{"error":{"code":"internal","message":"encoding failed"}}"#.into());
     HttpResponse {
         status,
         content_type: "application/json",

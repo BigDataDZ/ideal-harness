@@ -1,7 +1,10 @@
 //! TASK-504 server acceptance tests.
 
 use super::*;
-use protocol::{Event, RpcErrorResponse, SessionEventFrame, SessionTimelinePage};
+use protocol::{
+    Event, RpcErrorResponse, SessionEventFrame, SessionEventQuery, SessionRpcCapabilities,
+    SessionTimelinePage,
+};
 use session::JsonlSession;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
@@ -50,9 +53,17 @@ fn loopback_http_transport_serves_protocol_json() {
     source.append(Event::TurnCompleted { turn_id: 1 }).unwrap();
     let server = ReadOnlySessionServer::bind(&root, "127.0.0.1:0".parse().unwrap()).unwrap();
     let address = server.local_addr().unwrap();
+    let generation = server.generation;
     let worker = std::thread::spawn(move || {
         let (stream, _) = server.listener.accept().unwrap();
-        handle_connection(stream, &server.root, route).unwrap();
+        handle_connection(
+            stream,
+            &server.root,
+            |root, method, target, last_event_id| {
+                route_with_generation(root, method, target, last_event_id, generation)
+            },
+        )
+        .unwrap();
     });
 
     let mut client = TcpStream::connect(address).unwrap();
@@ -67,7 +78,59 @@ fn loopback_http_transport_serves_protocol_json() {
     let body = response.split_once("\r\n\r\n").unwrap().1;
     let page: SessionTimelinePage = serde_json::from_str(body).unwrap();
     assert_eq!(page.session_id, "demo");
+    assert_eq!(page.connection_generation, generation);
     assert_eq!(page.turns[0].turn_id, 1);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn http_last_event_id_header_resumes_without_duplicate() {
+    let root = root("last-event-id-header");
+    let mut source = session(&root, "demo");
+    source.append(Event::TurnStarted { turn_id: 1 }).unwrap();
+    source.append(Event::TurnCompleted { turn_id: 1 }).unwrap();
+    let server = ReadOnlySessionServer::bind(&root, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let address = server.local_addr().unwrap();
+    let generation = server.generation;
+    let worker = std::thread::spawn(move || {
+        let (stream, _) = server.listener.accept().unwrap();
+        handle_connection(
+            stream,
+            &server.root,
+            |root, method, target, last_event_id| {
+                route_with_generation(root, method, target, last_event_id, generation)
+            },
+        )
+        .unwrap();
+    });
+
+    let mut client = TcpStream::connect(address).unwrap();
+    write!(
+        client,
+        "GET /v1/sessions/demo/events?generation={generation} HTTP/1.1\r\nHost: localhost\r\nLast-Event-ID: 0\r\n\r\n"
+    )
+    .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    worker.join().unwrap();
+    assert!(response.contains("id: 1\n"));
+    assert!(!response.contains("id: 0\n"));
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn capabilities_are_read_only_and_server_rebind_advances_generation() {
+    let root = root("capabilities");
+    let first = ReadOnlySessionServer::bind(&root, "127.0.0.1:0".parse().unwrap()).unwrap();
+    let second = ReadOnlySessionServer::bind(&root, "127.0.0.1:0".parse().unwrap()).unwrap();
+    assert!(second.generation > first.generation);
+
+    let response = route_with_generation(&root, "GET", "/v1/capabilities", None, second.generation);
+    let capabilities: SessionRpcCapabilities = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(capabilities.connection_generation, second.generation);
+    assert!(capabilities.read_only && capabilities.follow_before_page);
+    assert!(!capabilities.retry_business_errors);
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -126,6 +189,88 @@ fn sse_reconnect_from_last_seq_has_no_duplicate_or_gap() {
     );
     let caught_up = route(&root, "GET", "/v1/sessions/demo/events/?last_seq=3");
     assert!(sse_frames(&caught_up).is_empty());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn last_event_id_and_follow_before_page_close_the_append_window() {
+    let root = root("follow-before-page");
+    let mut source = session(&root, "demo");
+    source.append(Event::TurnStarted { turn_id: 1 }).unwrap();
+    source
+        .append(Event::UserMessage {
+            text: "before".into(),
+        })
+        .unwrap();
+    let query = SessionEventQuery {
+        session_id: "demo".into(),
+        connection_generation: Some(7),
+        last_seq: Some(0),
+    };
+    let response = event_response_with_hook(&root, query, 7, || {
+        source
+            .append(Event::AssistantMessage {
+                text: "racing append".into(),
+            })
+            .unwrap();
+    });
+    assert_eq!(
+        sse_frames(&response)
+            .iter()
+            .map(|frame| frame.record.seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(sse_frames(&response)
+        .iter()
+        .all(|frame| frame.connection_generation == 7));
+
+    let header_resume = route_with_generation(
+        &root,
+        "GET",
+        "/v1/sessions/demo/events?generation=7",
+        Some("1"),
+        7,
+    );
+    assert_eq!(
+        sse_frames(&header_resume)
+            .iter()
+            .map(|frame| frame.record.seq)
+            .collect::<Vec<_>>(),
+        vec![2]
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn stale_generation_and_business_errors_are_non_retryable() {
+    let root = root("generation");
+    let mut source = session(&root, "demo");
+    source.append(Event::TurnStarted { turn_id: 1 }).unwrap();
+
+    let stale = route_with_generation(
+        &root,
+        "GET",
+        "/v1/sessions/demo/events?generation=4",
+        None,
+        5,
+    );
+    assert_eq!(stale.status, 400);
+    let stale = error(&stale);
+    assert_eq!(stale.error.code, ErrorCode::CursorInvalid);
+    assert!(!stale.retryable);
+
+    let duplicate_cursor = route_with_generation(
+        &root,
+        "GET",
+        "/v1/sessions/demo/events?generation=5&last_seq=0",
+        Some("0"),
+        5,
+    );
+    assert_eq!(
+        error(&duplicate_cursor).error.code,
+        ErrorCode::CursorInvalid
+    );
     std::fs::remove_dir_all(root).ok();
 }
 

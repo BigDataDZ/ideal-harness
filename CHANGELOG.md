@@ -10,6 +10,7 @@
 - **protocol/session/agent-loop/harness-cli（TASK-601）**：新增唯一 Model Surface 契约与事件投影；模型工具调用批次和压缩 replace-prefix/source seq 可忠实重放，Hook 等纯审计调用不会混入 resume 上下文；旧 JSONL 保持可读
 - **protocol/context/model-provider/agent-loop（TASK-602）**：新增可重放根 Token 预算与 usage 事件账本；provider usage 优先、启发式兜底，主代理和两层 subagent 用量按 agent path 汇总 own/subtree，耗尽后在下一次 provider/runner 调用前拒绝
 - **protocol/sandbox-policy/sandbox-exec/approval/tools（TASK-603，D16）**：审批绑定权限配置 epoch、稳定摘要与 executor OS/home/workspace/generation；审批期间策略、工作区或执行目标变化会拒绝旧授权并记录失效事件，未知环境 fail-closed
+- **protocol/harness-cli（TASK-605，D18）**：只读 RPC 增加服务能力协商与 connection generation；SSE 支持标准 `Last-Event-ID`、follow-before-page 无窗口补洞和 generation 校验，旧连接与业务错误均 fail-closed 且标记为不可自动重试
 - **tools/agent-loop（TASK-604，D17）**：新增 required/optional MCP 服务状态机、发现宽限、connection generation 与受监管工具句柄；可选服务失败独立降级、必需服务失败拒绝启动，旧代际调用 fail-closed，结果经过按工具裁剪、硬大小上限与来源一致性检查
 - **protocol（TASK-504）**：新增只读会话 timeline、SSE event frame、查询参数与统一 RPC 错误 DTO，并增加 `SessionNotFound` / `CursorInvalid` 稳定错误码
 - **harness-cli（TASK-504）**：新增 loopback-only `serve` 子命令；按请求重放 JSONL 真相源，支持 timeline 分页与 `last_seq` SSE 无重无漏补洞；非本机监听、写方法、路径穿越、坏 cursor 和未知会话均 fail-closed

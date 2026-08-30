@@ -193,14 +193,14 @@
 - 明确不做: 不实现远程执行协议；不缓存凭据；不改变 SandboxMode 三档语义
 - 依赖: TASK-602
 
-### TASK-604: 受监管 MCP registry ✅（完成，提交见 git 历史）
+### TASK-604: 受监管 MCP registry ✅（commit `0e275c2`）
 - 目标 crate: tools、agent-loop
 - 内容: required/optional 服务状态机、发现宽限、connection generation、结构化错误、按工具输出限制与安全结果中间件
 - 验收标准: optional 超时可降级而 required 失败拒绝启动；旧 generation 调用被拒；单服务失败不隐藏其他有效目录
 - 明确不做: 不做 HTTP MCP/OAuth；不引入异步运行时；不执行服务端任意代码
 - 依赖: TASK-603
 
-### TASK-605: generation-aware RPC/SSE 连续性
+### TASK-605: generation-aware RPC/SSE 连续性 ✅（完成，提交见 git 历史）
 - 目标 crate: protocol ⚠️串行、harness-cli
 - 内容: follow-before-page、connection generation、Last-Event-ID 续传与序号缺口修复；服务端能力协商保持只读
 - 验收标准: 首屏与并发追加无窗口丢失；断线补洞无重无漏；旧 generation、坏 cursor 和业务错误不自动无限重试

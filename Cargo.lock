@@ -229,6 +229,7 @@ dependencies = [
  "reqwest",
  "sandbox-exec",
  "sandbox-policy",
+ "serde",
  "serde_json",
  "session",
  "tools",
