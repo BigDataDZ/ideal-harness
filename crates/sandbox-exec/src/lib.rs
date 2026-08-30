@@ -3,12 +3,17 @@
 use protocol::ExecutorEnvironment;
 use std::{io, path::PathBuf};
 
+#[cfg(target_os = "linux")]
+mod landlock_backend;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 mod windows_command_line;
 #[cfg(windows)]
 mod windows_pipe_reader;
+
+#[cfg(target_os = "linux")]
+pub use landlock_backend::{LandlockBackend, LandlockFsMode};
 
 /// 一次外部命令执行请求。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +103,7 @@ impl RestrictedBackend for PlatformRestrictedBackend {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 impl RestrictedBackend for PlatformRestrictedBackend {
     fn execute(&self, _: &CommandSpec) -> io::Result<ExecutionOutput> {
         Err(io::Error::new(
@@ -112,7 +117,18 @@ impl RestrictedBackend for PlatformRestrictedBackend {
     }
 }
 
-fn local_executor_environment(generation: u64) -> io::Result<ExecutorEnvironment> {
+#[cfg(target_os = "linux")]
+impl RestrictedBackend for PlatformRestrictedBackend {
+    fn execute(&self, command: &CommandSpec) -> io::Result<ExecutionOutput> {
+        landlock_backend::LandlockBackend::from_environment(0)?.execute(command)
+    }
+
+    fn environment(&self) -> io::Result<ExecutorEnvironment> {
+        landlock_backend::LandlockBackend::from_environment(0)?.environment()
+    }
+}
+
+pub(crate) fn local_executor_environment(generation: u64) -> io::Result<ExecutorEnvironment> {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
         .filter(|value| !value.is_empty())

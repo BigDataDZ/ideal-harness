@@ -269,6 +269,7 @@
 - 内容: 落实预留的 Landlock trait 位：fs 读/写/执行与网络规则集，与 Windows Restricted Token 共享 SandboxMode 三档语义与执行器环境事实
 - 验收标准: Linux 集成测试（无环境时显式跳过）证明越界读写被拒；Windows 路径零回归； denial 路径留审计事件
 - 明确不做: 不做 Windows WFP 网络过滤（另立卡）；不改变 SandboxMode 语义；不做 macOS Seatbelt
+- 允许依赖: `libc`（仅 Linux target，Landlock/prctl 系统调用所需；2026-08-30 卡面修订）
 - 依赖: TASK-603
 
 ### P7 暂缓清单（明确不排卡，避免范围蔓延）
