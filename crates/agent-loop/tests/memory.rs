@@ -62,6 +62,8 @@ fn memory_write_flows_through_audit_to_event_and_projection() {
             audits: vec![ToolAudit::MemoryRecorded {
                 text: args["text"].as_str().unwrap_or_default().to_string(),
                 tags: vec!["test".to_string()],
+                source: protocol::MemorySource::Model,
+                scope: protocol::MemoryScope::LineageOnly,
             }],
         }),
     );

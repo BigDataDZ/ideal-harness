@@ -430,6 +430,10 @@ fn register_memory_tool(registry: &mut ToolRegistry) {
                     ),
                 });
             }
+            // TASK-806：单条记忆大小上限（P7 验收缺口在此收口）
+            if let Err(error) = session::validate_memory_size(&text) {
+                return ToolExecution::new(ToolOutcome::Failure { error });
+            }
             let tags = args["tags"]
                 .as_array()
                 .map(|values| {
@@ -444,7 +448,12 @@ fn register_memory_tool(registry: &mut ToolRegistry) {
                 outcome: ToolOutcome::Success {
                     value: serde_json::json!({ "recorded": true, "text": text }),
                 },
-                audits: vec![ToolAudit::MemoryRecorded { text, tags }],
+                audits: vec![ToolAudit::MemoryRecorded {
+                    text,
+                    tags,
+                    source: protocol::MemorySource::Model,
+                    scope: protocol::MemoryScope::LineageOnly,
+                }],
             }
         }),
     );
@@ -458,7 +467,7 @@ fn inject_memories(session: &mut dyn SessionStore) -> anyhow::Result<bool> {
     if memories.is_empty() {
         return Ok(false);
     }
-    let summary = render_memory_summary(&memories);
+    let summary = render_memory_summary(&memories)?;
     let already = events.iter().any(|sequenced| {
         matches!(
             &sequenced.event,
@@ -472,20 +481,9 @@ fn inject_memories(session: &mut dyn SessionStore) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-fn render_memory_summary(memories: &[session::MemoryEntry]) -> String {
-    let mut out = String::from(
-        "Known persistent memories:
-",
-    );
-    for memory in memories {
-        out.push_str(&format!(
-            "- [{}] {}
-",
-            memory.tags.join(","),
-            memory.text
-        ));
-    }
-    out
+fn render_memory_summary(memories: &[session::MemoryEntry]) -> anyhow::Result<String> {
+    // TASK-806：总量与注入预算 fail-closed（session 层统一守卫）
+    session::injection_summary(memories).map_err(|error| anyhow::anyhow!(error.message))
 }
 
 /// 演示工具集：echo（自纠演示）+ now（真实副作用最小示例）。
@@ -1048,6 +1046,8 @@ mod tests {
             memory_id: "mem-0".into(),
             text: "用户偏好 Rust".into(),
             tags: vec!["lang".into()],
+            source: protocol::MemorySource::Model,
+            scope: protocol::MemoryScope::LineageOnly,
         })
         .unwrap();
         // 首次注入：发生

@@ -75,7 +75,13 @@ pub enum ToolAudit {
         current: AuthorizationContext,
     },
     /// TASK-705：agent-loop 据此落 MemoryRecorded 事件（工具层不持有 session）。
-    MemoryRecorded { text: String, tags: Vec<String> },
+    /// TASK-806：携带来源与作用域。
+    MemoryRecorded {
+        text: String,
+        tags: Vec<String>,
+        source: protocol::MemorySource,
+        scope: protocol::MemoryScope,
+    },
 }
 
 /// 调度结果与其伴随审计事实。工具层不伪造协议 call_id。

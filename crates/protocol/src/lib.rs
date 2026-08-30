@@ -151,6 +151,24 @@ pub enum SubagentReportDelivery {
     Quiet,
 }
 
+/// TASK-806：记忆可见范围。当前唯一合法值是 LineageOnly：
+/// 记忆仅沿同一会话血脉（resume/fork）可见，绝不跨独立会话/用户共享。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryScope {
+    LineageOnly,
+}
+
+/// TASK-806：记忆写入来源（防污染审计的最小事实）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySource {
+    /// 模型经 memory_write 工具写入。
+    Model,
+    /// 宿主/用户显式写入。
+    Host,
+}
+
 /// TASK-802：工具终止原因；重放与审计用稳定枚举。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -315,10 +333,17 @@ pub enum Event {
         termination: ToolTermination,
     },
     /// TASK-705：跨会话记忆写入；id 幂等，重放时后写覆盖同 id。
+    /// TASK-806：携带来源与作用域，注入前按来源与预算过滤。
     MemoryRecorded {
         memory_id: String,
         text: String,
         tags: Vec<String>,
+        source: MemorySource,
+        scope: MemoryScope,
+    },
+    /// TASK-806：显式删除/失效一条记忆；重放幂等（对不存在 id 无效果）。
+    MemoryRevoked {
+        memory_id: String,
     },
     /// TASK-705：记忆注入系统表面的事件化事实（模型可见）。
     MemoryContextInjected {
@@ -449,6 +474,11 @@ mod tests {
                 memory_id: "mem-1".into(),
                 text: "用户偏好 Rust".into(),
                 tags: vec!["preference".into()],
+                source: MemorySource::Model,
+                scope: MemoryScope::LineageOnly,
+            },
+            Event::MemoryRevoked {
+                memory_id: "mem-1".into(),
             },
             Event::MemoryContextInjected {
                 summary: "记忆: 用户偏好 Rust".into(),

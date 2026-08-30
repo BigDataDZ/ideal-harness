@@ -630,13 +630,20 @@ impl<'a> AgentLoop<'a> {
                                 })
                                 .ok();
                         }
-                        ToolAudit::MemoryRecorded { text, tags } => {
+                        ToolAudit::MemoryRecorded {
+                            text,
+                            tags,
+                            source,
+                            scope,
+                        } => {
                             // TASK-705：记忆写入留 Event；id 取当前流长度（单调且幂等可重放）
                             session
                                 .append(Event::MemoryRecorded {
                                     memory_id: format!("mem-{}", session.len()),
                                     text,
                                     tags,
+                                    source,
+                                    scope,
                                 })
                                 .ok();
                         }
@@ -1182,6 +1189,7 @@ mod tests {
             Event::ToolExecutionTerminated { .. } => "tool_execution_terminated",
             Event::MemoryRecorded { .. } => "memory_recorded",
             Event::MemoryContextInjected { .. } => "memory_context_injected",
+            Event::MemoryRevoked { .. } => "memory_revoked",
             Event::UserInputQueued { .. } => "user_input_queued",
             Event::AssistantMessage { .. } => "assistant_message",
             Event::ModelChunkReceived { .. } => "model_chunk",

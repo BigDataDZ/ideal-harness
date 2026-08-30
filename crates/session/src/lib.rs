@@ -14,7 +14,7 @@ mod zstd_frames;
 mod zstd_record;
 
 pub use lineage::{derive_subagent_lineage, SubagentLineage};
-pub use memory::{project_memories, MemoryEntry};
+pub use memory::{injection_summary, project_memories, validate_memory_size, MemoryEntry};
 pub use model_surface::project_model_surface;
 pub use projection::{ProjectedSession, SqliteProjection};
 pub use spill::{SpillLocator, SpillStore, StoredToolResult};
