@@ -5,6 +5,7 @@ use crate::{
     windows_pipe_reader::{join_reader, reader_thread},
     CommandSpec, ExecutionOutput,
 };
+use std::time::Duration;
 use std::{
     ffi::c_void,
     io,
@@ -134,7 +135,26 @@ unsafe extern "system" {
     fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> Bool;
     fn ResumeThread(thread: Handle) -> u32;
     fn TerminateProcess(process: Handle, exit_code: u32) -> Bool;
+    fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> Handle;
+    fn SetInformationJobObject(
+        job: Handle,
+        class: i32,
+        information: *const c_void,
+        length: u32,
+    ) -> Bool;
+    fn AssignProcessToJobObject(job: Handle, process: Handle) -> Bool;
+    fn TerminateJobObject(job: Handle, exit_code: u32) -> Bool;
 }
+
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: i32 = 9;
+/// 实证确认的 x64 JOBOBJECT_EXTENDED_LIMIT_INFORMATION 长度（探针：144 接受，120 报
+/// ERROR_BAD_LENGTH）；LimitFlags 位于 JOBOBJECT_BASIC_LIMIT_INFORMATION 偏移 32。
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_SIZE: usize = 144;
+const JOB_OBJECT_LIMIT_FLAGS_OFFSET: usize = 32;
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
+/// 超时被终止时的约定退出码（类 Unix timeout 惯例）。
+const DEADLINE_EXIT_CODE: u32 = 124;
 
 struct OwnedHandle(Handle);
 
@@ -184,7 +204,49 @@ impl Pipe {
     }
 }
 
+/// TASK-802：创建 KILL_ON_JOB_CLOSE 的作业对象；句柄关闭即终止残留子进程。
+fn create_kill_on_close_job() -> io::Result<OwnedHandle> {
+    // SAFETY: 无名作业对象，attributes/name 均为空。
+    let job = unsafe { CreateJobObjectW(null(), null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let job_handle = OwnedHandle(job);
+    let mut limits = [0u8; JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_SIZE];
+    limits[JOB_OBJECT_LIMIT_FLAGS_OFFSET..JOB_OBJECT_LIMIT_FLAGS_OFFSET + 4]
+        .copy_from_slice(&JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.to_ne_bytes());
+    // SAFETY: limits 是完整零初始化的 Win32 结构缓冲，长度为实证确认的类大小。
+    if unsafe {
+        SetInformationJobObject(
+            job_handle.0,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            limits.as_ptr() as *const c_void,
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_SIZE as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::other(
+            format!(
+                "SetInformationJobObject failed: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(job_handle)
+}
+
+pub(crate) fn execute_with_deadline(
+    command: &CommandSpec,
+    deadline: Option<Duration>,
+) -> io::Result<ExecutionOutput> {
+    execute_inner(command, deadline)
+}
+
 pub(crate) fn execute(command: &CommandSpec) -> io::Result<ExecutionOutput> {
+    execute_inner(command, None)
+}
+
+fn execute_inner(command: &CommandSpec, deadline: Option<Duration>) -> io::Result<ExecutionOutput> {
     let mut process_token = OwnedHandle::null();
     // SAFETY: GetCurrentProcess returns a pseudo-handle and token points to writable storage.
     if unsafe {
@@ -246,6 +308,21 @@ pub(crate) fn execute(command: &CommandSpec) -> io::Result<ExecutionOutput> {
         return Err(error);
     }
 
+    // TASK-802：进程入作业对象（KILL_ON_JOB_CLOSE）——超时或句柄关闭都会
+    // 终止整棵进程树，受限子进程无法留下孤儿。
+    let job = create_kill_on_close_job()?;
+    // SAFETY: job 与刚创建的 process 句柄均有效。
+    if unsafe { AssignProcessToJobObject(job.0, process.0) } == 0 {
+        let error = io::Error::other(
+            format!(
+                "AssignProcessToJobObject failed: {}",
+                io::Error::last_os_error()
+            ),
+        );
+        unsafe { TerminateProcess(process.0, 1) };
+        return Err(error);
+    }
+
     // Drop parent copies of child write handles before readers start.
     drop(stdout_pipe.write);
     drop(stderr_pipe.write);
@@ -261,15 +338,32 @@ pub(crate) fn execute(command: &CommandSpec) -> io::Result<ExecutionOutput> {
     drop(thread_handle);
 
     // SAFETY: process is a valid process handle.
-    if unsafe { WaitForSingleObject(process.0, INFINITE) } == WAIT_FAILED {
+    let wait_ms = deadline.map_or(INFINITE, |value| value.as_millis() as u32);
+    let waited = unsafe { WaitForSingleObject(process.0, wait_ms) };
+    if waited == WAIT_FAILED {
         // SAFETY: best-effort termination prevents reader threads hanging on inherited pipes.
         unsafe { TerminateProcess(process.0, 1) };
         return Err(io::Error::last_os_error());
+    }
+    if waited == WAIT_TIMEOUT {
+        // TASK-802：超时终止整棵进程树；终止失败 fail-closed。
+        // SAFETY: job 与 process 句柄均有效。
+        if unsafe { TerminateJobObject(job.0, DEADLINE_EXIT_CODE) } == 0 {
+            return Err(io::Error::other(
+                "failed to terminate timed-out process tree",
+            ));
+        }
+        if unsafe { WaitForSingleObject(process.0, INFINITE) } == WAIT_FAILED {
+            return Err(io::Error::last_os_error());
+        }
     }
     let mut exit_code = 0;
     // SAFETY: process has completed and exit_code is writable.
     if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0 {
         return Err(io::Error::last_os_error());
+    }
+    if waited == WAIT_TIMEOUT {
+        exit_code = DEADLINE_EXIT_CODE;
     }
 
     Ok(ExecutionOutput {
@@ -393,4 +487,35 @@ fn verify_restricted(process: Handle) -> io::Result<()> {
 
 fn wide_null(value: &std::ffi::OsStr) -> Vec<u16> {
     value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn timed_out_process_tree_is_terminated_with_deadline_code() {
+        let command = CommandSpec::new("cmd")
+            .arg("/C")
+            .arg("ping -n 30 127.0.0.1");
+        let started = Instant::now();
+        let output = execute_with_deadline(&command, Some(Duration::from_millis(300))).unwrap();
+        let elapsed = started.elapsed();
+        // 终止结果结构化：约定退出码 124 + restricted 仍为真
+        assert_eq!(output.exit_code, 124, "stderr: {:?}", output.stderr);
+        assert!(output.restricted);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "超时必须在 deadline 附近返回而不是等命令跑完（实际 {elapsed:?}）"
+        );
+    }
+
+    #[test]
+    fn fast_command_within_deadline_succeeds_normally() {
+        let command = CommandSpec::new("cmd").arg("/C").arg("echo ok");
+        let output = execute_with_deadline(&command, Some(Duration::from_secs(10))).unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("ok"));
+    }
 }

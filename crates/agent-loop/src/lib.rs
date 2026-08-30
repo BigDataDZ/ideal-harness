@@ -642,6 +642,19 @@ impl<'a> AgentLoop<'a> {
                         }
                     }
                 }
+                // TASK-802：结构化终止留痕——超时/取消与失败结果成对出现
+                if matches!(
+                    &execution.outcome,
+                    ToolOutcome::Failure { error }
+                        if error.code == ErrorCode::ToolTimeout
+                ) {
+                    session
+                        .append(Event::ToolExecutionTerminated {
+                            call_id: tc.id.clone(),
+                            termination: protocol::ToolTermination::DeadlineExceeded,
+                        })
+                        .ok();
+                }
                 // TASK-607：结果进模型表面前的安全裁决（缺席对插件来源 fail-closed）
                 let outcome = guard_tool_result(
                     cfg.result_middleware,
@@ -1166,6 +1179,7 @@ mod tests {
         match e {
             Event::TurnStarted { .. } => "turn_started",
             Event::UserMessage { .. } => "user_message",
+            Event::ToolExecutionTerminated { .. } => "tool_execution_terminated",
             Event::MemoryRecorded { .. } => "memory_recorded",
             Event::MemoryContextInjected { .. } => "memory_context_injected",
             Event::UserInputQueued { .. } => "user_input_queued",

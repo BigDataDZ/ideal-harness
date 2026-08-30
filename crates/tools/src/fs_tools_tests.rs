@@ -168,6 +168,35 @@ fn path_escape_and_missing_paths_fail_closed() {
 }
 
 #[test]
+fn cancelled_token_refuses_write_and_edit_at_commit_point() {
+    let (h, set) = setup("cancelled");
+    // 模拟 deadline 到期：令牌被取消
+    set.set_cancellation_token(CancellationToken::default());
+    set.cancellation_token
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .cancel();
+    assert_eq!(
+        err(h.registry.dispatch(
+            "fs_write",
+            &serde_json::json!({ "path": "new.txt", "content": "x" })
+        ))
+        .code,
+        ErrorCode::ToolTimeout
+    );
+    assert_eq!(
+        err(h.registry.dispatch(
+            "fs_edit",
+            &serde_json::json!({ "path": "new.txt", "old_string": "a", "new_string": "b" })
+        ))
+        .code,
+        ErrorCode::ToolTimeout
+    );
+}
+
+#[test]
 fn symlinked_file_is_not_followed_when_platform_allows_creation() {
     let (h, _set) = setup("symlink");
     let outside = workspace("symlink-outside");

@@ -2,6 +2,7 @@
 //! 错误一律以稳定 ErrorCode 回传，供模型自纠，绝不 panic。
 
 mod advertisement;
+mod cancel;
 mod fs_tools;
 mod mcp;
 mod mcp_registry;
@@ -16,6 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use advertisement::EscalationAvailability;
+pub use cancel::CancellationToken;
 pub use fs_tools::FsToolSet;
 pub use mcp::{McpCallResult, McpClient, McpServerConfig, McpTool};
 pub use mcp_registry::{
@@ -113,6 +115,10 @@ struct PluginProvenance {
 pub struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     escalation_availability: EscalationAvailability,
+    /// TASK-802：全局默认 deadline（毫秒）；spec.timeout_ms 优先。
+    default_deadline_ms: Option<u64>,
+    /// TASK-802：deadline 到期时被取消的协作令牌。
+    cancellation_token: Option<Arc<CancellationToken>>,
     /// TASK-607：插件调度门；注册与调度两个时点都强制清单校验。
     plugin_gate: Option<Arc<PluginCatalog>>,
     plugin_tools: BTreeMap<String, PluginProvenance>,
@@ -123,6 +129,8 @@ impl Default for ToolRegistry {
         Self {
             tools: Vec::new(),
             escalation_availability: EscalationAvailability::Unavailable,
+            default_deadline_ms: None,
+            cancellation_token: None,
             plugin_gate: None,
             plugin_tools: BTreeMap::new(),
         }
@@ -161,6 +169,16 @@ impl ToolRegistry {
             spec,
             handler: ToolHandler::Audited(Arc::from(handler)),
         });
+    }
+
+    /// TASK-802：设置全局默认 deadline（未被 spec.timeout_ms 覆盖时生效）。
+    pub fn set_default_deadline(&mut self, deadline: std::time::Duration) {
+        self.default_deadline_ms = Some(deadline.as_millis() as u64);
+    }
+
+    /// TASK-802：安装协作取消令牌；deadline 到期即取消，handler 在提交点 check。
+    pub fn set_cancellation_token(&mut self, token: Arc<CancellationToken>) {
+        self.cancellation_token = Some(token);
     }
 
     /// TASK-607：安装插件调度门；此后 `register_plugin_tool` 才可用。
@@ -297,7 +315,16 @@ impl ToolRegistry {
         if let Err(error) = self.verify_plugin_tool(name) {
             return Some(ToolExecution::new(ToolOutcome::Failure { error }));
         }
-        if let Some(ms) = t.spec.timeout_ms.filter(|ms| *ms > 0) {
+        let deadline_ms = t
+            .spec
+            .timeout_ms
+            .or(self.default_deadline_ms)
+            .filter(|ms| *ms > 0);
+        if let Some(ms) = deadline_ms {
+            // TASK-802：deadline 到期即取消协作令牌，handler 在提交点放弃副作用
+            if let Some(token) = &self.cancellation_token {
+                token.cancel();
+            }
             return Some(
                 run_with_deadline(&t.handler, args, std::time::Duration::from_millis(ms))
                     .unwrap_or_else(|| {
@@ -396,6 +423,52 @@ mod tests {
             Some(ToolOutcome::Success { value }) => assert_eq!(value, "hi"),
             other => panic!("expected success, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deadline_cancel_token_blocks_late_side_effects() {
+        // TASK-802 验收：ToolTimeout 返回后，handler 的提交点不再产生写副作用
+        let token = Arc::new(CancellationToken::default());
+        let mut reg = ToolRegistry::default();
+        reg.set_default_deadline(std::time::Duration::from_millis(50));
+        reg.set_cancellation_token(Arc::clone(&token));
+        let side_effect_file =
+            std::env::temp_dir().join(format!("ih-802-{}.txt", std::process::id()));
+        std::fs::remove_file(&side_effect_file).ok();
+        let path_for_handler = side_effect_file.clone();
+        let token_for_handler = Arc::clone(&token);
+        reg.register(
+            ToolSpec {
+                name: "slow_writer".into(),
+                description: "sleep then write".into(),
+                parameters_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                escalation_capable: false,
+                timeout_ms: None,
+            },
+            Box::new(move |_| {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                // 提交点：被取消的 handler 必须放弃写副作用
+                if let Err(error) = token_for_handler.check() {
+                    return ToolOutcome::Failure { error };
+                }
+                std::fs::write(&path_for_handler, b"late side effect").unwrap();
+                ToolOutcome::Success { value: ().into() }
+            }),
+        );
+        match reg.dispatch("slow_writer", &serde_json::json!({})) {
+            Some(ToolOutcome::Failure { error }) => {
+                assert_eq!(error.code, ErrorCode::ToolTimeout)
+            }
+            other => panic!("expected timeout, got {other:?}"),
+        }
+        // 等 handler 线程跑完睡眠段，确认它没有写文件
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !side_effect_file.exists(),
+            "被取消的 handler 不得产生写副作用"
+        );
+        assert!(token.is_cancelled());
+        std::fs::remove_file(&side_effect_file).ok();
     }
 
     #[test]

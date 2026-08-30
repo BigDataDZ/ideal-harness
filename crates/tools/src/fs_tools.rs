@@ -3,7 +3,7 @@
 //! 写路径强制 read-before-write；超限结果全文落 spill 文件，
 //! 结果只携带预览 + locator（locator 是工作区内相对路径，可用 fs_read 取回全文）。
 
-use crate::ToolRegistry;
+use crate::{CancellationToken, ToolRegistry};
 use protocol::{ErrorCode, ErrorEnvelope, ToolOutcome};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -30,6 +30,8 @@ pub struct FsToolSet {
     spill_counter: AtomicU64,
     /// 已读取过的 canonical 路径；覆盖写与编辑的前置条件。
     read_tracker: Mutex<BTreeSet<PathBuf>>,
+    /// TASK-802：协作取消令牌；写/编辑提交点检查，超时后拒绝产生新副作用。
+    cancellation_token: Mutex<Option<CancellationToken>>,
 }
 
 impl FsToolSet {
@@ -43,7 +45,30 @@ impl FsToolSet {
             spill_dir,
             spill_counter: AtomicU64::new(0),
             read_tracker: Mutex::new(BTreeSet::new()),
+            cancellation_token: Mutex::new(None),
         }))
+    }
+
+    /// TASK-802：安装协作取消令牌；deadline 取消后写/编辑在提交点被拒绝。
+    pub fn set_cancellation_token(&self, token: CancellationToken) {
+        *self
+            .cancellation_token
+            .lock()
+            .expect("cancel token poisoned") = Some(token);
+    }
+
+    fn check_not_cancelled(&self, tool: &str) -> Result<(), ErrorEnvelope> {
+        let guard = self
+            .cancellation_token
+            .lock()
+            .expect("cancel token poisoned");
+        match guard.as_ref() {
+            Some(token) if token.is_cancelled() => Err(ErrorEnvelope::new(
+                ErrorCode::ToolTimeout,
+                format!("fs_write/fs_edit abandoned: {tool} deadline token cancelled"),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// 注册全部文件工具；重复名由 ToolRegistry 断言暴露。
@@ -158,6 +183,7 @@ impl FsToolSet {
 
     fn tool_write(self: &Arc<Self>, args: &Value) -> ToolOutcome {
         run(|| {
+            self.check_not_cancelled("fs_write")?;
             let raw = string_arg(args, "path")?;
             let content = string_arg(args, "content")?;
             if content.len() > MAX_WRITE_BYTES {
@@ -190,6 +216,7 @@ impl FsToolSet {
 
     fn tool_edit(self: &Arc<Self>, args: &Value) -> ToolOutcome {
         run(|| {
+            self.check_not_cancelled("fs_edit")?;
             let raw = string_arg(args, "path")?;
             let old_string = string_arg(args, "old_string")?;
             let new_string = string_arg(args, "new_string")?;

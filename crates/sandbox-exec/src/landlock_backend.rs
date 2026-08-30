@@ -106,7 +106,15 @@ impl LandlockBackend {
 
 impl RestrictedBackend for LandlockBackend {
     fn execute(&self, command: &CommandSpec) -> io::Result<ExecutionOutput> {
-        execute_under_landlock(self, command)
+        execute_under_landlock(self, command, None)
+    }
+
+    fn execute_with_deadline(
+        &self,
+        command: &CommandSpec,
+        deadline: Option<std::time::Duration>,
+    ) -> io::Result<ExecutionOutput> {
+        execute_under_landlock(self, command, deadline)
     }
 
     fn environment(&self) -> io::Result<protocol::ExecutorEnvironment> {
@@ -210,6 +218,7 @@ fn restrict_child(workspace_root: &Path, mode: LandlockFsMode) {
 fn execute_under_landlock(
     backend: &LandlockBackend,
     command: &CommandSpec,
+    deadline: Option<std::time::Duration>,
 ) -> io::Result<ExecutionOutput> {
     // ABI 预检：无 Landlock 的内核直接拒绝，不降级为不受限执行
     probe_abi().and_then(|version| {
@@ -260,7 +269,10 @@ fn execute_under_landlock(
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
-        // 子进程：接管管道 → chdir → Landlock → exec
+        // 子进程：自成进程组（setpgid）→ 接管管道 → chdir → Landlock → exec
+        unsafe {
+            libc::setpgid(0, 0);
+        }
         unsafe {
             libc::close(stdout_pipe[0]);
             libc::close(stderr_pipe[0]);
@@ -293,12 +305,36 @@ fn execute_under_landlock(
         libc::close(stderr_pipe[0]);
     }
 
+    // TASK-802：轮询等待；deadline 到期 killpg 终止整组（含受控子进程）。
+    let deadline_at = deadline.map(|value| std::time::Instant::now() + value);
     let mut status: libc::c_int = 0;
-    let wait = unsafe { libc::waitpid(pid, &mut status, 0) };
+    let mut timed_out = false;
+    let wait = loop {
+        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        if result == pid {
+            break result;
+        }
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if deadline_at.is_some_and(|at| std::time::Instant::now() >= at) {
+            timed_out = true;
+            // SAFETY: pid 是自成进程组的子进程；SIGKILL 终止整组。
+            if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+                return Err(io::Error::other(
+                    "failed to terminate timed-out process group",
+                ));
+            }
+            break unsafe { libc::waitpid(pid, &mut status, 0) };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
     if wait < 0 {
         return Err(io::Error::last_os_error());
     }
-    let exit_code = if libc::WIFEXITED(status) {
+    let exit_code = if timed_out {
+        124
+    } else if libc::WIFEXITED(status) {
         libc::WEXITSTATUS(status) as u32
     } else if libc::WIFSIGNALED(status) {
         128 + libc::WTERMSIG(status) as u32

@@ -7,6 +7,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
+use std::time::Duration;
 
 use approval::{
     approve_escalation, validate_escalation_args, validate_grant, ApprovalAudit, Approver,
@@ -128,11 +129,15 @@ pub(crate) fn register_exec_tool<B>(
                 }
             }),
             escalation_capable: true,
-            timeout_ms: None,
+            // TASK-802：外部命令硬 deadline；到期终止受限进程树（Windows Job / Linux killpg）
+            timeout_ms: Some(EXEC_DEADLINE_MS),
         },
         Box::new(move |args| execute_restricted(args, &pool, approver.as_deref())),
     );
 }
+
+/// TASK-802：外部命令硬 deadline（毫秒）；与 exec 工具 spec.timeout_ms 保持一致。
+pub(crate) const EXEC_DEADLINE_MS: u64 = 60_000;
 
 fn execute_restricted<B: RestrictedBackend>(
     args: &serde_json::Value,
@@ -221,31 +226,32 @@ fn execute_restricted<B: RestrictedBackend>(
             command = command.arg(arg);
         }
     }
-    let outcome = match pool.execute(&command) {
-        Ok(output) if output.restricted && output.process_id != std::process::id() => {
-            ToolOutcome::Success {
-                value: serde_json::json!({
-                    "process_id": output.process_id,
-                    "exit_code": output.exit_code,
-                    "restricted": output.restricted,
-                    "stdout": String::from_utf8_lossy(&output.stdout),
-                    "stderr": String::from_utf8_lossy(&output.stderr),
-                }),
+    let outcome =
+        match pool.execute_with_deadline(&command, Some(Duration::from_millis(EXEC_DEADLINE_MS))) {
+            Ok(output) if output.restricted && output.process_id != std::process::id() => {
+                ToolOutcome::Success {
+                    value: serde_json::json!({
+                        "process_id": output.process_id,
+                        "exit_code": output.exit_code,
+                        "restricted": output.restricted,
+                        "stdout": String::from_utf8_lossy(&output.stdout),
+                        "stderr": String::from_utf8_lossy(&output.stderr),
+                    }),
+                }
             }
-        }
-        Ok(_) => ToolOutcome::Failure {
-            error: ErrorEnvelope::new(
-                ErrorCode::SandboxDenied,
-                "restricted backend did not prove child-process isolation",
-            ),
-        },
-        Err(error) => ToolOutcome::Failure {
-            error: ErrorEnvelope::new(
-                ErrorCode::SandboxDenied,
-                format!("restricted process execution failed: {error}"),
-            ),
-        },
-    };
+            Ok(_) => ToolOutcome::Failure {
+                error: ErrorEnvelope::new(
+                    ErrorCode::SandboxDenied,
+                    "restricted backend did not prove child-process isolation",
+                ),
+            },
+            Err(error) => ToolOutcome::Failure {
+                error: ErrorEnvelope::new(
+                    ErrorCode::SandboxDenied,
+                    format!("restricted process execution failed: {error}"),
+                ),
+            },
+        };
     ToolExecution { outcome, audits }
 }
 

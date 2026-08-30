@@ -122,6 +122,7 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
             cfg.workspace.display()
         )
     })?;
+    let cancel_token = tools::CancellationToken::default();
     let mut registry = ToolRegistry::default();
     register_chat_tools(
         &mut registry,
@@ -129,6 +130,7 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         cfg.plugin_root.as_deref(),
         &cfg.fetch_allow,
         &proxy.url,
+        &cancel_token,
     )?;
     registry.set_escalation_availability(EscalationAvailability::RestrictedBackendMounted);
     let terminal_approver = Arc::new(TerminalApprover::new(
@@ -288,9 +290,13 @@ fn register_chat_tools(
     plugin_root: Option<&Path>,
     fetch_hosts: &[String],
     proxy_url: &str,
+    cancel_token: &tools::CancellationToken,
 ) -> anyhow::Result<usize> {
     let fs_tools =
         tools::FsToolSet::new(workspace).map_err(|error| anyhow::anyhow!(error.message))?;
+    // TASK-802：deadline 取消令牌贯通——registry 超时即取消，fs 工具在提交点放弃
+    fs_tools.set_cancellation_token(cancel_token.clone());
+    registry.set_cancellation_token(std::sync::Arc::new(cancel_token.clone()));
     fs_tools.register(registry);
     register_demo_tools(registry);
     register_web_fetch_tool(registry, proxy_url, fetch_hosts)?;
@@ -847,7 +853,15 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("note.txt"), "hello 803").unwrap();
         let mut registry = ToolRegistry::default();
-        register_chat_tools(&mut registry, &workspace, None, &[], "http://127.0.0.1:1").unwrap();
+        register_chat_tools(
+            &mut registry,
+            &workspace,
+            None,
+            &[],
+            "http://127.0.0.1:1",
+            &tools::CancellationToken::default(),
+        )
+        .unwrap();
         let names: Vec<&str> = registry.names().collect();
         for expected in [
             "fs_read",
@@ -920,6 +934,7 @@ mod tests {
             Some(&plugin_root),
             &[],
             "http://127.0.0.1:1",
+            &tools::CancellationToken::default(),
         )
         .unwrap();
         let names: Vec<&str> = registry.names().collect();
@@ -935,7 +950,15 @@ mod tests {
 
         // 不显式给 plugin_root：不自动信任工作区插件
         let mut ungated = ToolRegistry::default();
-        register_chat_tools(&mut ungated, &workspace, None, &[], "http://127.0.0.1:1").unwrap();
+        register_chat_tools(
+            &mut ungated,
+            &workspace,
+            None,
+            &[],
+            "http://127.0.0.1:1",
+            &tools::CancellationToken::default(),
+        )
+        .unwrap();
         assert!(!ungated.names().any(|name| name == "greeter_hello"));
         std::fs::remove_dir_all(&workspace).ok();
         std::fs::remove_dir_all(&plugin_root).ok();

@@ -149,6 +149,18 @@ pub enum SubagentReportDelivery {
     Quiet,
 }
 
+/// TASK-802：工具终止原因；重放与审计用稳定枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolTermination {
+    /// deadline 到期，进程内 handler 被协作取消，外部命令进程树被终止。
+    DeadlineExceeded,
+    /// 显式取消（token.cancel）且未到 deadline。
+    Cancelled,
+    /// 终止动作本身完成（进程/进程树已退出）。
+    ProcessTreeTerminated,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TeamTaskStatus {
@@ -294,6 +306,12 @@ pub enum Event {
         child_id: String,
         outcome: SubagentOutcome,
     },
+    /// TASK-802：工具执行被取消/超时/终止的结构化留痕；
+    /// 紧随其后必有同 call_id 的 ToolResultAdded（失败结果），保持配对完整。
+    ToolExecutionTerminated {
+        call_id: String,
+        termination: ToolTermination,
+    },
     /// TASK-705：跨会话记忆写入；id 幂等，重放时后写覆盖同 id。
     MemoryRecorded {
         memory_id: String,
@@ -400,6 +418,26 @@ mod tests {
             let encoded = serde_json::to_string(&event).unwrap();
             assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
         }
+    }
+
+    #[test]
+    fn tool_termination_event_roundtrip() {
+        for termination in [
+            ToolTermination::DeadlineExceeded,
+            ToolTermination::Cancelled,
+            ToolTermination::ProcessTreeTerminated,
+        ] {
+            let event = Event::ToolExecutionTerminated {
+                call_id: "c1".into(),
+                termination,
+            };
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event);
+        }
+        assert_eq!(
+            serde_json::to_string(&ToolTermination::DeadlineExceeded).unwrap(),
+            "\"deadline_exceeded\""
+        );
     }
 
     #[test]

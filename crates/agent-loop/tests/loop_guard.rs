@@ -267,3 +267,80 @@ fn distinct_arguments_reset_the_consecutive_counter() {
     assert_eq!(failures, 0, "参数每次都不同，循环防护不得触发");
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn tool_timeout_leaves_structured_termination_event_with_pairing() {
+    use std::sync::atomic::AtomicUsize;
+    let path = tmp("timeout-event.jsonl");
+    let _ = std::fs::remove_file(&path);
+    let mut session = JsonlSession::create(path.clone()).unwrap();
+    let mut registry = ToolRegistry::default();
+    registry.register(
+        tools::ToolSpec {
+            name: "slow".into(),
+            description: "demo".into(),
+            parameters_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            escalation_capable: false,
+            timeout_ms: Some(60),
+        },
+        Box::new(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            ToolOutcome::Success { value: ().into() }
+        }),
+    );
+    struct OneToolCall(AtomicUsize);
+    impl ChatModel for OneToolCall {
+        fn stream_chat(
+            &self,
+            _: &ModelCallSpec,
+            _: &[ChatMessage],
+            _: Option<&serde_json::Value>,
+        ) -> Result<ChatReply, ErrorEnvelope> {
+            let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                Ok(ChatReply {
+                    text: String::new(),
+                    finish_reason: Some("tool_calls".into()),
+                    tool_calls: vec![ToolCallRequest {
+                        id: "call_0".into(),
+                        name: "slow".into(),
+                        arguments: "{}".into(),
+                    }],
+                    usage: None,
+                })
+            } else {
+                Ok(ChatReply {
+                    text: "超时已处理".into(),
+                    finish_reason: Some("stop".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                })
+            }
+        }
+    }
+    let model = OneToolCall(std::sync::atomic::AtomicUsize::new(0));
+    let mut lp = AgentLoop::with_chat(&mut session, &registry, &model, spec());
+    lp.inbox.push("调用慢工具");
+    assert_eq!(lp.run_turn(), 1);
+    let events = replay(&path).unwrap();
+    // 终止事件 + 失败结果 + 配对完整
+    assert!(events.iter().any(|sequenced| matches!(
+        &sequenced.event,
+        Event::ToolExecutionTerminated {
+            call_id,
+            termination: protocol::ToolTermination::DeadlineExceeded,
+        } if call_id == "call_0"
+    )));
+    assert!(events.iter().any(|sequenced| matches!(
+        &sequenced.event,
+        Event::ToolResultAdded {
+            call_id,
+            outcome: ToolOutcome::Failure { error },
+        } if call_id == "call_0" && error.code == ErrorCode::ToolTimeout
+    )));
+    assert!(matches!(
+        events.last().unwrap().event,
+        Event::TurnCompleted { .. }
+    ));
+    std::fs::remove_file(&path).ok();
+}

@@ -58,6 +58,18 @@ pub struct ExecutionOutput {
 pub trait RestrictedBackend {
     fn execute(&self, command: &CommandSpec) -> io::Result<ExecutionOutput>;
 
+    /// TASK-802：带 deadline 的执行。外部命令超时必须终止进程**及其受控子进程**；
+    /// 终止失败时返回 Err（fail-closed），绝不把无法终止的进程伪装成已收口。
+    /// None = 不限时（与 execute 等价，行为兼容）。
+    fn execute_with_deadline(
+        &self,
+        command: &CommandSpec,
+        deadline: Option<std::time::Duration>,
+    ) -> io::Result<ExecutionOutput> {
+        let _ = deadline;
+        self.execute(command)
+    }
+
     /// 返回执行器自身的 OS/home/workspace 事实；缺失时调用方必须拒绝授权。
     fn environment(&self) -> io::Result<ExecutorEnvironment> {
         Err(io::Error::new(
@@ -83,6 +95,15 @@ impl<B: RestrictedBackend> RestrictedProcessPool<B> {
         self.backend.execute(command)
     }
 
+    /// TASK-802：带 deadline 的执行；后端负责终止进程树。
+    pub fn execute_with_deadline(
+        &self,
+        command: &CommandSpec,
+        deadline: Option<std::time::Duration>,
+    ) -> io::Result<ExecutionOutput> {
+        self.backend.execute_with_deadline(command, deadline)
+    }
+
     pub fn environment(&self) -> io::Result<ExecutorEnvironment> {
         self.backend.environment()
     }
@@ -96,6 +117,14 @@ pub struct PlatformRestrictedBackend;
 impl RestrictedBackend for PlatformRestrictedBackend {
     fn execute(&self, command: &CommandSpec) -> io::Result<ExecutionOutput> {
         windows::execute(command)
+    }
+
+    fn execute_with_deadline(
+        &self,
+        command: &CommandSpec,
+        deadline: Option<std::time::Duration>,
+    ) -> io::Result<ExecutionOutput> {
+        windows::execute_with_deadline(command, deadline)
     }
 
     fn environment(&self) -> io::Result<ExecutorEnvironment> {
@@ -121,6 +150,15 @@ impl RestrictedBackend for PlatformRestrictedBackend {
 impl RestrictedBackend for PlatformRestrictedBackend {
     fn execute(&self, command: &CommandSpec) -> io::Result<ExecutionOutput> {
         landlock_backend::LandlockBackend::from_environment(0)?.execute(command)
+    }
+
+    fn execute_with_deadline(
+        &self,
+        command: &CommandSpec,
+        deadline: Option<std::time::Duration>,
+    ) -> io::Result<ExecutionOutput> {
+        landlock_backend::LandlockBackend::from_environment(0)?
+            .execute_with_deadline(command, deadline)
     }
 
     fn environment(&self) -> io::Result<ExecutorEnvironment> {
