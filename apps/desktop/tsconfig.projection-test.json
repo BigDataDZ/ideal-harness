@@ -3,9 +3,9 @@
   "compilerOptions": {
     "noEmit": false,
     "outDir": ".projection-test",
-    "rootDir": "src/lib/projection",
+    "rootDir": "src",
     "rewriteRelativeImportExtensions": true,
     "tsBuildInfoFile": ".projection-test/tsconfig.tsbuildinfo"
   },
-  "include": ["src/lib/projection"]
+  "include": ["src"]
 }

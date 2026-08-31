@@ -1,7 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useReducer, useState } from "react";
 
-type ShellState = "connecting" | "ready" | "unavailable";
+import {
+  operationReducer,
+  SessionNavigator,
+  type CommandErrorDto,
+  type SessionCollectionState,
+  type SessionOperation,
+  type SessionReceiptDto,
+} from "./features/sessions/index.ts";
+import { TimelinePanel } from "./features/timeline/index.ts";
+import type { ProjectionSnapshot } from "./lib/projection/index.ts";
 
 interface DesktopStatus {
   operation: string;
@@ -11,75 +20,122 @@ interface DesktopStatus {
 }
 
 function App() {
-  const [shellState, setShellState] = useState<ShellState>("connecting");
-  const [statusText, setStatusText] = useState("正在连接受限 Rust 宿主…");
+  const [security, setSecurity] = useState<DesktopStatus | null>(null);
+  const [sessions, setSessions] = useState<SessionCollectionState>({ kind: "loading" });
+  const [selectedSnapshot] = useState<ProjectionSnapshot | null>(null);
+  const [operation, dispatchOperation] = useReducer(operationReducer, { kind: "idle" });
 
-  useEffect(() => {
-    let active = true;
-
+  const connect = useCallback(() => {
+    setSessions({ kind: "loading" });
     invoke<DesktopStatus>("desktop_status")
       .then((status) => {
-        if (active) {
-          setStatusText(
-            `Rust 宿主已连接 · generation ${status.generation} · permission epoch ${status.permissionEpoch}`,
-          );
-          setShellState("ready");
-        }
+        setSecurity(status);
+        setSessions({ kind: "ready", sessions: [], selectedId: null });
       })
-      .catch(() => {
-        if (active) {
-          setStatusText("请通过 Tauri 桌面入口启动；浏览器预览不连接本地宿主");
-          setShellState("unavailable");
-        }
+      .catch((cause: unknown) => {
+        const error = commandError(cause);
+        setSecurity(null);
+        setSessions(
+          error.code === "sandbox_denied"
+            ? { kind: "forbidden", message: error.message }
+            : { kind: "error", error },
+        );
       });
-
-    return () => {
-      active = false;
-    };
   }, []);
 
+  useEffect(() => connect(), [connect]);
+
+  const submitOperation = useCallback(
+    (requested: SessionOperation) => {
+      if (!security) {
+        dispatchOperation({
+          type: "failed",
+          error: { code: "internal", message: "Rust 宿主尚未连接" },
+        });
+        return;
+      }
+      invoke<SessionReceiptDto>("session_operation", {
+        request: operationRequest(requested, security),
+      })
+        .then((receipt) => dispatchOperation({ type: "receipt", receipt }))
+        .catch((cause: unknown) => dispatchOperation({ type: "failed", error: commandError(cause) }));
+    },
+    [security],
+  );
+
+  const requestOperation = (requested: SessionOperation) => {
+    dispatchOperation({ type: "request", operation: requested });
+    if (requested.kind === "create" || requested.kind === "resume") submitOperation(requested);
+  };
+
+  const confirmOperation = () => {
+    if (operation.kind !== "confirming") return;
+    const requested = operation.operation;
+    dispatchOperation({ type: "confirm" });
+    submitOperation(requested);
+  };
+
+  const selectedId =
+    sessions.kind === "ready" || sessions.kind === "disconnected" ? sessions.selectedId : null;
+
   return (
-    <main className="shell">
-      <section className="hero" aria-labelledby="app-title">
-        <div className="brand-mark" aria-hidden="true">
-          IH
-        </div>
-        <p className="eyebrow">IDEAL HARNESS · DESKTOP</p>
-        <h1 id="app-title">可靠的 Agent，清晰的边界。</h1>
-        <p className="summary">
-          Tauri 只承载界面，Rust Harness 继续管理会话、工具、沙箱与审批。所有状态最终都能由事件流重建。
-        </p>
-
-        <div className={`status status--${shellState}`} role="status" aria-live="polite">
-          <span className="status__dot" aria-hidden="true" />
-          <span>{statusText}</span>
-        </div>
-      </section>
-
-      <section className="principles" aria-label="桌面端安全原则">
-        <article>
-          <span>01</span>
-          <h2>唯一真相源</h2>
-          <p>客户端只投影 Event，不在 WebView 内复制业务状态。</p>
-        </article>
-        <article>
-          <span>02</span>
-          <h2>默认无权限</h2>
-          <p>Capability 从空白名单起步，能力按任务逐项开放。</p>
-        </article>
-        <article>
-          <span>03</span>
-          <h2>显式桥接</h2>
-          <p>敏感操作只通过经过校验的 Rust command 进入核心。</p>
-        </article>
-      </section>
-
-      <footer>
-        <span>TASK-903</span>
-        <span>安全命令桥已就绪 · capability 默认拒绝</span>
-      </footer>
+    <main className="app-shell">
+      <SessionNavigator
+        state={sessions}
+        operation={operation}
+        onSelect={(sessionId) => {
+          if (sessions.kind === "ready" || sessions.kind === "disconnected") {
+            setSessions({ ...sessions, selectedId: sessionId });
+          }
+        }}
+        onRequestOperation={requestOperation}
+        onConfirmOperation={confirmOperation}
+        onDismissOperation={() => dispatchOperation({ type: "dismiss" })}
+        onRetry={connect}
+      />
+      <div className="workspace-shell">
+        <header className="app-header">
+          <div className="brand-lockup">
+            <span className="brand-mark" aria-hidden="true">IH</span>
+            <div><strong>ideal-harness</strong><span>Event-sourced Agent Desktop</span></div>
+          </div>
+          <div className="host-facts" aria-label="宿主安全状态">
+            <span>SESSION {selectedId ?? "NONE"}</span>
+            <span>GEN {security?.generation ?? "—"}</span>
+            <span>EPOCH {security?.permissionEpoch ?? "—"}</span>
+          </div>
+        </header>
+        <TimelinePanel snapshot={selectedSnapshot} />
+        <footer className="app-footer">
+          <span>TASK-905</span>
+          <span>事件是唯一真相源 · 客户端不持久化会话状态</span>
+        </footer>
+      </div>
     </main>
   );
+}
+
+function operationRequest(operation: SessionOperation, status: DesktopStatus): Record<string, unknown> {
+  const context = { generation: status.generation, permissionEpoch: status.permissionEpoch };
+  switch (operation.kind) {
+    case "create":
+    case "resume":
+      return { operation: operation.kind, context, sessionId: operation.sessionId };
+    case "fork":
+      return { operation: "fork", context, sourceId: operation.sourceId, targetId: operation.targetId, boundary: operation.boundary };
+    case "revert":
+      return { operation: "revert", context, sourceId: operation.sourceId, targetId: operation.targetId, turnId: operation.turnId };
+  }
+}
+
+function commandError(cause: unknown): CommandErrorDto {
+  if (cause !== null && typeof cause === "object") {
+    const candidate = cause as Record<string, unknown>;
+    if (typeof candidate.code === "string" && typeof candidate.message === "string") {
+      return { code: candidate.code, message: candidate.message };
+    }
+  }
+  return { code: "internal", message: "宿主暂时不可用" };
 }
 
 export default App;

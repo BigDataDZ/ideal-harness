@@ -415,13 +415,14 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 - 依赖: TASK-901、TASK-903、D18
 - 完成证据: 新增无外部依赖的纯投影库、wire DTO 运行时校验和 SSE `id`/事件序号绑定；覆盖乱序补洞、重复幂等、冲突修复、断线续传、generation 重启、并发分页水位、未知事件降级与 replay 收敛共 6 项确定性测试；`npm test`、typecheck、生产构建、依赖审计、桌面 Rust 门禁及 workspace 318 项测试全绿，Rust 1.85 兼容构建通过
 
-### TASK-905: 会话导航、Timeline 与诊断面板 ⬜
+### TASK-905: 会话导航、Timeline 与诊断面板 ✅
 - 目标范围: `apps/desktop/src/features/sessions`、`apps/desktop/src/features/timeline`
 - 内容: 会话列表、新建/resume/fork/revert 入口，turn 状态、Event 时间线、错误码、Token 用量、Agent Team 状态和连接代际展示；错误展示使用 code 决定交互，message 只用于说明
 - 验收标准: 空状态/加载/断线/坏会话/无权限均有明确 UI；fork/revert 必须二次确认且结果由事件回执确认；键盘导航和基础无障碍检查通过；快照覆盖主要状态
 - 允许新增依赖: shadcn/ui（源码组件）或 Ant Design 二选一，由 TASK-901 锁定；不得并存两套组件库
 - 明确不做: 不提供事件删除/篡改；不把客户端缓存作为会话列表真相源
 - 依赖: TASK-904
+- 完成证据: 新增无第三方 UI 依赖的会话导航、操作确认状态机、Timeline 与诊断投影；错误交互严格按稳定 code 路由，fork/revert 经二次确认和宿主回执后仍等待事件投影，不乐观改写会话列表；Event 安全摘要覆盖 Turn、Token、Agent Team、错误与 generation，未知事件只降级展示；13 项前端测试覆盖主要状态快照、无障碍语义和投影确定性，1280/700 宽真实渲染无控制台错误和横向溢出；前端 typecheck/build/audit、桌面 Rust 门禁、workspace 318 项测试及 Rust 1.85 构建全绿
 
 ### TASK-906: 流式对话、工具调用卡片与 Markdown 展示 ⬜
 - 目标范围: `apps/desktop/src/features/chat`
