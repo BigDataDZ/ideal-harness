@@ -6,7 +6,11 @@
 > 取其共识（事件溯源、ErrorCode 路由、OS 级沙箱），避其教训（巨石 core / 过度碎片化）。
 > 每个决策的对标记录见 [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md)。
 
-## 当前状态：路线图 P8 已完成 ✅（真实模型冒烟待 key 执行，见 tests/manual/p8-smoke.md）
+## 当前状态：路线图 P8 代码与自动化门禁已完成 ✅；发布验收待真实模型冒烟 🟡
+
+Windows、Ubuntu（含真实 Landlock）、MSRV 1.85 与供应链门禁均已通过；唯一未完成项是使用
+`IDEAL_HARNESS_API_KEY` 执行一次真实模型冒烟并回填记录，详见
+[tests/manual/p8-smoke.md](tests/manual/p8-smoke.md)。
 
 ✅ 已实现：流式模型与工具闭环、三层沙箱与 fail-closed 审批、JSONL/zstd/SQLite 会话恢复、
 上下文压缩与 spill、subagent 生命周期与角色策略、stdio MCP、可信 Skill、可审计 Hook，

@@ -17,8 +17,8 @@
 | P4.1 | v0.5.1 ✅ | **可靠性收口**：统一存储、崩溃恢复、subagent 治理 | 压缩会话可恢复；子代理资源与权限不越界 |
 | P5 | v0.6 ✅ | **扩展生态**：MCP/skill/hooks/Web 投影 | 第三方工具可控接入；客户端断线可按 seq 补洞 |
 | P6 | v0.7 ✅ | **运行时闭环**：忠实重放、层级预算、权限时效与受监管扩展 | resume 与在线上下文等价；预算/权限/连接状态不可被旧状态绕过 |
-| P7 | v0.8 ✅ | **工具面扩展**：内置文件工具、执行护栏、白名单 web_fetch、turn 内 steer、跨会话记忆、Landlock 后端 | 出口判据由 TASK-803/808 收口：生产 CLI 装配 + scripted 端到端已证；真实模型冒烟见 tests/manual/p8-smoke.md |
-| P8 | v0.9 ✅ | **安全与产品化收口**：出网目标钉扎、可取消工具、生产装配、并发一致性、跨平台证据 | 真实 CLI 能安全完成代码任务；Windows/Linux CI 与安全回归全绿；文档、版本和实际能力一致 |
+| P7 | v0.8 ✅ | **工具面扩展**：内置文件工具、执行护栏、白名单 web_fetch、turn 内 steer、跨会话记忆、Landlock 后端 | 出口判据由 TASK-803/808 收口：生产 CLI 装配 + scripted 端到端已证 |
+| P8 | v0.9 🟡 | **安全与产品化收口**：出网目标钉扎、可取消工具、生产装配、并发一致性、跨平台证据 | 代码与自动化门禁已完成；Windows/Linux CI 与安全回归全绿；发布验收仅待真实模型冒烟 |
 
 并行规则：**同一阶段内不同 crate 的任务卡可由多个智能体并行认领；涉及 protocol 的任务串行**（契约冻结原则）。
 
@@ -287,7 +287,7 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 ## 十、P8 安全与产品化收口（v0.9）
 
 > 来源：P7 完成后的整体验收。当前单元/集成测试覆盖较强，但安全边界、真实 CLI 装配、跨平台证据和发布口径仍有缺口。
-> 本节卡片已按 2026-08-31 实际交付修订（as-built）；两项待外部实证的事项以「待实证」标注。
+> 本节卡片已按 2026-08-31 实际交付修订（as-built）；跨平台 CI 已取得远程实证，真实模型冒烟因未提供 key 仍待验收。
 
 ### TASK-801: DNS 解析后目标钉扎与 SSRF 闭环 ✅（commit `48989d9`）
 - 目标 crate: network-proxy（钉扎与校验的落地层）、tools（703 字面量 SSRF 检查沿用）、harness-cli（测试旗标）
@@ -335,25 +335,24 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 - 落地注记: P7 卡 705 遗漏的「单条记忆大小受限」在本卡收口
 - 依赖: TASK-705、TASK-602、TASK-607
 
-### TASK-807: 跨平台 CI 与安全供应链门禁 ✅（commit `9185617`；Landlock 实证待分支推送后由 Ubuntu job 出具）
+### TASK-807: 跨平台 CI 与安全供应链门禁 ✅（实现 `9185617`；修复收口至 `06e4923`）
 - 目标范围: `.github/workflows`、workspace 配置、sandbox-exec 测试
 - 内容（as-built）: CI 触发改为**全分支** + PR；build/test/clippy 全部 `--all-features` 且 clippy `-D warnings`；Windows + Ubuntu 双矩阵——Ubuntu 真实执行 Landlock 越界测试（内核不支持时测试硬失败，不允许静默跳过冒充通过）；新增 MSRV job（workspace 声明 `rust-version = "1.85.0"`，全 crate 继承）；新增 cargo-deny 供应链 job（advisories/licenses/bans/sources，可复现配置 `deny.toml`，例外必须留证）
-- 验收标准: 1/2 已落入工作流定义；3 的 rust-version 已声明且 MSRV job 配置完成——「CI 全绿」的最终证据在分支推送后由 GitHub Actions 出具
-- 待实证: 推送分支 → CI 首次运行 → Ubuntu Landlock 测试结果回填本卡
+- 验收结果: GitHub Actions [run #13](https://github.com/BigDataDZ/ideal-harness/actions/runs/33353637643) 四项全绿——Windows、Ubuntu（真实执行 Landlock 越界测试）、MSRV 1.85、cargo-deny 均通过
 - 明确不做: 不在 CI 使用真实 API key；不把不稳定公网测试设为单元门禁；不引入运行时外部依赖
 - 依赖: TASK-801、TASK-802、TASK-804
 
-### TASK-808: 真实仓库代码任务端到端验收 ✅（commit `b1f062e`；真实模型冒烟待 key 执行，规程见 tests/manual/p8-smoke.md）
+### TASK-808: 真实仓库代码任务端到端验收 🟡（scripted 已完成；真实模型冒烟待 key）
 - 目标 crate: harness-cli、tools、agent-loop；目标目录: tests/manual
 - 内容（as-built）: 离线 scripted-provider 端到端场景走**生产装配**（register_chat_tools + 受限 exec + 审批 + 结果中间件 + 循环护栏）完成「fs_grep 定位 → fs_read 拿 hash → fs_edit CAS 修复 → exec 提权跑测试 → 完成」全链；断言最终文件内容、精确工具调用轨迹、ApprovalDecided 审计、turn 完成、无幽灵副作用；真实模型手动冒烟规程（含篡改复现 FileRevisionConflict、/steer、resume 验证）写入 tests/manual/p8-smoke.md
-- 验收标准: 1（离线 scripted CI 回归）达成；2 的规程已就绪、执行记录待 key 持有者回填；3 达成（场景直接调用生产装配函数而非测试专用路径）
+- 验收结果: 1（离线 scripted CI 回归）达成；3 达成（场景直接调用生产装配函数而非测试专用路径）；2 的规程已就绪，但 2026-08-31 当前环境未设置 `IDEAL_HARNESS_API_KEY`，执行记录待 key 持有者回填
 - 明确不做: 不让 CI 依赖付费模型或公网；不自动修改真实用户仓库；不以单次成功替代故障注入测试
 - 依赖: TASK-801~807
 
 ### TASK-809: 版本、文档与能力声明一致性 ✅（commit `54eb5a6`）
 - 目标范围: Cargo workspace、README、CHANGELOG、ROADMAP
-- 内容（as-built）: workspace 版本 0.2.0 → 0.9.0（对齐路线图）；CHANGELOG 增 0.9.0 段逐卡记录；README 状态行标注「P8 已完成 + 真实模型冒烟待 key 执行」的诚实口径；本卡即文档同步提交
-- 验收标准: README 每项声明有生产入口与测试对应；版本/CHANGELOG/路线图一致；Landlock 与真实模型冒烟按「待实证」标注而非宣称完成
+- 内容（as-built）: workspace 版本 0.2.0 → 0.9.0（对齐路线图）；CHANGELOG 增 0.9.0 段逐卡记录；README 区分「代码与自动化门禁完成」和「真实模型发布验收待 key」；本卡即文档同步提交
+- 验收标准: README 每项声明有生产入口与测试对应；版本/CHANGELOG/路线图一致；Landlock 已链接远程实证，真实模型冒烟明确标为未完成而非宣称通过
 - 明确不做: 不重写历史提交；不删除历史任务卡；不虚构 CI、性能或安全验证结果
 - 依赖: TASK-808
 
@@ -369,8 +368,8 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 
 - **安全串行链**：801 → 802 ✅
 - **产品/一致性并行组**：803、804、805、806 ✅
-- **发布证据链**：807 → 808 → 809 ✅；810 ✅
-- **P8 出口判据**：801~810 全部完成 ✅；真实 CLI 端到端通过（scripted 已证 + 真实模型冒烟待 key）✅；Windows/Linux 远程 CI 全绿（推送后出具）；README、版本和生产能力一致 ✅
+- **发布证据链**：807 ✅ → 808 🟡 → 809 ✅；810 ✅
+- **P8 出口判据**：801~807、809~810 完成 ✅；真实 CLI scripted 端到端已证 ✅；真实模型冒烟待 key 🟡；Windows/Linux 远程 CI 全绿 ✅；README、版本和生产能力一致 ✅
 
 ## 十一、质量门禁演进（随阶段收紧）
 

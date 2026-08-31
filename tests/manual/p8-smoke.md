@@ -3,6 +3,14 @@
 > 目的：验证生产 CLI（非测试装配）在真实模型下完成一次仓库代码任务。
 > 本记录必须由持有 `IDEAL_HARNESS_API_KEY` 的人执行一次并回填结果；CI 不使用真实 key。
 
+## 当前状态
+
+- 状态：待执行（不是失败，也未以 scripted-provider 结果冒充真实模型通过）。
+- 最近检查：2026-08-31，当前执行环境未设置 `IDEAL_HARNESS_API_KEY`。
+- 已有基线：scripted-provider 生产装配端到端测试和远程四项 CI 门禁均通过；CI 证据见
+  [GitHub Actions run #13](https://github.com/BigDataDZ/ideal-harness/actions/runs/33353637643)。
+- 解锁条件：仅需为执行进程提供 `IDEAL_HARNESS_API_KEY`，无需修改代码或把 key 写入仓库。
+
 ## 前置
 
 - `IDEAL_HARNESS_API_KEY` 已设置（DeepSeek 兼容端点）。

@@ -5,8 +5,10 @@
 
 ## [0.9.0] - 2026-08-30
 
-P8「安全与产品化收口」达成：SSRF 闭环、可取消工具、生产装配、CAS 文件写入、
-原子 batch、记忆预算、供应链门禁、端到端验收、fuzz/soak 与资源上限。
+P8「安全与产品化收口」代码交付：SSRF 闭环、可取消工具、生产装配、CAS 文件写入、
+原子 batch、记忆预算、供应链门禁、scripted 端到端验收、fuzz/soak 与资源上限。
+Windows、Ubuntu（含真实 Landlock）、MSRV 1.85 和供应链远程门禁均已通过；发布验收仅待
+按 `tests/manual/p8-smoke.md` 使用真实模型执行一次冒烟。
 
 ### Added
 
@@ -28,6 +30,7 @@ P8「安全与产品化收口」达成：SSRF 闭环、可取消工具、生产�
 
 ### Fixed
 
+- **CI/sandbox-exec**：恢复格式、MSRV 与 cargo-deny 门禁，修正 Linux Landlock FFI 布局和 syscall 参数，并补齐跨平台测试条件编译；远程 Windows、Ubuntu、MSRV、供应链四项门禁全绿
 - **network-proxy/harness-cli**：修复 `web_fetch` 在真实 chat 链路上的断链——代理白名单此前只含 provider 域名，fetch 目标在工具层放行后仍会被代理拒绝；现在 `--fetch-allow` 主机会同时注入代理 allowlist（`ProviderProxy::start_with_fetch_hosts`），代理补齐 absolute-form GET/HEAD 明文转发（请求头此前被读取后未转发给源站），并在 accept 后显式恢复阻塞模式（Windows 非阻塞继承会导致 WSAEWOULDBLOCK）。新增 reqwest→代理→源站的端到端测试
 
 ### Added
