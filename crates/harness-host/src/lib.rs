@@ -1,5 +1,6 @@
 //! D25/TASK-902: shared production Host assembly for CLI and desktop entry points.
 
+mod desktop_bridge;
 mod security;
 
 use std::path::{Path, PathBuf};
@@ -10,13 +11,17 @@ use agent_loop::{
 };
 use approval::Approver;
 use model_provider::{ChatMessage, OpenAiCompatClient};
-use protocol::{ErrorEnvelope, Event, ModelCallSpec, ToolOutcome};
+pub use protocol::{ErrorCode, ErrorEnvelope};
+use protocol::{Event, ModelCallSpec, ToolOutcome};
 use sandbox_exec::PlatformRestrictedBackend;
 use session::{replay_session, JsonlSession, SessionStore};
 use tools::{
     CancellationToken, EscalationAvailability, ToolAudit, ToolExecution, ToolRegistry, ToolSpec,
 };
 
+pub use desktop_bridge::{
+    CommandContext, CommandReceipt, DesktopBridge, SessionOperation, SessionReceipt,
+};
 pub use security::register_exec_tool;
 use security::ProviderProxy;
 

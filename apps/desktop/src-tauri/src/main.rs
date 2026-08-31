@@ -1,38 +1,33 @@
-//! D25/TASK-902: restricted desktop entry point backed by the shared Host assembly.
+//! D25/TASK-903: thin restricted Tauri entry point.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-#[tauri::command]
-fn desktop_status() -> String {
-    match harness_host::HostConfig::default().validate() {
-        Ok(_) => format!(
-            "Rust 宿主已连接 · ideal-harness v{} · capability 默认拒绝",
-            env!("CARGO_PKG_VERSION")
-        ),
-        Err(_) => "Rust 宿主配置不可用 · capability 默认拒绝".into(),
-    }
-}
+mod commands;
+
+use commands::{
+    cancel_turn, close_window, desktop_status, initialize_state, respond_approval,
+    session_operation, start_turn, steer_turn, stop_turn,
+};
 
 fn main() {
+    let workspace = std::env::current_dir().expect("desktop working directory must be available");
+    let state = initialize_state(&workspace).expect("desktop security boundary must initialize");
     tauri::Builder::default()
-        .invoke_handler(tauri::generate_handler![desktop_status])
+        .manage(state)
+        .invoke_handler(tauri::generate_handler![
+            desktop_status,
+            start_turn,
+            stop_turn,
+            cancel_turn,
+            steer_turn,
+            respond_approval,
+            session_operation
+        ])
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                close_window(window);
+            }
+        })
         .run(tauri::generate_context!())
         .expect("Tauri desktop runtime failed to start");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::desktop_status;
-
-    #[test]
-    fn desktop_status_reports_version_and_default_deny_boundary() {
-        let status = desktop_status();
-        assert!(status.contains(env!("CARGO_PKG_VERSION")));
-        assert!(status.contains("capability 默认拒绝"));
-    }
-
-    #[test]
-    fn desktop_uses_the_shared_host_config_boundary() {
-        assert!(harness_host::HostConfig::default().validate().is_ok());
-    }
 }

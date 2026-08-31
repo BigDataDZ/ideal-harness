@@ -3,6 +3,13 @@ import { useEffect, useState } from "react";
 
 type ShellState = "connecting" | "ready" | "unavailable";
 
+interface DesktopStatus {
+  operation: string;
+  generation: number;
+  permissionEpoch: number;
+  turnId: number | null;
+}
+
 function App() {
   const [shellState, setShellState] = useState<ShellState>("connecting");
   const [statusText, setStatusText] = useState("正在连接受限 Rust 宿主…");
@@ -10,10 +17,12 @@ function App() {
   useEffect(() => {
     let active = true;
 
-    invoke<string>("desktop_status")
+    invoke<DesktopStatus>("desktop_status")
       .then((status) => {
         if (active) {
-          setStatusText(status);
+          setStatusText(
+            `Rust 宿主已连接 · generation ${status.generation} · permission epoch ${status.permissionEpoch}`,
+          );
           setShellState("ready");
         }
       })
@@ -66,8 +75,8 @@ function App() {
       </section>
 
       <footer>
-        <span>TASK-901</span>
-        <span>桌面骨架已就绪 · 业务装配将在 TASK-902 接入</span>
+        <span>TASK-903</span>
+        <span>安全命令桥已就绪 · capability 默认拒绝</span>
       </footer>
     </main>
   );

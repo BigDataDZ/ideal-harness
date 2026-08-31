@@ -1,0 +1,395 @@
+//! D25/TASK-903: explicit DTO command bridge and bounded Host lifecycle.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use harness_host::{
+    CommandContext, CommandReceipt, DesktopBridge, ErrorCode, ErrorEnvelope, HostConfig,
+    SessionOperation, SessionReceipt,
+};
+use serde::{Deserialize, Serialize};
+use tauri::Manager;
+
+pub(crate) struct DesktopState(Mutex<DesktopBridge>);
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SecurityContextDto {
+    generation: u64,
+    permission_epoch: u64,
+}
+
+impl From<SecurityContextDto> for CommandContext {
+    fn from(value: SecurityContextDto) -> Self {
+        Self {
+            generation: value.generation,
+            permission_epoch: value.permission_epoch,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct StartTurnDto {
+    context: SecurityContextDto,
+    session_id: String,
+    workspace: PathBuf,
+    input: String,
+    base_url: String,
+    model: String,
+    #[serde(default)]
+    fetch_allow: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TurnCommandDto {
+    context: SecurityContextDto,
+    turn_id: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SteerDto {
+    context: SecurityContextDto,
+    turn_id: u64,
+    input: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ApprovalResponseDto {
+    context: SecurityContextDto,
+    request_id: String,
+    executor_generation: u64,
+    approved: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum SessionOperationDto {
+    Create {
+        context: SecurityContextDto,
+        session_id: String,
+    },
+    Resume {
+        context: SecurityContextDto,
+        session_id: String,
+    },
+    Fork {
+        context: SecurityContextDto,
+        source_id: String,
+        target_id: String,
+        boundary: Option<usize>,
+    },
+    Revert {
+        context: SecurityContextDto,
+        source_id: String,
+        target_id: String,
+        turn_id: u64,
+    },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CommandReceiptDto {
+    operation: String,
+    generation: u64,
+    permission_epoch: u64,
+    turn_id: Option<u64>,
+}
+
+impl From<CommandReceipt> for CommandReceiptDto {
+    fn from(value: CommandReceipt) -> Self {
+        Self {
+            operation: value.operation.into(),
+            generation: value.generation,
+            permission_epoch: value.permission_epoch,
+            turn_id: value.turn_id,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionReceiptDto {
+    session_id: String,
+    event_count: u64,
+    generation: u64,
+}
+
+impl From<SessionReceipt> for SessionReceiptDto {
+    fn from(value: SessionReceipt) -> Self {
+        Self {
+            session_id: value.session_id,
+            event_count: value.event_count,
+            generation: value.generation,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CommandErrorDto {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl From<ErrorEnvelope> for CommandErrorDto {
+    fn from(value: ErrorEnvelope) -> Self {
+        let (code, message) = match value.code {
+            ErrorCode::ToolArgsInvalid => ("tool_args_invalid", "请求参数无效"),
+            ErrorCode::SandboxDenied => ("sandbox_denied", "请求超出安全边界"),
+            ErrorCode::ApprovalRejected => ("approval_rejected", "审批不存在、已拒绝或已过期"),
+            ErrorCode::SessionNotFound => ("session_not_found", "会话不存在"),
+            ErrorCode::CursorInvalid => ("cursor_invalid", "客户端代际已过期，请刷新后重试"),
+            ErrorCode::ToolTimeout => ("tool_timeout", "操作已取消或超时"),
+            ErrorCode::ContextWindowExceeded => ("context_window_exceeded", "上下文窗口不足"),
+            ErrorCode::ModelStreamBroken => ("model_stream_broken", "模型流已中断"),
+            ErrorCode::SubagentCancelled => ("subagent_cancelled", "子任务已取消"),
+            ErrorCode::TeamRevisionConflict => ("team_revision_conflict", "团队状态版本冲突"),
+            ErrorCode::TeamDependencyCycle => ("team_dependency_cycle", "团队任务依赖成环"),
+            ErrorCode::ToolLoopDetected => ("tool_loop_detected", "工具循环已被阻止"),
+            ErrorCode::FileRevisionConflict => ("file_revision_conflict", "文件版本已变化"),
+            ErrorCode::Internal => ("internal", "宿主暂时不可用"),
+        };
+        Self { code, message }
+    }
+}
+
+#[tauri::command]
+pub(crate) fn desktop_status(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<CommandReceiptDto, CommandErrorDto> {
+    let bridge = lock_bridge(&state)?;
+    let context = bridge.context();
+    Ok(CommandReceiptDto {
+        operation: format!("desktop_status_v{}", env!("CARGO_PKG_VERSION")),
+        generation: context.generation,
+        permission_epoch: context.permission_epoch,
+        turn_id: None,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn start_turn(
+    request: StartTurnDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<CommandReceiptDto, CommandErrorDto> {
+    let mut bridge = lock_bridge(&state)?;
+    let context = request.context.into();
+    let config = HostConfig {
+        base_url: request.base_url,
+        model: request.model,
+        fetch_allow: request.fetch_allow,
+        workspace: request.workspace.clone(),
+        plugin_root: None,
+    };
+    if !bridge.has_production_host() {
+        bridge
+            .install_production_host(context, config, None)
+            .map_err(CommandErrorDto::from)?;
+    } else {
+        bridge
+            .validate_installed_host(context, config)
+            .map_err(CommandErrorDto::from)?;
+    }
+    bridge
+        .start_turn(
+            context,
+            &request.session_id,
+            &request.workspace,
+            &request.input,
+        )
+        .map(CommandReceiptDto::from)
+        .map_err(CommandErrorDto::from)
+}
+
+#[tauri::command]
+pub(crate) fn stop_turn(
+    request: TurnCommandDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<CommandReceiptDto, CommandErrorDto> {
+    cancel_active_turn(request, state)
+}
+
+#[tauri::command]
+pub(crate) fn cancel_turn(
+    request: TurnCommandDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<CommandReceiptDto, CommandErrorDto> {
+    cancel_active_turn(request, state)
+}
+
+fn cancel_active_turn(
+    request: TurnCommandDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<CommandReceiptDto, CommandErrorDto> {
+    lock_bridge(&state)?
+        .cancel_turn(request.context.into(), request.turn_id)
+        .map(CommandReceiptDto::from)
+        .map_err(CommandErrorDto::from)
+}
+
+#[tauri::command]
+pub(crate) fn steer_turn(
+    request: SteerDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<CommandReceiptDto, CommandErrorDto> {
+    lock_bridge(&state)?
+        .steer(request.context.into(), request.turn_id, &request.input)
+        .map(CommandReceiptDto::from)
+        .map_err(CommandErrorDto::from)
+}
+
+#[tauri::command]
+pub(crate) fn respond_approval(
+    request: ApprovalResponseDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<CommandReceiptDto, CommandErrorDto> {
+    lock_bridge(&state)?
+        .respond_approval(
+            request.context.into(),
+            &request.request_id,
+            request.executor_generation,
+            request.approved,
+        )
+        .map(CommandReceiptDto::from)
+        .map_err(CommandErrorDto::from)
+}
+
+#[tauri::command]
+pub(crate) fn session_operation(
+    request: SessionOperationDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<SessionReceiptDto, CommandErrorDto> {
+    let (context, operation) = session_request(request);
+    lock_bridge(&state)?
+        .session_operation(context, operation)
+        .map(SessionReceiptDto::from)
+        .map_err(CommandErrorDto::from)
+}
+
+fn session_request(request: SessionOperationDto) -> (CommandContext, SessionOperation) {
+    match request {
+        SessionOperationDto::Create {
+            context,
+            session_id,
+        } => (context.into(), SessionOperation::Create { session_id }),
+        SessionOperationDto::Resume {
+            context,
+            session_id,
+        } => (context.into(), SessionOperation::Resume { session_id }),
+        SessionOperationDto::Fork {
+            context,
+            source_id,
+            target_id,
+            boundary,
+        } => (
+            context.into(),
+            SessionOperation::Fork {
+                source_id,
+                target_id,
+                boundary,
+            },
+        ),
+        SessionOperationDto::Revert {
+            context,
+            source_id,
+            target_id,
+            turn_id,
+        } => (
+            context.into(),
+            SessionOperation::Revert {
+                source_id,
+                target_id,
+                turn_id,
+            },
+        ),
+    }
+}
+
+fn lock_bridge<'a>(
+    state: &'a tauri::State<'_, DesktopState>,
+) -> Result<std::sync::MutexGuard<'a, DesktopBridge>, CommandErrorDto> {
+    state.0.lock().map_err(|_| CommandErrorDto {
+        code: "internal",
+        message: "宿主状态不可用",
+    })
+}
+
+pub(crate) fn initialize_state(workspace: &Path) -> Result<DesktopState, ErrorEnvelope> {
+    let sessions = workspace.join(".harness").join("desktop-sessions");
+    std::fs::create_dir_all(&sessions)
+        .map_err(|_| ErrorEnvelope::new(ErrorCode::Internal, "cannot create session directory"))?;
+    DesktopBridge::new(workspace, &sessions).map(|bridge| DesktopState(Mutex::new(bridge)))
+}
+
+pub(crate) fn close_window(window: &tauri::Window) {
+    if let Ok(mut bridge) = window.state::<DesktopState>().0.lock() {
+        let _ = bridge.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ih-tauri-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn state_uses_shared_bridge_and_closes_fail_closed() {
+        let root = root("state");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = initialize_state(&root).unwrap();
+        let mut bridge = state.0.lock().unwrap();
+        let context = bridge.context();
+        assert_eq!(context.generation, 1);
+        bridge.close().unwrap();
+        assert_eq!(
+            bridge
+                .session_operation(
+                    bridge.context(),
+                    SessionOperation::Create {
+                        session_id: "late".into(),
+                    },
+                )
+                .unwrap_err()
+                .code,
+            ErrorCode::SandboxDenied
+        );
+        drop(bridge);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn command_errors_expose_only_static_safe_text() {
+        let error = CommandErrorDto::from(ErrorEnvelope::new(
+            ErrorCode::Internal,
+            "IDEAL_HARNESS_API_KEY=secret approval payload",
+        ));
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("secret"));
+        assert!(!encoded.contains("approval payload"));
+        assert_eq!(error.code, "internal");
+    }
+
+    #[test]
+    fn tauri_configuration_keeps_plugin_permissions_empty_and_pages_local() {
+        let capability = include_str!("../capabilities/desktop-shell.json");
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert!(capability.contains("\"permissions\": []"));
+        assert_eq!(
+            config["build"]["devUrl"].as_str(),
+            Some("http://127.0.0.1:1420")
+        );
+        assert!(config["app"]["windows"][0].get("url").is_none());
+        assert!(config["app"]["security"]["csp"]
+            .as_str()
+            .unwrap()
+            .contains("frame-src 'none'"));
+    }
+}

@@ -396,9 +396,11 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 - 明确不做: 不做多 provider 抽象；不把 UI 状态写入 SessionStore；不解析错误 message 做控制流
 - 依赖: TASK-901
 
-### TASK-903: Tauri 安全桥接与生命周期管理 ⬜
+### TASK-903: Tauri 安全桥接与生命周期管理 ✅
 - 目标范围: `apps/desktop/src-tauri`、harness-host
 - 内容: 只暴露显式 command DTO（启动/停止 turn、steer、取消、审批响应、会话操作）；窗口关闭时有界取消子进程与代理；按 Tauri capability 限定窗口权限；所有 command 输入做 schema/路径/epoch 校验
+- 内容（as-built）: `harness-host::DesktopBridge` 集中校验 command generation、permission epoch、Host 安全配置、工作区 canonical 路径、会话 ID/边界、活动 turn 与审批执行代际；Tauri 仅注册 status/start/stop/cancel/steer/approval/session 七个显式 command，未知字段由 DTO 拒绝；取消或窗口销毁会取消工具令牌、关闭代理 Host 并推进安全代际；capability 继续保持零插件权限
+- 验收结果: 旧 generation、旧 epoch、工作区/会话逃逸、Host/审批缺席、错误 turn、执行代际漂移和窗口关闭后调用均 fail-closed；返回 WebView 的错误只含稳定 code 与静态安全文案；Host 生命周期测试证明取消与 shutdown 均触发；workspace 318 项测试、桌面 3 项测试、严格 clippy、Rust 1.85、前端 typecheck/build 和 npm audit 全绿
 - 验收标准: 未声明 command、路径逃逸、过期审批、旧 generation、窗口关闭后的调用全部 fail-closed；API key、审批内容和工具敏感结果不进入前端日志；生命周期集成测试证明无遗留代理/子进程
 - 允许新增依赖: Tauri 官方 dialog/process/event 等插件仅按最小能力逐个列入；每个插件需在 PR 中给出权限说明
 - 明确不做: 不开放任意 shell；不开放通用文件系统 API；不允许加载远程页面；不新增 loopback 写服务
