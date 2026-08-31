@@ -58,8 +58,9 @@ struct RulesetAttr {
 
 #[repr(C)]
 struct PathBeneathAttr {
-    parent_fd: u64,
     allowed_access: u64,
+    parent_fd: libc::c_int,
+    reserved: u32,
 }
 
 /// Landlock 文件系统隔离档位（与 SandboxMode 三档中可落地的两档对应）。
@@ -159,8 +160,9 @@ fn create_ruleset(handled_access_fs: u64) -> io::Result<RawFd> {
 
 fn add_path_beneath(ruleset_fd: RawFd, parent_fd: RawFd, allowed_access: u64) -> io::Result<()> {
     let attr = PathBeneathAttr {
-        parent_fd: parent_fd as u64,
         allowed_access,
+        parent_fd,
+        reserved: 0,
     };
     landlock_syscall(
         SYS_LANDLOCK_ADD_RULE,
