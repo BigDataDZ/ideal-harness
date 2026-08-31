@@ -1,6 +1,8 @@
 //! TASK-202 验收：命令在真实 restricted-token 子进程中执行。
 
-use sandbox_exec::{CommandSpec, PlatformRestrictedBackend, RestrictedProcessPool};
+use sandbox_exec::CommandSpec;
+#[cfg(windows)]
+use sandbox_exec::{PlatformRestrictedBackend, RestrictedProcessPool};
 
 #[cfg(windows)]
 #[test]
