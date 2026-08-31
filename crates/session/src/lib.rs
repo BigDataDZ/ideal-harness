@@ -244,9 +244,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut state = 0xfeed_beef_u64;
         for _round in 0..300 {
-            let mut bytes = Vec::from(
-                r#"{"seq":0,"event":{"type":"user_message","text":"x"}}"#.as_bytes(),
-            );
+            let mut bytes =
+                Vec::from(r#"{"seq":0,"event":{"type":"user_message","text":"x"}}"#.as_bytes());
             let mutations = (xorshift(&mut state) % 6) + 1;
             for _ in 0..mutations {
                 match xorshift(&mut state) % 3 {
