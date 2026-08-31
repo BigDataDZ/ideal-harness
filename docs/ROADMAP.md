@@ -378,16 +378,17 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 > Event/RPC/SSE 投影；任何写操作、审批和密钥访问必须经过受控 Rust command，不向 WebView 暴露
 > 任意文件系统、shell 或远程网络能力。Taro 仅在未来明确需要微信/支付宝小程序时另行评估。
 
-### TASK-901: 桌面端架构决策、边界与最小骨架 ⬜
+### TASK-901: 桌面端架构决策、边界与最小骨架 🟡（实现与验证完成；D25/规范待人工 review）
 - 目标范围: `docs/DESIGN-DECISIONS.md`、`AGENTS.md`、`docs/DEVELOPMENT.md`、`apps/desktop`
-- 内容: 新增 D22，确定 Tauri 仅是受限 UI 宿主、Event 是唯一真相源、命令面与投影面分离；修订“唯一 main”规则，为桌面入口建立明确例外和模块所有权；创建 Tauri 2 + React + TypeScript + Vite 最小工程及 Windows 开发启动页
-- 验收标准: `npm run typecheck`、`npm run build`、`cargo check` 通过；开发模式能打开本地窗口并显示后端版本/连接状态；CSP 禁止远程脚本，Tauri capability 默认空白名单；架构文档通过人工 review 后方可开始 TASK-902
+- 内容（as-built）: 新增 D25，确定 Tauri 仅是受限 UI 宿主、Event 是唯一真相源、命令面与投影面分离；修订“唯一 main”规则并登记桌面模块所有权；创建独立的 Tauri 2.11 + React 19 + TypeScript 7 + Vite 8 工程、响应式 Windows 启动页、严格 CSP、空权限 capability 和仅返回版本/安全边界的 `desktop_status` command；npm/Cargo 依赖均精确锁定
+- 验收结果: `npm run typecheck`、`npm run build`、桌面 `cargo check/clippy/test --locked` 全绿（1 test），Rust 1.85.0 MSRV 实测通过；npm audit 0 漏洞；Windows `tauri dev` 实际启动且窗口进程 responding；原 Rust workspace fmt/clippy 与 313 项测试全绿
+- 待人工 review: 确认 D25、CLI/Tauri 双薄入口例外及 TASK-902 的共享 Host library 方向；确认前不得开始 TASK-902
 - 允许新增依赖: Tauri 2 官方核心/构建依赖、React、TypeScript、Vite，以及仅用于 lint/test 的前端开发依赖；版本必须锁定并提交 lockfile
 - 明确不做: 不实现聊天业务；不复制 agent-loop；不把现有只读 HTTP 接口扩成无鉴权写接口；不引入 Taro/Electron
 - 依赖: P8 自动化门禁已完成；TASK-808 真实模型冒烟可并行，不阻塞客户端骨架
 
 ### TASK-902: 提取可复用 Host 装配层并保持 CLI 零回归 ⬜
-- 目标 crate: 新建 `harness-host`（名称可在 D22 review 时定稿）、harness-cli
+- 目标 crate: 新建 `harness-host`（名称可在 D25 review 时定稿）、harness-cli
 - 内容: 将 provider、代理、工具注册、审批注入、会话恢复和 AgentLoop 生产装配从二进制入口提取为可复用 library；CLI 与桌面端只做参数/交互适配；依赖方向同步写入所有权地图
 - 验收标准: CLI 现有命令与 313+ 回归测试不变；CLI 与桌面测试使用同一生产构造器；缺 key、缺审批器、未知执行环境继续 fail-closed；不新增或修改 protocol wire 契约
 - 明确不做: 不做多 provider 抽象；不把 UI 状态写入 SessionStore；不解析错误 message 做控制流

@@ -14,14 +14,15 @@
 3. **fail-closed 默认**：所有"服务不在场/参数不全/路径不明"的分支走向拒绝，绝不走向放行。
 4. **事件溯源**：会话状态唯一来源是 append-only JSONL 事件流。恢复=fork=重放；一切自动行为留痕。
 5. **错误按 code 路由**：`ErrorCode` 是机器契约，message 只供人读。禁止 `contains("...")` 式控制流。
-6. **粗粒度模块**：crate 数量冻结在当前规模；新增能力优先放进既有 crate 的子模块。
+6. **粗粒度模块**：核心 crate 数量冻结在当前规模；新增能力优先放进既有 crate 的子模块。P9 经 D25/TASK-901 批准新增桌面应用边界，TASK-902 如新增共享 Host crate 必须同步所有权地图。
 
 ## 2. 目录与依赖规则
 
 见 `AGENTS.md §1` 所有权地图。补充细则：
 
 - 依赖只允许"下游引上游"：{protocol, sandbox-policy, sandbox-exec} ← {network-proxy, tools, session, context} ← agent-loop ← harness-cli
-- `harness-cli` 是唯一含 `fn main` 的 crate
+- 生产入口仅允许 `crates/harness-cli` 与 `apps/desktop/src-tauri` 含 `fn main`；二者都必须是薄适配层并最终共享 TASK-902 的 Host 装配，不得复制 agent-loop 或维护第二真相源
+- `apps/desktop` 是独立 Tauri 应用边界，不反向加入核心 crate 的依赖图；WebView 只能调用显式 Rust command 或消费只读 Event/RPC/SSE 投影
 - crate 内部结构约定：
   ```
   crates/<name>/

@@ -7,7 +7,7 @@
 
 Rust 实现的 LLM Agent Harness 原型：protocol-first、事件溯源、三层沙箱、fail-closed 审批。
 
-**设计依据链**：每个架构决策的对标来源（学的谁/不同于谁/踩什么坑）见 `docs/DESIGN-DECISIONS.md`（D1~D13 决策对照表 + 环境注意点）。改架构前必读；PR 触及表中决策时必须在描述里引用决策编号。
+**设计依据链**：每个架构决策的对标来源（学的谁/不同于谁/踩什么坑）见 `docs/DESIGN-DECISIONS.md`（D1~D25 决策对照表 + 环境注意点）。改架构前必读；PR 触及表中决策时必须在描述里引用决策编号。
 
 ## 1. 模块所有权地图（改动边界）
 
@@ -23,9 +23,11 @@ Rust 实现的 LLM Agent Harness 原型：protocol-first、事件溯源、三层
 | `crates/context` | token 计量 + 根/子树预算账本 + 双触发压缩判定 | P4/D15 | protocol |
 | `crates/model-provider` | OpenAI 兼容 HTTP+SSE 客户端（错误→稳定码映射） | P1 | protocol, reqwest |
 | `crates/agent-loop` | Phase 状态机主循环 + Inbox + 工具/MCP/Agent Team 协调闭环 + 结果安全中间件 | P3/D17/D19 | protocol, session, tools, model-provider |
-| `crates/harness-cli` | 装配入口 + generation-aware 只读 RPC/SSE（唯一允许 main 的地方） | D18 | 全部 |
+| `crates/harness-cli` | CLI 装配入口 + generation-aware 只读 RPC/SSE | D18/D25 | 全部 |
+| `apps/desktop` | Tauri 2 受限桌面入口 + React/TypeScript 纯事件投影；不得持有第二真相源 | D13/D18/D25 | Tauri 官方核心；TASK-902 后仅经共享 Host library/显式 command 访问核心 |
 
 依赖方向必须与上表一致，禁止反向依赖与跨层依赖。
+允许含 `fn main` 的入口仅有 `crates/harness-cli` 与 `apps/desktop/src-tauri`；两者必须保持薄适配层，禁止复制业务状态机或生产装配。
 
 ## 2. 红线（违反 = PR 必拒）
 

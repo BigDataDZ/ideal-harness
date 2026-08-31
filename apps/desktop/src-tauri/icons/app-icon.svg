@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="ideal-harness">
+  <defs>
+    <linearGradient id="background" x1="64" y1="32" x2="448" y2="480" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#151b22" />
+      <stop offset="1" stop-color="#07090c" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="116" fill="url(#background)" />
+  <rect x="72" y="72" width="368" height="368" rx="88" fill="none" stroke="#8bffcf" stroke-width="12" />
+  <path d="M170 154v204M342 154v204M170 256h172" fill="none" stroke="#f4f5f7" stroke-linecap="round" stroke-width="38" />
+  <circle cx="342" cy="154" r="21" fill="#8bffcf" />
+</svg>

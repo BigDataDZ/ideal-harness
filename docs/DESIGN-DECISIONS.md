@@ -32,6 +32,7 @@
 | D22 | turn 内 steer | queued inputs + steering 中断点（feature flag） | agent.inject() 任意时刻注入，轮边界生效 | **事件化 UserInputQueued + 采样轮边界按游标吸收**（TASK-704） | 投影在工具批次未闭合时延迟出账（provider 消息序合法）；resume 与在线视图必须一致；不做采样中途抢占 |
 | D23 | 工具面广度 | shell/unified_exec/apply_patch/web_search 为核心，文件编辑靠 patch | 内置 fs/搜索/终端/web 全家桶 + read-before-write 观察策略 | **声明式内置文件工具 + 白名单代理内 web_fetch**（TASK-701/703） | 写前必读 fail-closed；fetch 拒私网/回环且逐跳复检重定向；出网只经 CONNECT/明文白名单代理，fetch 主机必须同时进代理 allowlist |
 | D24 | 跨平台沙箱后端 | Seatbelt/Landlock/bwrap/AppContainer+WFP 全平台矩阵 | bwrap/Landlock/Seatbelt/Windows ACL token | **Windows 受限 token + Linux Landlock（TASK-706）**，其余平台 fail-closed 拒执行 | 无 Landlock 的内核拒绝执行不降级；未知 sandbox 档位 fail-closed；网络域限制（v4 NET）暂不落地 |
+| D25 | 桌面客户端宿主 | 多客户端经 app-server/协议共享核心，客户端不另存业务真相 | Web 作为事件投影并以 SSE gap repair 恢复 | **Tauri 2 受限宿主 + React 纯投影；CLI/Tauri 双入口最终共享 Host library**（TASK-901/902） | 延续 D13/D18：Event 仍是唯一真相源；WebView 不开放任意 shell/文件系统/远程页面，写操作仅走显式 Rust command；两个 `main` 只做入口适配，不复制 agent-loop |
 
 
 ## 二、本项目独有的环境注意点（两家文档都没有的）
