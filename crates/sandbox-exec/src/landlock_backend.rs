@@ -128,8 +128,9 @@ fn landlock_syscall(
     a: usize,
     b: usize,
     c: usize,
+    d: usize,
 ) -> io::Result<libc::c_long> {
-    let result = unsafe { libc::syscall(syscall, a, b, c) };
+    let result = unsafe { libc::syscall(syscall, a, b, c, d) };
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -143,6 +144,7 @@ fn probe_abi() -> io::Result<u64> {
         0,
         0,
         LANDLOCK_CREATE_RULESET_VERSION as usize,
+        0,
     )?;
     Ok(version as u64)
 }
@@ -153,6 +155,7 @@ fn create_ruleset(handled_access_fs: u64) -> io::Result<RawFd> {
         SYS_LANDLOCK_CREATE_RULESET,
         &attr as *const RulesetAttr as usize,
         std::mem::size_of::<RulesetAttr>(),
+        0,
         0,
     )?;
     Ok(fd as RawFd)
@@ -169,6 +172,7 @@ fn add_path_beneath(ruleset_fd: RawFd, parent_fd: RawFd, allowed_access: u64) ->
         ruleset_fd as usize,
         LANDLOCK_RULE_PATH_BENEATH as usize,
         &attr as *const PathBeneathAttr as usize,
+        0,
     )?;
     Ok(())
 }
@@ -214,7 +218,7 @@ fn restrict_child(workspace_root: &Path, mode: LandlockFsMode) {
             add_path_beneath(ruleset_fd, workspace_fd, WORKSPACE_ACCESS)?;
             unsafe { libc::close(workspace_fd) };
         }
-        landlock_syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd as usize, 0, 0)?;
+        landlock_syscall(SYS_LANDLOCK_RESTRICT_SELF, ruleset_fd as usize, 0, 0, 0)?;
         unsafe { libc::close(ruleset_fd) };
         Ok(())
     })();
