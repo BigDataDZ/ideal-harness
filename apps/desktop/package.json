@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc -b",
+    "test": "tsc -p tsconfig.projection-test.json && node --test .projection-test/*.test.js",
     "build": "tsc -b && vite build",
     "tauri": "tauri"
   },

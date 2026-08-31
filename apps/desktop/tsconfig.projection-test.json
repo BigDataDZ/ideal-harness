@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.app.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".projection-test",
+    "rootDir": "src/lib/projection",
+    "rewriteRelativeImportExtensions": true,
+    "tsBuildInfoFile": ".projection-test/tsconfig.tsbuildinfo"
+  },
+  "include": ["src/lib/projection"]
+}

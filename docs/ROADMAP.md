@@ -406,13 +406,14 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 - 明确不做: 不开放任意 shell；不开放通用文件系统 API；不允许加载远程页面；不新增 loopback 写服务
 - 依赖: TASK-902
 
-### TASK-904: Event/SSE 投影状态库与断线补洞 ⬜
+### TASK-904: Event/SSE 投影状态库与断线补洞 ✅
 - 目标范围: `apps/desktop/src/lib/projection`、protocol 生成/手写 DTO 适配层
 - 内容: 前端状态完全由 timeline + SSE 事件归约得到；实现 `Last-Event-ID`、connection generation、断线重连、gap repair、重复事件幂等和分页水位；本地仅保存非权威 UI 偏好
 - 验收标准: 乱序、重复、断流、服务重启和分页并发的确定性测试全绿；重连后视图与 SessionStore replay 结果一致；未知事件可降级展示但不得静默改写状态
 - 允许新增依赖: Zustand、TanStack Query；不得引入第二套持久业务数据库
 - 明确不做: 不在浏览器状态中补造 Event；不乐观确认审批/工具成功；不缓存 API key
 - 依赖: TASK-901、TASK-903、D18
+- 完成证据: 新增无外部依赖的纯投影库、wire DTO 运行时校验和 SSE `id`/事件序号绑定；覆盖乱序补洞、重复幂等、冲突修复、断线续传、generation 重启、并发分页水位、未知事件降级与 replay 收敛共 6 项确定性测试；`npm test`、typecheck、生产构建、依赖审计、桌面 Rust 门禁及 workspace 318 项测试全绿，Rust 1.85 兼容构建通过
 
 ### TASK-905: 会话导航、Timeline 与诊断面板 ⬜
 - 目标范围: `apps/desktop/src/features/sessions`、`apps/desktop/src/features/timeline`
