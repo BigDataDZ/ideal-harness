@@ -12,6 +12,7 @@ use protocol::{ErrorCode, ModelCallSpec};
 use std::net::TcpListener;
 
 const SHORT_TIMEOUT: Duration = Duration::from_millis(300);
+const TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn spec(base_url: &str) -> ModelCallSpec {
     ModelCallSpec {
@@ -22,7 +23,11 @@ fn spec(base_url: &str) -> ModelCallSpec {
 }
 
 fn client() -> OpenAiCompatClient {
-    OpenAiCompatClient::with_key_for_loopback_test("test-key", SHORT_TIMEOUT).unwrap()
+    client_with_timeout(TEST_TIMEOUT)
+}
+
+fn client_with_timeout(timeout: Duration) -> OpenAiCompatClient {
+    OpenAiCompatClient::with_key_for_loopback_test("test-key", timeout).unwrap()
 }
 
 /// 启动一次性 mock server：接受单个连接、排空请求头+体后执行 handler。
@@ -109,7 +114,7 @@ fn hung_upstream_times_out_to_model_stream_broken() {
         thread::sleep(Duration::from_secs(5));
     });
 
-    let err = client()
+    let err = client_with_timeout(SHORT_TIMEOUT)
         .stream_chat(&spec(&base), &[ChatMessage::user("hi")], None)
         .expect_err("挂起的上游必须以超时失败");
     let elapsed = started.elapsed();

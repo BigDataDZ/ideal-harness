@@ -122,7 +122,12 @@ impl RestrictedBackend for LandlockBackend {
     }
 }
 
-fn landlock_syscall(syscall: libc::c_long, a: usize, b: usize, c: usize) -> io::Result<isize> {
+fn landlock_syscall(
+    syscall: libc::c_long,
+    a: usize,
+    b: usize,
+    c: usize,
+) -> io::Result<libc::c_long> {
     let result = unsafe { libc::syscall(syscall, a, b, c) };
     if result < 0 {
         return Err(io::Error::last_os_error());
@@ -167,12 +172,13 @@ fn add_path_beneath(ruleset_fd: RawFd, parent_fd: RawFd, allowed_access: u64) ->
 }
 
 fn open_dir_fd(path: &Path) -> io::Result<RawFd> {
-    let fd = unsafe {
-        libc::open(
-            path.as_os_str().as_bytes() as *const libc::c_char,
-            O_PATH_FLAGS,
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Landlock path contains an interior NUL byte",
         )
-    };
+    })?;
+    let fd = unsafe { libc::open(path.as_ptr(), O_PATH_FLAGS) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -211,7 +217,7 @@ fn restrict_child(workspace_root: &Path, mode: LandlockFsMode) {
         Ok(())
     })();
     if outcome.is_err() {
-        libc::_exit(126);
+        unsafe { libc::_exit(126) };
     }
 }
 
@@ -247,6 +253,17 @@ fn execute_under_landlock(
     let program = command.program.clone();
     let args = command.args.clone();
     let current_dir = command.current_dir.clone();
+    let current_dir_c = current_dir
+        .as_ref()
+        .map(|dir| {
+            std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "working directory contains an interior NUL byte",
+                )
+            })
+        })
+        .transpose()?;
     let workspace_root = backend.workspace_root.clone();
     let mode = backend.mode;
 
@@ -280,8 +297,8 @@ fn execute_under_landlock(
             libc::dup2(stderr_pipe[1], libc::STDERR_FILENO);
             libc::close(stdout_pipe[1]);
             libc::close(stderr_pipe[1]);
-            if let Some(dir) = &current_dir {
-                if libc::chdir(dir.as_os_str().as_bytes() as *const libc::c_char) != 0 {
+            if let Some(dir) = &current_dir_c {
+                if libc::chdir(dir.as_ptr()) != 0 {
                     libc::_exit(126);
                 }
             }
@@ -352,8 +369,10 @@ fn execute_under_landlock(
 
 fn read_fd_to_end(fd: RawFd) -> io::Result<Vec<u8>> {
     use std::io::Read;
-    let mut file =
-        std::mem::ManuallyDrop::new(std::fs::File::from(std::os::unix::io::OwnedFd::from(fd)));
+    use std::os::fd::FromRawFd;
+    // SAFETY: the caller uniquely owns this open pipe fd and closes it after this borrowed read.
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut file = std::mem::ManuallyDrop::new(file);
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer)?;
     Ok(buffer)

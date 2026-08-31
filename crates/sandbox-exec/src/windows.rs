@@ -494,7 +494,7 @@ mod deadline_tests {
     fn timed_out_process_tree_is_terminated_with_deadline_code() {
         let command = CommandSpec::new("cmd")
             .arg("/C")
-            .arg("ping -n 30 127.0.0.1");
+            .arg("for /L %i in (1,1,2147483647) do @rem loop");
         let started = Instant::now();
         let output = execute_with_deadline(&command, Some(Duration::from_millis(300))).unwrap();
         let elapsed = started.elapsed();
