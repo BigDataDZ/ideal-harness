@@ -223,6 +223,7 @@ dependencies = [
  "agent-loop",
  "anyhow",
  "approval",
+ "harness-host",
  "model-provider",
  "network-proxy",
  "protocol",
@@ -230,6 +231,24 @@ dependencies = [
  "sandbox-exec",
  "sandbox-policy",
  "serde",
+ "serde_json",
+ "session",
+ "tools",
+]
+
+[[package]]
+name = "harness-host"
+version = "0.9.0"
+dependencies = [
+ "agent-loop",
+ "anyhow",
+ "approval",
+ "model-provider",
+ "network-proxy",
+ "protocol",
+ "reqwest",
+ "sandbox-exec",
+ "sandbox-policy",
  "serde_json",
  "session",
  "tools",

@@ -1,4 +1,4 @@
-//! P2/TASK-206：CLI 安全链路装配（D5/D7/D8/D9）。
+//! P2/TASK-206/TASK-902：共享 Host 安全链路装配（D5/D7/D8/D9/D25）。
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -107,7 +107,7 @@ impl Drop for ProviderProxy {
     }
 }
 
-pub(crate) fn register_exec_tool<B>(
+pub fn register_exec_tool<B>(
     registry: &mut ToolRegistry,
     backend: B,
     approver: Option<Arc<dyn Approver + Send + Sync>>,

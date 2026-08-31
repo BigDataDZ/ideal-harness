@@ -2,28 +2,38 @@
 //! chat 模式 = 真实模型 + 工具调用闭环 + JSONL 会话持久化 + 中断恢复。
 
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use agent_loop::{
-    AgentLoop, LoopGuard, ModelProvider, ToolResultContext, ToolResultDecision,
-    ToolResultMiddleware,
-};
+use agent_loop::{AgentLoop, ModelProvider};
 use approval::TerminalApprover;
-use model_provider::{ChatMessage, OpenAiCompatClient};
-use protocol::{ErrorEnvelope, Event, ModelCallSpec, ToolOutcome};
-use sandbox_exec::PlatformRestrictedBackend;
+use harness_host::{prepare_session, HostConfig, PreparedSession, ProductionHost};
+use protocol::{Event, ToolOutcome};
 use sandbox_policy::{SandboxMode, SandboxPolicy};
-use session::{replay_session, JsonlSession, SessionStore};
-use tools::{EscalationAvailability, ToolAudit, ToolExecution, ToolRegistry, ToolSpec};
+use session::{replay_session, JsonlSession};
+use tools::{ToolRegistry, ToolSpec};
+
+#[cfg(test)]
+use agent_loop::{LoopGuard, ToolResultContext, ToolResultDecision, ToolResultMiddleware};
+#[cfg(test)]
+use harness_host::{
+    inject_memories, openai_tools_json, rebuild_history, recover_dangling_turn,
+    register_chat_tools, register_exec_tool, register_memory_tool, ProductionResultMiddleware,
+};
+#[cfg(test)]
+use model_provider::ChatMessage;
+#[cfg(test)]
+use protocol::ErrorEnvelope;
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use tools::EscalationAvailability;
 
 mod readonly_server;
 #[cfg(test)]
 mod scenario_snapshots;
-mod security;
 mod session_commands;
 use readonly_server::cmd_serve;
-use security::{register_exec_tool, ProviderProxy};
 use session_commands::{cmd_fork, cmd_resume, cmd_revert, cmd_timeline};
 
 fn main() -> anyhow::Result<()> {
@@ -96,89 +106,40 @@ fn parse_chat_args(args: &[String]) -> anyhow::Result<ChatArgs> {
 
 fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
     let cfg = parse_chat_args(args)?;
-    let proxy_events = Arc::new(Mutex::new(Vec::<Event>::new()));
-    let mut proxy = ProviderProxy::start_with_fetch_hosts(
-        &cfg.base_url,
-        &cfg.fetch_allow,
-        Arc::clone(&proxy_events),
-    )?;
-    // fail-closed：无 key 直接拒绝启动（红线 3），绝不匿名调用上游。
-    let client = OpenAiCompatClient::from_env_via_proxy(&proxy.url).map_err(|e| {
-        anyhow::anyhow!(
-            "{}（请先设置环境变量 IDEAL_HARNESS_API_KEY 后重试）",
-            e.message
-        )
-    })?;
-    let spec = ModelCallSpec {
-        model: cfg.model.clone(),
-        base_url: cfg.base_url.clone(),
-        temperature: None,
-    };
-
-    // TASK-803：--workspace 是文件工具与相对路径的唯一信任根（canonical 化，缺失即拒绝）
-    let workspace = cfg.workspace.canonicalize().map_err(|error| {
-        anyhow::anyhow!(
-            "--workspace 不存在或不可访问: {} ({error})",
-            cfg.workspace.display()
-        )
-    })?;
-    let cancel_token = tools::CancellationToken::default();
-    let mut registry = ToolRegistry::default();
-    register_chat_tools(
-        &mut registry,
-        &workspace,
-        cfg.plugin_root.as_deref(),
-        &cfg.fetch_allow,
-        &proxy.url,
-        &cancel_token,
-    )?;
-    registry.set_escalation_availability(EscalationAvailability::RestrictedBackendMounted);
     let terminal_approver = Arc::new(TerminalApprover::new(
         std::io::BufReader::new(std::io::stdin()),
         std::io::stderr(),
     ));
-    register_exec_tool(
-        &mut registry,
-        PlatformRestrictedBackend,
+    let mut host = ProductionHost::start(
+        HostConfig {
+            base_url: cfg.base_url.clone(),
+            model: cfg.model.clone(),
+            fetch_allow: cfg.fetch_allow.clone(),
+            workspace: cfg.workspace.clone(),
+            plugin_root: cfg.plugin_root.clone(),
+        },
         Some(terminal_approver),
-    );
-
-    // 会话复用：create 即 append 模式，seq 自动续接（崩溃安全）。
-    let mut js = JsonlSession::create(cfg.session.clone())?;
-    if recover_dangling_turn(&mut js)? {
+    )?;
+    let PreparedSession {
+        mut session,
+        history,
+        recovered_dangling_turn,
+        memories_injected,
+    } = prepare_session(cfg.session.clone())?;
+    if recovered_dangling_turn {
         println!("（检测到上次中断的 turn，已补记 TurnAborted——事件溯源崩溃恢复）");
     }
-    // TASK-705：记忆注入先于历史重建（注入事件随即进入模型表面投影）
-    if inject_memories(&mut js)? {
+    if memories_injected {
         println!("（已注入跨会话记忆）");
     }
-    let history = rebuild_history(js.path())?;
-
-    let production_middleware = ProductionResultMiddleware {
-        max_result_bytes: 256 * 1024,
-    };
-    let mut lp = AgentLoop::with_chat(&mut js, &registry, &client, spec);
-    // TASK-803：生产默认护栏——结果大小预算 + 循环防护先提醒后拒绝
-    lp.result_middleware = Some(&production_middleware);
-    lp.loop_guard = Some(LoopGuard {
-        remind_after: 3,
-        reject_after: 8,
-    });
-    // /tools 与模型广告必须反映实际可用能力（不再硬编码清单）
-    let tool_names: Vec<&str> = registry.names().collect();
-    lp.tool_definitions = Some(
-        openai_tools_json(&registry, &tool_names)
-            .map_err(|error| anyhow::anyhow!(error.message))?,
-    );
-    lp.chat_history = history;
-    // 重建历史已含既有排队输入；以当前流长度推进水位避免重复吸收
-    lp.mark_queued_inputs_consumed();
-    let event_source_queue = Arc::clone(&proxy_events);
-    let event_source = move || match event_source_queue.lock() {
+    let proxy_events = host.proxy_event_queue();
+    let event_source = move || match proxy_events.lock() {
         Ok(mut events) => std::mem::take(&mut *events),
         Err(_) => Vec::new(),
     };
-    lp.external_events = Some(&event_source);
+    let mut lp = host
+        .build_agent_loop(&mut session, history, &event_source)
+        .map_err(|error| anyhow::anyhow!(error.message))?;
 
     println!("== ideal-harness chat ==");
     println!(
@@ -206,8 +167,8 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         match text {
             "/exit" | "/quit" => break,
             "/tools" => {
-                for name in registry.names() {
-                    if let Some(s) = registry.get(name) {
+                for name in lp.tools.names() {
+                    if let Some(s) = lp.tools.get(name) {
                         println!("  {} — {}", s.name, s.description);
                     }
                 }
@@ -245,245 +206,8 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
     }
     println!("会话已保存：{}", lp.session.path().display());
     drop(lp);
-    drop(client);
-    proxy.shutdown()?;
+    host.shutdown()?;
     Ok(())
-}
-
-/// TASK-803：生产结果中间件——超预算的成功结果被替换为带 locator 语义的截断预览，
-/// 失败结果原样放行（错误码即告示）。中间件在位，插件来源结果不再因缺席 fail-closed。
-struct ProductionResultMiddleware {
-    max_result_bytes: usize,
-}
-
-impl ToolResultMiddleware for ProductionResultMiddleware {
-    fn inspect(
-        &self,
-        context: &ToolResultContext<'_>,
-    ) -> Result<ToolResultDecision, ErrorEnvelope> {
-        match context.outcome {
-            ToolOutcome::Success { value } => {
-                let serialized = serde_json::to_string(value).unwrap_or_default();
-                if serialized.len() > self.max_result_bytes {
-                    let preview: String = serialized.chars().take(2_000).collect();
-                    return Ok(ToolResultDecision::Redact(ToolOutcome::Success {
-                        value: serde_json::json!({
-                            "truncated_by_result_guard": true,
-                            "original_bytes": serialized.len(),
-                            "preview": preview,
-                        }),
-                    }));
-                }
-                Ok(ToolResultDecision::Allow)
-            }
-            ToolOutcome::Failure { .. } => Ok(ToolResultDecision::Allow),
-        }
-    }
-}
-
-/// TASK-803：把工作区文件工具、显式插件目录装配进 chat 注册表；
-/// 返回装载的插件工具数。未显式给出 plugin_root 时不加载任何插件
-/// （不自动信任工作区插件）；坏插件被隔离跳过，不遮蔽其他插件。
-fn register_chat_tools(
-    registry: &mut ToolRegistry,
-    workspace: &Path,
-    plugin_root: Option<&Path>,
-    fetch_hosts: &[String],
-    proxy_url: &str,
-    cancel_token: &tools::CancellationToken,
-) -> anyhow::Result<usize> {
-    let fs_tools =
-        tools::FsToolSet::new(workspace).map_err(|error| anyhow::anyhow!(error.message))?;
-    // TASK-802：deadline 取消令牌贯通——registry 超时即取消，fs 工具在提交点放弃
-    fs_tools.set_cancellation_token(cancel_token.clone());
-    registry.set_cancellation_token(std::sync::Arc::new(cancel_token.clone()));
-    fs_tools.register(registry);
-    register_demo_tools(registry);
-    register_web_fetch_tool(registry, proxy_url, fetch_hosts)?;
-    register_memory_tool(registry);
-
-    let mut plugin_tools = 0;
-    if let Some(root) = plugin_root {
-        let catalog = std::sync::Arc::new(
-            tools::PluginCatalog::discover_explicit(root)
-                .map_err(|error| anyhow::anyhow!(error.message))?,
-        );
-        for failure in catalog.failures() {
-            eprintln!(
-                "  ⚠ 插件 {} 被隔离（{:?}）：{}",
-                failure.plugin, failure.stage, failure.error.message
-            );
-        }
-        for plugin in catalog.plugins() {
-            match catalog.bind_static_tools(registry, plugin.name()) {
-                Ok(count) => {
-                    println!(
-                        "  插件已装配: {} v{}（+{count} 工具）",
-                        plugin.name(),
-                        plugin.version()
-                    );
-                    plugin_tools += count;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "  ⚠ 插件 {} 绑定失败（已跳过，不遮蔽其他插件）：{}",
-                        plugin.name(),
-                        error.message
-                    );
-                }
-            }
-        }
-    }
-    Ok(plugin_tools)
-}
-
-/// TASK-703：把物理出网接到本地 CONNECT 白名单代理的 Fetcher 适配器。
-struct ProxiedHttpFetcher {
-    proxy_url: String,
-}
-
-impl tools::Fetcher for ProxiedHttpFetcher {
-    fn fetch(&self, request: &tools::FetchRequest) -> Result<tools::FetchResponse, ErrorEnvelope> {
-        let outcome = model_provider::http_fetch_via_proxy(
-            Some(&self.proxy_url),
-            &request.url,
-            request.max_bytes,
-            std::time::Duration::from_secs(30),
-        )?;
-        Ok(tools::FetchResponse {
-            status: outcome.status,
-            location: outcome.location,
-            body: outcome.body,
-            truncated: outcome.truncated,
-        })
-    }
-}
-
-/// TASK-703：注册 web_fetch 工具（主机默认拒绝，`--fetch-allow` 显式放行）。
-fn register_web_fetch_tool(
-    registry: &mut ToolRegistry,
-    proxy_url: &str,
-    allowed_hosts: &[String],
-) -> anyhow::Result<()> {
-    let fetcher: std::sync::Arc<dyn tools::Fetcher> = std::sync::Arc::new(ProxiedHttpFetcher {
-        proxy_url: proxy_url.to_string(),
-    });
-    let spill_root = std::env::current_dir()?.join(".harness").join("spill");
-    let tool = tools::WebFetchTool::new(
-        fetcher,
-        allowed_hosts.iter().cloned().collect(),
-        spill_root,
-        ".harness/spill",
-        1024 * 1024,
-    );
-    registry.register(
-        ToolSpec {
-            name: "web_fetch".into(),
-            description:
-                "抓取白名单内主机的 http(s) 页面文本；仅经本地白名单代理出网，私网/回环一律拒绝"
-                    .into(),
-            parameters_schema: serde_json::json!({
-                "type": "object",
-                "required": ["url"],
-                "properties": { "url": { "type": "string" } }
-            }),
-            escalation_capable: false,
-            timeout_ms: None,
-        },
-        Box::new(move |args| tool.fetch(args)),
-    );
-    Ok(())
-}
-
-/// TASK-705：注册 memory_write 工具——工具层不持有 session，
-/// 通过 ToolAudit::MemoryRecorded 让 agent-loop 落事件。
-fn register_memory_tool(registry: &mut ToolRegistry) {
-    registry.register_audited(
-        ToolSpec {
-            name: "memory_write".into(),
-            description: "把一条跨会话记忆事实写入事件流（会随 resume/fork 重放恢复）".into(),
-            parameters_schema: serde_json::json!({
-                "type": "object",
-                "required": ["text"],
-                "properties": {
-                    "text": { "type": "string" },
-                    "tags": { "type": "array", "items": { "type": "string" } }
-                }
-            }),
-            escalation_capable: false,
-            timeout_ms: None,
-        },
-        Box::new(|args| {
-            let Some(text) = args["text"].as_str().map(str::to_owned) else {
-                return ToolExecution::new(ToolOutcome::Failure {
-                    error: protocol::ErrorEnvelope::new(
-                        protocol::ErrorCode::ToolArgsInvalid,
-                        "missing string argument: text",
-                    ),
-                });
-            };
-            if text.trim().is_empty() {
-                return ToolExecution::new(ToolOutcome::Failure {
-                    error: protocol::ErrorEnvelope::new(
-                        protocol::ErrorCode::ToolArgsInvalid,
-                        "memory text must not be empty",
-                    ),
-                });
-            }
-            // TASK-806：单条记忆大小上限（P7 验收缺口在此收口）
-            if let Err(error) = session::validate_memory_size(&text) {
-                return ToolExecution::new(ToolOutcome::Failure { error });
-            }
-            let tags = args["tags"]
-                .as_array()
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default();
-            ToolExecution {
-                outcome: ToolOutcome::Success {
-                    value: serde_json::json!({ "recorded": true, "text": text }),
-                },
-                audits: vec![ToolAudit::MemoryRecorded {
-                    text,
-                    tags,
-                    source: protocol::MemorySource::Model,
-                    scope: protocol::MemoryScope::LineageOnly,
-                }],
-            }
-        }),
-    );
-}
-
-/// TASK-705：把当前记忆注入会话表面（事件化 MemoryContextInjected）。
-/// 幂等：内容与最近一次注入相同则跳过；无记忆则不动。
-fn inject_memories(session: &mut dyn SessionStore) -> anyhow::Result<bool> {
-    let events = session.replay_events()?;
-    let memories = session::project_memories(&events)?;
-    if memories.is_empty() {
-        return Ok(false);
-    }
-    let summary = render_memory_summary(&memories)?;
-    let already = events.iter().any(|sequenced| {
-        matches!(
-            &sequenced.event,
-            Event::MemoryContextInjected { summary: existing } if *existing == summary
-        )
-    });
-    if already {
-        return Ok(false);
-    }
-    session.append(Event::MemoryContextInjected { summary })?;
-    Ok(true)
-}
-
-fn render_memory_summary(memories: &[session::MemoryEntry]) -> anyhow::Result<String> {
-    // TASK-806：总量与注入预算 fail-closed（session 层统一守卫）
-    session::injection_summary(memories).map_err(|error| anyhow::anyhow!(error.message))
 }
 
 /// 演示工具集：echo（自纠演示）+ now（真实副作用最小示例）。
@@ -521,73 +245,6 @@ fn register_demo_tools(registry: &mut ToolRegistry) {
             }),
         }),
     );
-}
-
-/// 把注册表中的指定工具包装为 OpenAI tools 数组（chat 请求的 tools 广告）。
-fn openai_tools_json(
-    registry: &ToolRegistry,
-    names: &[&str],
-) -> Result<serde_json::Value, ErrorEnvelope> {
-    Ok(serde_json::Value::Array(
-        names
-            .iter()
-            .filter_map(|n| registry.get(n))
-            .map(|s| {
-                Ok(serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": s.name,
-                        "description": s.description,
-                        "parameters": s.advertised_parameters_schema(
-                            registry.escalation_availability()
-                        )?,
-                    },
-                }))
-            })
-            .collect::<Result<Vec<_>, ErrorEnvelope>>()?,
-    ))
-}
-
-/// 事件溯源原生的中断恢复：悬空 turn（有 Started、无 Completed/Aborted）
-/// 补记 TurnAborted——Ctrl+C 硬退出的下次启动自动收口（红线 5：一切留痕）。
-fn recover_dangling_turn(session: &mut dyn SessionStore) -> anyhow::Result<bool> {
-    let events = replay_session(session.path())?;
-    let Some(last_start) = events.iter().rev().find_map(|se| match se.event {
-        Event::TurnStarted { turn_id } => Some(turn_id),
-        _ => None,
-    }) else {
-        return Ok(false);
-    };
-    let finished = events.iter().any(|se| {
-        matches!(
-            &se.event,
-            Event::TurnCompleted { turn_id } | Event::TurnAborted { turn_id, .. }
-                if *turn_id == last_start
-        )
-    });
-    if finished {
-        return Ok(false);
-    }
-    session.append(Event::TurnAborted {
-        turn_id: last_start,
-        reason: "interrupted: session reopened".into(),
-    })?;
-    Ok(true)
-}
-
-/// TASK-601：从唯一事件流投影完整模型可见历史；审计事件不会混入上下文。
-fn rebuild_history(path: &Path) -> anyhow::Result<Vec<ChatMessage>> {
-    session::project_model_surface(&replay_session(path)?)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "model surface projection failed ({:?}): {}",
-                error.code,
-                error.message
-            )
-        })?
-        .into_iter()
-        .map(|entry| ChatMessage::try_from(entry.message).map_err(anyhow::Error::from))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -994,9 +651,7 @@ mod tests {
     /// TASK-803 验收 4：生产结果中间件——超预算结果被截断替换，小结果原样放行。
     #[test]
     fn production_middleware_redacts_oversized_results() {
-        let middleware = ProductionResultMiddleware {
-            max_result_bytes: 32,
-        };
+        let middleware = ProductionResultMiddleware::with_max_result_bytes(32).unwrap();
         let outcome = ToolOutcome::Success {
             value: serde_json::json!({ "data": "x".repeat(128) }),
         };
@@ -1329,9 +984,8 @@ mod tests {
                 temperature: None,
             },
         );
-        lp.result_middleware = Some(&ProductionResultMiddleware {
-            max_result_bytes: 256 * 1024,
-        });
+        let middleware = ProductionResultMiddleware::with_max_result_bytes(256 * 1024).unwrap();
+        lp.result_middleware = Some(&middleware);
         lp.loop_guard = Some(LoopGuard {
             remind_after: 3,
             reject_after: 8,

@@ -23,8 +23,9 @@ Rust 实现的 LLM Agent Harness 原型：protocol-first、事件溯源、三层
 | `crates/context` | token 计量 + 根/子树预算账本 + 双触发压缩判定 | P4/D15 | protocol |
 | `crates/model-provider` | OpenAI 兼容 HTTP+SSE 客户端（错误→稳定码映射） | P1 | protocol, reqwest |
 | `crates/agent-loop` | Phase 状态机主循环 + Inbox + 工具/MCP/Agent Team 协调闭环 + 结果安全中间件 | P3/D17/D19 | protocol, session, tools, model-provider |
-| `crates/harness-cli` | CLI 装配入口 + generation-aware 只读 RPC/SSE | D18/D25 | 全部 |
-| `apps/desktop` | Tauri 2 受限桌面入口 + React/TypeScript 纯事件投影；不得持有第二真相源 | D13/D18/D25 | Tauri 官方核心；TASK-902 后仅经共享 Host library/显式 command 访问核心 |
+| `crates/harness-host` | 共享生产装配：provider/代理/工具/审批/会话恢复/AgentLoop 边界 | D18/D25 | agent-loop 及其上游核心 crate |
+| `crates/harness-cli` | CLI 参数与终端交互适配 + generation-aware 只读 RPC/SSE | D18/D25 | harness-host；只读服务所需核心 crate |
+| `apps/desktop` | Tauri 2 受限桌面入口 + React/TypeScript 纯事件投影；不得持有第二真相源 | D13/D18/D25 | Tauri 官方核心、harness-host；仅经显式 command 访问核心 |
 
 依赖方向必须与上表一致，禁止反向依赖与跨层依赖。
 允许含 `fn main` 的入口仅有 `crates/harness-cli` 与 `apps/desktop/src-tauri`；两者必须保持薄适配层，禁止复制业务状态机或生产装配。

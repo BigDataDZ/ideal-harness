@@ -30,3 +30,4 @@ agent-loop = { path = "crates/agent-loop" }
 model-provider = { path = "crates/model-provider" }
 sandbox-exec = { path = "crates/sandbox-exec" }
 network-proxy = { path = "crates/network-proxy" }
+harness-host = { path = "crates/harness-host" }

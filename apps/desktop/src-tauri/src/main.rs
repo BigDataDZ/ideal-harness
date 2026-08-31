@@ -1,13 +1,16 @@
-//! D25/TASK-901: restricted desktop entry point; business assembly remains in the host.
+//! D25/TASK-902: restricted desktop entry point backed by the shared Host assembly.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 #[tauri::command]
 fn desktop_status() -> String {
-    format!(
-        "Rust 宿主已连接 · ideal-harness v{} · capability 默认拒绝",
-        env!("CARGO_PKG_VERSION")
-    )
+    match harness_host::HostConfig::default().validate() {
+        Ok(_) => format!(
+            "Rust 宿主已连接 · ideal-harness v{} · capability 默认拒绝",
+            env!("CARGO_PKG_VERSION")
+        ),
+        Err(_) => "Rust 宿主配置不可用 · capability 默认拒绝".into(),
+    }
 }
 
 fn main() {
@@ -26,5 +29,10 @@ mod tests {
         let status = desktop_status();
         assert!(status.contains(env!("CARGO_PKG_VERSION")));
         assert!(status.contains("capability 默认拒绝"));
+    }
+
+    #[test]
+    fn desktop_uses_the_shared_host_config_boundary() {
+        assert!(harness_host::HostConfig::default().validate().is_ok());
     }
 }

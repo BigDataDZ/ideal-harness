@@ -1,17 +1,12 @@
 [package]
-name = "harness-cli"
+name = "harness-host"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "ideal-harness"
-path = "src/main.rs"
-
 [dependencies]
 anyhow = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 protocol = { workspace = true }
 sandbox-policy = { workspace = true }
@@ -23,4 +18,3 @@ approval = { workspace = true }
 sandbox-exec = { workspace = true }
 network-proxy = { workspace = true }
 reqwest = { workspace = true }
-harness-host = { workspace = true }
