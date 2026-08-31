@@ -19,6 +19,7 @@
 | P6 | v0.7 ✅ | **运行时闭环**：忠实重放、层级预算、权限时效与受监管扩展 | resume 与在线上下文等价；预算/权限/连接状态不可被旧状态绕过 |
 | P7 | v0.8 ✅ | **工具面扩展**：内置文件工具、执行护栏、白名单 web_fetch、turn 内 steer、跨会话记忆、Landlock 后端 | 出口判据由 TASK-803/808 收口：生产 CLI 装配 + scripted 端到端已证 |
 | P8 | v0.9 🟡 | **安全与产品化收口**：出网目标钉扎、可取消工具、生产装配、并发一致性、跨平台证据 | 代码与自动化门禁已完成；Windows/Linux CI 与安全回归全绿；发布验收仅待真实模型冒烟 |
+| P9 | v1.0 ⬜ | **桌面客户端**：Tauri 2 + React/TypeScript，事件流纯投影，安全审批与跨平台安装包 | Windows 桌面端可完成会话、流式对话、工具审计和审批；不产生第二真相源；安装包和 UI E2E 门禁通过 |
 
 并行规则：**同一阶段内不同 crate 的任务卡可由多个智能体并行认领；涉及 protocol 的任务串行**（契约冻结原则）。
 
@@ -371,7 +372,91 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 - **发布证据链**：807 ✅ → 808 🟡 → 809 ✅；810 ✅
 - **P8 出口判据**：801~807、809~810 完成 ✅；真实 CLI scripted 端到端已证 ✅；真实模型冒烟待 key 🟡；Windows/Linux 远程 CI 全绿 ✅；README、版本和生产能力一致 ✅
 
-## 十一、质量门禁演进（随阶段收紧）
+## 十一、P9 桌面客户端（v1.0）
+
+> 推荐栈：Tauri 2 + React + TypeScript + Vite。Rust Harness 仍是唯一业务真相源，客户端只消费
+> Event/RPC/SSE 投影；任何写操作、审批和密钥访问必须经过受控 Rust command，不向 WebView 暴露
+> 任意文件系统、shell 或远程网络能力。Taro 仅在未来明确需要微信/支付宝小程序时另行评估。
+
+### TASK-901: 桌面端架构决策、边界与最小骨架 ⬜
+- 目标范围: `docs/DESIGN-DECISIONS.md`、`AGENTS.md`、`docs/DEVELOPMENT.md`、`apps/desktop`
+- 内容: 新增 D22，确定 Tauri 仅是受限 UI 宿主、Event 是唯一真相源、命令面与投影面分离；修订“唯一 main”规则，为桌面入口建立明确例外和模块所有权；创建 Tauri 2 + React + TypeScript + Vite 最小工程及 Windows 开发启动页
+- 验收标准: `npm run typecheck`、`npm run build`、`cargo check` 通过；开发模式能打开本地窗口并显示后端版本/连接状态；CSP 禁止远程脚本，Tauri capability 默认空白名单；架构文档通过人工 review 后方可开始 TASK-902
+- 允许新增依赖: Tauri 2 官方核心/构建依赖、React、TypeScript、Vite，以及仅用于 lint/test 的前端开发依赖；版本必须锁定并提交 lockfile
+- 明确不做: 不实现聊天业务；不复制 agent-loop；不把现有只读 HTTP 接口扩成无鉴权写接口；不引入 Taro/Electron
+- 依赖: P8 自动化门禁已完成；TASK-808 真实模型冒烟可并行，不阻塞客户端骨架
+
+### TASK-902: 提取可复用 Host 装配层并保持 CLI 零回归 ⬜
+- 目标 crate: 新建 `harness-host`（名称可在 D22 review 时定稿）、harness-cli
+- 内容: 将 provider、代理、工具注册、审批注入、会话恢复和 AgentLoop 生产装配从二进制入口提取为可复用 library；CLI 与桌面端只做参数/交互适配；依赖方向同步写入所有权地图
+- 验收标准: CLI 现有命令与 313+ 回归测试不变；CLI 与桌面测试使用同一生产构造器；缺 key、缺审批器、未知执行环境继续 fail-closed；不新增或修改 protocol wire 契约
+- 明确不做: 不做多 provider 抽象；不把 UI 状态写入 SessionStore；不解析错误 message 做控制流
+- 依赖: TASK-901
+
+### TASK-903: Tauri 安全桥接与生命周期管理 ⬜
+- 目标范围: `apps/desktop/src-tauri`、harness-host
+- 内容: 只暴露显式 command DTO（启动/停止 turn、steer、取消、审批响应、会话操作）；窗口关闭时有界取消子进程与代理；按 Tauri capability 限定窗口权限；所有 command 输入做 schema/路径/epoch 校验
+- 验收标准: 未声明 command、路径逃逸、过期审批、旧 generation、窗口关闭后的调用全部 fail-closed；API key、审批内容和工具敏感结果不进入前端日志；生命周期集成测试证明无遗留代理/子进程
+- 允许新增依赖: Tauri 官方 dialog/process/event 等插件仅按最小能力逐个列入；每个插件需在 PR 中给出权限说明
+- 明确不做: 不开放任意 shell；不开放通用文件系统 API；不允许加载远程页面；不新增 loopback 写服务
+- 依赖: TASK-902
+
+### TASK-904: Event/SSE 投影状态库与断线补洞 ⬜
+- 目标范围: `apps/desktop/src/lib/projection`、protocol 生成/手写 DTO 适配层
+- 内容: 前端状态完全由 timeline + SSE 事件归约得到；实现 `Last-Event-ID`、connection generation、断线重连、gap repair、重复事件幂等和分页水位；本地仅保存非权威 UI 偏好
+- 验收标准: 乱序、重复、断流、服务重启和分页并发的确定性测试全绿；重连后视图与 SessionStore replay 结果一致；未知事件可降级展示但不得静默改写状态
+- 允许新增依赖: Zustand、TanStack Query；不得引入第二套持久业务数据库
+- 明确不做: 不在浏览器状态中补造 Event；不乐观确认审批/工具成功；不缓存 API key
+- 依赖: TASK-901、TASK-903、D18
+
+### TASK-905: 会话导航、Timeline 与诊断面板 ⬜
+- 目标范围: `apps/desktop/src/features/sessions`、`apps/desktop/src/features/timeline`
+- 内容: 会话列表、新建/resume/fork/revert 入口，turn 状态、Event 时间线、错误码、Token 用量、Agent Team 状态和连接代际展示；错误展示使用 code 决定交互，message 只用于说明
+- 验收标准: 空状态/加载/断线/坏会话/无权限均有明确 UI；fork/revert 必须二次确认且结果由事件回执确认；键盘导航和基础无障碍检查通过；快照覆盖主要状态
+- 允许新增依赖: shadcn/ui（源码组件）或 Ant Design 二选一，由 TASK-901 锁定；不得并存两套组件库
+- 明确不做: 不提供事件删除/篡改；不把客户端缓存作为会话列表真相源
+- 依赖: TASK-904
+
+### TASK-906: 流式对话、工具调用卡片与 Markdown 展示 ⬜
+- 目标范围: `apps/desktop/src/features/chat`
+- 内容: 用户输入、流式 assistant 文本、取消、steer、resume；tool_call/tool_result 成对卡片、稳定 ErrorCode、耗时与审计状态展示；Markdown/代码块安全渲染
+- 验收标准: 流式中断可恢复且不重复文本；工具调用/结果永不拆对；Markdown 禁止原始 HTML、脚本和危险链接协议；长消息和高频 token 更新不卡死主线程；组件与端到端测试覆盖成功/拒绝/超时/取消
+- 允许新增依赖: `react-markdown` 及最小安全插件；高亮库需按需加载并记录包体影响
+- 明确不做: 不执行模型生成的 HTML/JS；不在 UI 猜测工具成功；首版不做语音和多窗口并行 turn
+- 依赖: TASK-904、TASK-905
+
+### TASK-907: 审批中心、工作区文件树与安全 Diff ⬜
+- 目标范围: `apps/desktop/src/features/approval`、`apps/desktop/src/features/workspace`
+- 内容: 展示命令、工作区、SandboxMode、权限 epoch、执行环境和风险原因；允许明确批准/拒绝；提供只读文件树、文件预览和变更 Diff，写入仍只能经 harness 工具 CAS 路径完成
+- 验收标准: 审批服务/窗口不在场默认拒绝；过期审批不可点击复用；批准前完整展示实际参数；路径越界与 symlink 逃逸测试通过；Diff 可定位对应 Event 和 expected_hash
+- 允许新增依赖: Monaco Editor 仅用于只读代码/Diff，必须懒加载；若包体预算不达标则退回轻量 Diff 组件
+- 明确不做: 不提供绕过工具层的保存按钮；不嵌入任意交互 shell；不允许批量“永久批准”
+- 依赖: TASK-903、TASK-906
+
+### TASK-908: Provider 设置与系统密钥存储 ⬜
+- 目标范围: `apps/desktop/src/features/settings`、`apps/desktop/src-tauri`
+- 内容: 配置 base URL、model、fetch allowlist 和非敏感偏好；API key 写入操作系统安全存储，Rust 侧按需读取，WebView 永远拿不到明文；配置变更触发新的 generation/权限事实
+- 验收标准: key 不出现在 Event、日志、崩溃报告、前端状态和导出文件；安全存储不可用时拒绝保存而非降级明文；provider 连通性测试区分认证/网络/超时稳定码；删除 key 可验证生效
+- 允许新增依赖: Tauri 官方 Stronghold 插件或经 review 的系统 keyring crate 二选一，不得自行加密后落普通文件
+- 明确不做: 不同步云端配置；不在 UI 展示完整 key；不默认放宽 fetch allowlist
+- 依赖: TASK-903
+
+### TASK-909: 桌面 E2E、安装包、签名与发布门禁 ⬜
+- 目标范围: `apps/desktop`、`.github/workflows`、README、CHANGELOG
+- 内容: scripted-provider 驱动桌面 E2E，覆盖新建会话→对话→工具卡→审批→文件 Diff→完成→重启恢复；生成 Windows MSI/NSIS，预留 macOS/Linux 矩阵；记录包体、冷启动和长会话性能预算
+- 验收标准: Windows 安装/卸载/升级冒烟通过；前端 lint/typecheck/unit/E2E、Rust fmt/clippy/test、Tauri build 全部成为 CI 硬门禁；产物生成 SBOM 与校验和；正式发布必须配置代码签名，未配置时只允许生成标记为 unsigned 的内部测试包
+- 允许新增依赖: Playwright 或 WebdriverIO 二选一用于 E2E；打包/签名仅使用 Tauri 官方支持链路
+- 明确不做: 不自动发布未签名正式版本；不在 CI 使用真实模型 key；不因 UI 测试跳过现有 Rust 安全门禁
+- 依赖: TASK-905、TASK-906、TASK-907、TASK-908
+
+### P9 建议执行顺序
+
+- **架构串行链**：901（含 D22/规范 review）→ 902 → 903
+- **投影与产品链**：903 → 904 → 905 → 906 → 907
+- **可并行项**：908 可在 903 后与 904~907 并行；909 在 905~908 完成后收口
+- **P9 出口判据**：Windows 安装包可独立安装运行；scripted 桌面 E2E 全绿；真实模型完成一次代码任务冒烟；客户端状态可由事件流完全重建；审批/密钥/路径边界安全测试全绿；README、版本与能力一致
+
+## 十二、质量门禁演进（随阶段收紧）
 
 | 门禁 | P0 现在 | P1 起 | P2 起 | P3 起 |
 |---|---|---|---|---|
@@ -381,17 +466,21 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 | 属性测试 | — | — | — | 配对完整性必须 |
 | 审计事件覆盖 | — | — | 网络拒绝必须落事件 | 自动压缩必须落事件 |
 
-## 十二、规范自身的演进规则
+P9 新增硬门禁：前端 format/lint/typecheck/unit test、scripted 桌面 E2E、Tauri Windows build、
+依赖审计与安装包校验；任一门禁不得替代或弱化既有 Rust workspace 门禁。
+
+## 十三、规范自身的演进规则
 
 1. 改 `DEVELOPMENT.md`/`AGENTS.md` 的 PR 必须在标题加 `[spec]` 前缀，人工 review
 2. 新 crate 入册：PR 同时更新所有权地图（AGENTS.md §1）与本文档依赖图
 3. 任务卡完成后：在本文件对应卡片打 ✅ 并附 PR 链接，禁止删除历史卡片
 4. 阶段出口评审：人类守护者按「出口判据」逐条打勾后才开下一阶段的卡
 
-## 十三、给协调者的并行调度建议
+## 十四、给协调者的并行调度建议
 
 - **可并行组**：{102, 104} 与 {201} 与 {403} 互不触碰
 - **P7 并行组**：{701, 703, 705, 706} 可并行；{702 → 704} 是 protocol 串行链，必须一张卡走到底
 - **P8 调度**：先 801 → 802；再并行 {803, 804, 805, 806}（protocol 卡互斥）；最后 807 → 808 → 809，810 可在 807 后并行
+- **P9 调度**：901 → 902 → 903 严格串行；904 → 905 → 906 → 907 为主链，908 在 903 后并行，909 最后收口
 - **串行链**：101 → 103 → 303（协议→闭环→自愈，一条线一个人/代理跟到底）
 - 每个智能体会话结束必须产出 AGENTS.md §6 汇报；连续两次汇报缺测试证据的智能体暂停派卡
