@@ -304,7 +304,9 @@ mod tests {
     use approval::Decision;
     use model_provider::{ChatMessage, ChatModel, OpenAiCompatClient};
     use protocol::{ExecutorEnvironment, ModelCallSpec};
-    use sandbox_exec::{ExecutionOutput, PlatformRestrictedBackend};
+    use sandbox_exec::ExecutionOutput;
+    #[cfg(windows)]
+    use sandbox_exec::PlatformRestrictedBackend;
     use std::io;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
