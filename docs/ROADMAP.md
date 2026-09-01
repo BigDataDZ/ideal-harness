@@ -433,13 +433,14 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 - 依赖: TASK-904、TASK-905
 - 完成证据: 新增纯 Event 投影的流式对话与 steer/cancel/resume 控件，按 `call_id` 合并高频 chunk，并以最终 assistant 事件替换草稿，断线重放和跨 Turn 中断均不重复文本；工具调用与结果合并为单卡，孤立结果、重复结果和未闭合调用 fail-closed，成功/拒绝/超时/取消仅按权威事件与稳定 `ErrorCode` 展示，协议未提供墙钟时间时明确显示 event span 而不伪造耗时；`react-markdown@10.1.0` 使用 `skipHtml` 和 URL 白名单，阻止原始 HTML、脚本、危险协议及远程图片，长 Markdown 限制为 65,536 字符且未引入高亮器；20 项前端测试全绿，其中 TASK-906 新增 7 项覆盖流恢复、跨 Turn、工具状态、配对拒绝、Markdown 安全和 20,000 chunk 性能，事件到组件链路覆盖成功/拒绝/超时/取消；1280/700 宽真实浏览器验收无控制台错误和横向溢出；前端 typecheck/build/audit、桌面 Rust 3 项测试、workspace 全量测试及 Rust 1.85 构建全绿，生产 JS 337.46 KB（gzip 105.45 KB）
 
-### TASK-907: 审批中心、工作区文件树与安全 Diff ⬜
+### TASK-907: 审批中心、工作区文件树与安全 Diff ✅
 - 目标范围: `apps/desktop/src/features/approval`、`apps/desktop/src/features/workspace`
 - 内容: 展示命令、工作区、SandboxMode、权限 epoch、执行环境和风险原因；允许明确批准/拒绝；提供只读文件树、文件预览和变更 Diff，写入仍只能经 harness 工具 CAS 路径完成
 - 验收标准: 审批服务/窗口不在场默认拒绝；过期审批不可点击复用；批准前完整展示实际参数；路径越界与 symlink 逃逸测试通过；Diff 可定位对应 Event 和 expected_hash
 - 允许新增依赖: Monaco Editor 仅用于只读代码/Diff，必须懒加载；若包体预算不达标则退回轻量 Diff 组件
 - 明确不做: 不提供绕过工具层的保存按钮；不嵌入任意交互 shell；不允许批量“永久批准”
 - 依赖: TASK-903、TASK-906
+- 完成证据: 新增 fail-closed 审批中心，只有宿主提供 request/call id、实际程序与完整参数、SandboxMode、风险原因、工作区、权限 epoch/profile hash、桌面与执行器 generation、OS/Home 等完整且仍新鲜的安全事实时才开放操作；审批服务/请求缺席、事实不完整、工作区不一致、generation/epoch 过期均默认拒绝并禁用按钮，批准必须按 requestId 单独勾选复核且仅批准本次，提交仍经既有 generation-aware `respond_approval` command，审批历史仅从 `approval_decided`/`authorization_invalidated` Event 重建；新增只读工作区观察页，仅从成对 `fs_read/fs_glob/fs_write/fs_edit` Event 投影文件树、预览和轻量文本 Diff，不向 WebView 开放文件系统或保存入口，拒绝绝对路径、遍历、控制字符和不安全 glob 结果，Diff 显示 call id、请求/结果 Event、expected_hash、最近 fs_read hash 的 CAS 匹配事实和 400 行上限；TASK-907 新增 7 项前端测试（总计 27 项）覆盖服务缺席、事实不全、过期审批、完整参数、审计失效、路径越界、失败的 symlink 逃逸、配对 Diff 和 CAS 冲突，Rust 工具层 path escape/symlink/CAS 测试同步全绿；1280/700 宽真实浏览器验收无控制台错误和横向溢出；未新增依赖或 Monaco，生产 JS 352.39 KB（gzip 109.91 KB，较 TASK-906 增加约 4.46 KB）；前端 typecheck/build/audit、桌面 Rust 3 项测试、workspace 全量测试及 Rust 1.85 构建全绿
 
 ### TASK-908: Provider 设置与系统密钥存储 ⬜
 - 目标范围: `apps/desktop/src/features/settings`、`apps/desktop/src-tauri`

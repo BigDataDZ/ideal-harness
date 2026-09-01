@@ -9,8 +9,10 @@ import {
   type SessionOperation,
   type SessionReceiptDto,
 } from "./features/sessions/index.ts";
+import { ApprovalCenter, type PendingApprovalRequest } from "./features/approval/index.ts";
 import { ChatPanel } from "./features/chat/index.ts";
 import { TimelinePanel } from "./features/timeline/index.ts";
+import { WorkspacePanel } from "./features/workspace/index.ts";
 import type { ProjectionSnapshot } from "./lib/projection/index.ts";
 
 interface DesktopStatus {
@@ -25,7 +27,8 @@ function App() {
   const [sessions, setSessions] = useState<SessionCollectionState>({ kind: "loading" });
   const [selectedSnapshot] = useState<ProjectionSnapshot | null>(null);
   const [operation, dispatchOperation] = useReducer(operationReducer, { kind: "idle" });
-  const [activeView, setActiveView] = useState<"chat" | "timeline">("chat");
+  const [activeView, setActiveView] = useState<"chat" | "timeline" | "approval" | "workspace">("chat");
+  const [pendingApproval] = useState<PendingApprovalRequest | null>(null);
 
   const connect = useCallback(() => {
     setSessions({ kind: "loading" });
@@ -88,6 +91,18 @@ function App() {
     );
   };
 
+  const decideApproval = (request: PendingApprovalRequest, approved: boolean): Promise<void> => {
+    if (!security) return Promise.reject({ code: "approval_rejected", message: "审批服务不在场" });
+    return invoke("respond_approval", {
+      request: {
+        context: { generation: security.generation, permissionEpoch: security.permissionEpoch },
+        requestId: request.requestId,
+        executorGeneration: request.executor.generation,
+        approved,
+      },
+    }).then(() => undefined);
+  };
+
   return (
     <main className="app-shell">
       <SessionNavigator
@@ -118,6 +133,8 @@ function App() {
         <nav className="workspace-tabs" aria-label="会话视图">
           <button type="button" aria-current={activeView === "chat" ? "page" : undefined} onClick={() => setActiveView("chat")}>对话</button>
           <button type="button" aria-current={activeView === "timeline" ? "page" : undefined} onClick={() => setActiveView("timeline")}>Timeline</button>
+          <button type="button" aria-current={activeView === "approval" ? "page" : undefined} onClick={() => setActiveView("approval")}>审批</button>
+          <button type="button" aria-current={activeView === "workspace" ? "page" : undefined} onClick={() => setActiveView("workspace")}>工作区</button>
         </nav>
         {activeView === "chat" ? (
           <ChatPanel
@@ -130,9 +147,18 @@ function App() {
               if (selectedId) requestOperation({ kind: "resume", sessionId: selectedId });
             }}
           />
-        ) : <TimelinePanel snapshot={selectedSnapshot} />}
+        ) : activeView === "timeline" ? (
+          <TimelinePanel snapshot={selectedSnapshot} />
+        ) : activeView === "approval" ? (
+          <ApprovalCenter
+            snapshot={selectedSnapshot}
+            request={pendingApproval}
+            security={security ? { generation: security.generation, permissionEpoch: security.permissionEpoch } : null}
+            onDecision={decideApproval}
+          />
+        ) : <WorkspacePanel snapshot={selectedSnapshot} />}
         <footer className="app-footer">
-          <span>TASK-906</span>
+          <span>TASK-907</span>
           <span>事件是唯一真相源 · 客户端不持久化会话状态</span>
         </footer>
       </div>
