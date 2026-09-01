@@ -9,6 +9,7 @@ import {
   type SessionOperation,
   type SessionReceiptDto,
 } from "./features/sessions/index.ts";
+import { ChatPanel } from "./features/chat/index.ts";
 import { TimelinePanel } from "./features/timeline/index.ts";
 import type { ProjectionSnapshot } from "./lib/projection/index.ts";
 
@@ -24,6 +25,7 @@ function App() {
   const [sessions, setSessions] = useState<SessionCollectionState>({ kind: "loading" });
   const [selectedSnapshot] = useState<ProjectionSnapshot | null>(null);
   const [operation, dispatchOperation] = useReducer(operationReducer, { kind: "idle" });
+  const [activeView, setActiveView] = useState<"chat" | "timeline">("chat");
 
   const connect = useCallback(() => {
     setSessions({ kind: "loading" });
@@ -78,6 +80,14 @@ function App() {
   const selectedId =
     sessions.kind === "ready" || sessions.kind === "disconnected" ? sessions.selectedId : null;
 
+  const turnCommand = (command: "cancel_turn" | "steer_turn", turnId: number, input?: string) => {
+    if (!security) return;
+    const context = { generation: security.generation, permissionEpoch: security.permissionEpoch };
+    void invoke(command, { request: { context, turnId, ...(input === undefined ? {} : { input }) } }).catch(
+      () => undefined,
+    );
+  };
+
   return (
     <main className="app-shell">
       <SessionNavigator
@@ -105,9 +115,24 @@ function App() {
             <span>EPOCH {security?.permissionEpoch ?? "—"}</span>
           </div>
         </header>
-        <TimelinePanel snapshot={selectedSnapshot} />
+        <nav className="workspace-tabs" aria-label="会话视图">
+          <button type="button" aria-current={activeView === "chat" ? "page" : undefined} onClick={() => setActiveView("chat")}>对话</button>
+          <button type="button" aria-current={activeView === "timeline" ? "page" : undefined} onClick={() => setActiveView("timeline")}>Timeline</button>
+        </nav>
+        {activeView === "chat" ? (
+          <ChatPanel
+            snapshot={selectedSnapshot}
+            startAvailable={false}
+            onSend={() => undefined}
+            onSteer={(turnId, input) => turnCommand("steer_turn", turnId, input)}
+            onCancel={(turnId) => turnCommand("cancel_turn", turnId)}
+            onResume={() => {
+              if (selectedId) requestOperation({ kind: "resume", sessionId: selectedId });
+            }}
+          />
+        ) : <TimelinePanel snapshot={selectedSnapshot} />}
         <footer className="app-footer">
-          <span>TASK-905</span>
+          <span>TASK-906</span>
           <span>事件是唯一真相源 · 客户端不持久化会话状态</span>
         </footer>
       </div>

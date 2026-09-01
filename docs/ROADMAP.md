@@ -424,13 +424,14 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 - 依赖: TASK-904
 - 完成证据: 新增无第三方 UI 依赖的会话导航、操作确认状态机、Timeline 与诊断投影；错误交互严格按稳定 code 路由，fork/revert 经二次确认和宿主回执后仍等待事件投影，不乐观改写会话列表；Event 安全摘要覆盖 Turn、Token、Agent Team、错误与 generation，未知事件只降级展示；13 项前端测试覆盖主要状态快照、无障碍语义和投影确定性，1280/700 宽真实渲染无控制台错误和横向溢出；前端 typecheck/build/audit、桌面 Rust 门禁、workspace 318 项测试及 Rust 1.85 构建全绿
 
-### TASK-906: 流式对话、工具调用卡片与 Markdown 展示 ⬜
+### TASK-906: 流式对话、工具调用卡片与 Markdown 展示 ✅
 - 目标范围: `apps/desktop/src/features/chat`
 - 内容: 用户输入、流式 assistant 文本、取消、steer、resume；tool_call/tool_result 成对卡片、稳定 ErrorCode、耗时与审计状态展示；Markdown/代码块安全渲染
 - 验收标准: 流式中断可恢复且不重复文本；工具调用/结果永不拆对；Markdown 禁止原始 HTML、脚本和危险链接协议；长消息和高频 token 更新不卡死主线程；组件与端到端测试覆盖成功/拒绝/超时/取消
 - 允许新增依赖: `react-markdown` 及最小安全插件；高亮库需按需加载并记录包体影响
 - 明确不做: 不执行模型生成的 HTML/JS；不在 UI 猜测工具成功；首版不做语音和多窗口并行 turn
 - 依赖: TASK-904、TASK-905
+- 完成证据: 新增纯 Event 投影的流式对话与 steer/cancel/resume 控件，按 `call_id` 合并高频 chunk，并以最终 assistant 事件替换草稿，断线重放和跨 Turn 中断均不重复文本；工具调用与结果合并为单卡，孤立结果、重复结果和未闭合调用 fail-closed，成功/拒绝/超时/取消仅按权威事件与稳定 `ErrorCode` 展示，协议未提供墙钟时间时明确显示 event span 而不伪造耗时；`react-markdown@10.1.0` 使用 `skipHtml` 和 URL 白名单，阻止原始 HTML、脚本、危险协议及远程图片，长 Markdown 限制为 65,536 字符且未引入高亮器；20 项前端测试全绿，其中 TASK-906 新增 7 项覆盖流恢复、跨 Turn、工具状态、配对拒绝、Markdown 安全和 20,000 chunk 性能，事件到组件链路覆盖成功/拒绝/超时/取消；1280/700 宽真实浏览器验收无控制台错误和横向溢出；前端 typecheck/build/audit、桌面 Rust 3 项测试、workspace 全量测试及 Rust 1.85 构建全绿，生产 JS 337.46 KB（gzip 105.45 KB）
 
 ### TASK-907: 审批中心、工作区文件树与安全 Diff ⬜
 - 目标范围: `apps/desktop/src/features/approval`、`apps/desktop/src/features/workspace`
