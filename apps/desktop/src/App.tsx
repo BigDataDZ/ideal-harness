@@ -13,6 +13,12 @@ import { ApprovalCenter, type PendingApprovalRequest } from "./features/approval
 import { ChatPanel } from "./features/chat/index.ts";
 import { TimelinePanel } from "./features/timeline/index.ts";
 import { WorkspacePanel } from "./features/workspace/index.ts";
+import {
+  SettingsPanel,
+  type ProbeResult,
+  type ProviderSettings,
+  type ProviderSettingsSnapshot,
+} from "./features/settings/index.tsx";
 import type { ProjectionSnapshot } from "./lib/projection/index.ts";
 
 interface DesktopStatus {
@@ -27,8 +33,11 @@ function App() {
   const [sessions, setSessions] = useState<SessionCollectionState>({ kind: "loading" });
   const [selectedSnapshot] = useState<ProjectionSnapshot | null>(null);
   const [operation, dispatchOperation] = useReducer(operationReducer, { kind: "idle" });
-  const [activeView, setActiveView] = useState<"chat" | "timeline" | "approval" | "workspace">("chat");
+  const [activeView, setActiveView] = useState<"chat" | "timeline" | "approval" | "workspace" | "settings">("chat");
   const [pendingApproval] = useState<PendingApprovalRequest | null>(null);
+  const [providerSettings, setProviderSettings] = useState<ProviderSettingsSnapshot | null>(null);
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
 
   const connect = useCallback(() => {
     setSessions({ kind: "loading" });
@@ -49,6 +58,14 @@ function App() {
   }, []);
 
   useEffect(() => connect(), [connect]);
+
+  const loadSettings = useCallback(() => {
+    invoke<ProviderSettingsSnapshot>("get_provider_settings")
+      .then(setProviderSettings)
+      .catch((cause: unknown) => setSettingsMessage(commandError(cause).message));
+  }, []);
+
+  useEffect(() => loadSettings(), [loadSettings]);
 
   const submitOperation = useCallback(
     (requested: SessionOperation) => {
@@ -103,6 +120,58 @@ function App() {
     }).then(() => undefined);
   };
 
+  const settingsContext = () => {
+    if (!security) throw new Error("host unavailable");
+    return { generation: security.generation, permissionEpoch: security.permissionEpoch };
+  };
+
+  const settingsMutation = async (command: string, details: Record<string, unknown>) => {
+    setSettingsBusy(true);
+    setSettingsMessage(null);
+    try {
+      const receipt = await invoke<DesktopStatus>(command, {
+        request: { context: settingsContext(), ...details },
+      });
+      setSecurity(receipt);
+      loadSettings();
+      setSettingsMessage("设置已生效，安全代际已更新");
+    } catch (cause) {
+      setSettingsMessage(commandError(cause).message);
+      connect();
+    } finally {
+      setSettingsBusy(false);
+    }
+  };
+
+  const saveSettings = (settings: ProviderSettings) =>
+    settingsMutation("save_provider_settings", { settings });
+  const storeKey = (apiKey: string) =>
+    settingsMutation("store_api_key", { apiKey });
+  const deleteKey = () =>
+    settingsMutation("delete_api_key", {});
+  const probeProvider = async (): Promise<ProbeResult> => {
+    setSettingsBusy(true);
+    try {
+      const result = await invoke<ProbeResult>("test_provider_connection", {
+        request: { context: settingsContext() },
+      });
+      const labels: Record<ProbeResult, string> = {
+        connected: "连接成功",
+        authentication_failed: "认证失败：请更新 API Key",
+        network_unavailable: "网络不可达",
+        timed_out: "连接超时",
+        rejected: "Provider 拒绝请求",
+      };
+      setSettingsMessage(labels[result]);
+      return result;
+    } catch (cause) {
+      setSettingsMessage(commandError(cause).message);
+      return "rejected";
+    } finally {
+      setSettingsBusy(false);
+    }
+  };
+
   return (
     <main className="app-shell">
       <SessionNavigator
@@ -135,6 +204,7 @@ function App() {
           <button type="button" aria-current={activeView === "timeline" ? "page" : undefined} onClick={() => setActiveView("timeline")}>Timeline</button>
           <button type="button" aria-current={activeView === "approval" ? "page" : undefined} onClick={() => setActiveView("approval")}>审批</button>
           <button type="button" aria-current={activeView === "workspace" ? "page" : undefined} onClick={() => setActiveView("workspace")}>工作区</button>
+          <button type="button" aria-current={activeView === "settings" ? "page" : undefined} onClick={() => setActiveView("settings")}>设置</button>
         </nav>
         {activeView === "chat" ? (
           <ChatPanel
@@ -156,9 +226,19 @@ function App() {
             security={security ? { generation: security.generation, permissionEpoch: security.permissionEpoch } : null}
             onDecision={decideApproval}
           />
-        ) : <WorkspacePanel snapshot={selectedSnapshot} />}
+        ) : activeView === "workspace" ? <WorkspacePanel snapshot={selectedSnapshot} /> : (
+          <SettingsPanel
+            snapshot={providerSettings}
+            busy={settingsBusy}
+            message={settingsMessage}
+            onSave={saveSettings}
+            onStoreKey={storeKey}
+            onDeleteKey={deleteKey}
+            onProbe={probeProvider}
+          />
+        )}
         <footer className="app-footer">
-          <span>TASK-907</span>
+          <span>TASK-908</span>
           <span>事件是唯一真相源 · 客户端不持久化会话状态</span>
         </footer>
       </div>

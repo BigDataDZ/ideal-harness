@@ -3,10 +3,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod secret_store;
+mod settings;
 
 use commands::{
-    cancel_turn, close_window, desktop_status, initialize_state, respond_approval,
-    session_operation, start_turn, steer_turn, stop_turn,
+    cancel_turn, close_window, delete_api_key, desktop_status, get_provider_settings,
+    initialize_state, respond_approval, save_provider_settings, session_operation, start_turn,
+    steer_turn, stop_turn, store_api_key, test_provider_connection,
 };
 
 fn main() {
@@ -21,7 +24,12 @@ fn main() {
             cancel_turn,
             steer_turn,
             respond_approval,
-            session_operation
+            session_operation,
+            get_provider_settings,
+            save_provider_settings,
+            store_api_key,
+            delete_api_key,
+            test_provider_connection
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) {

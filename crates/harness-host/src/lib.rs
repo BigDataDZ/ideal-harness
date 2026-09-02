@@ -10,6 +10,7 @@ use agent_loop::{
     AgentLoop, LoopGuard, ToolResultContext, ToolResultDecision, ToolResultMiddleware,
 };
 use approval::Approver;
+pub use model_provider::ProviderProbeFailure;
 use model_provider::{ChatMessage, OpenAiCompatClient};
 pub use protocol::{ErrorCode, ErrorEnvelope};
 use protocol::{Event, ModelCallSpec, ToolOutcome};
@@ -110,6 +111,22 @@ impl ProductionHost {
         config: HostConfig,
         approver: Option<Arc<dyn Approver + Send + Sync>>,
     ) -> anyhow::Result<Self> {
+        let key = std::env::var(model_provider::API_KEY_ENV).map_err(|_| {
+            anyhow::anyhow!(
+                "环境变量 {} 未设置；拒绝以匿名方式调用上游",
+                model_provider::API_KEY_ENV
+            )
+        })?;
+        Self::start_with_api_key(config, key, approver)
+    }
+
+    /// Desktop-safe constructor: the caller obtains the key from an OS credential store and the
+    /// host never writes it to configuration, events, or command responses.
+    pub fn start_with_api_key(
+        config: HostConfig,
+        api_key: impl Into<String>,
+        approver: Option<Arc<dyn Approver + Send + Sync>>,
+    ) -> anyhow::Result<Self> {
         let config = config.validate()?;
         let proxy_events = Arc::new(Mutex::new(Vec::<Event>::new()));
         let proxy = ProviderProxy::start_with_fetch_hosts(
@@ -117,12 +134,8 @@ impl ProductionHost {
             &config.fetch_allow,
             Arc::clone(&proxy_events),
         )?;
-        let client = OpenAiCompatClient::from_env_via_proxy(&proxy.url).map_err(|error| {
-            anyhow::anyhow!(
-                "{}（请先设置环境变量 IDEAL_HARNESS_API_KEY 后重试）",
-                error.message
-            )
-        })?;
+        let client = OpenAiCompatClient::with_key_via_proxy(api_key, &proxy.url)
+            .map_err(|error| anyhow::anyhow!(error.message))?;
         let cancel_token = CancellationToken::default();
         let mut registry = ToolRegistry::default();
         register_chat_tools(
@@ -144,6 +157,10 @@ impl ProductionHost {
             cancel_token,
             result_middleware: ProductionResultMiddleware::default(),
         })
+    }
+
+    pub fn probe_provider(&self) -> Result<(), ProviderProbeFailure> {
+        self.client.probe(&self.config.base_url)
     }
 
     pub fn config(&self) -> &ValidatedHostConfig {

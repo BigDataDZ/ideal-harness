@@ -119,6 +119,10 @@ impl DesktopBridge {
         }
     }
 
+    pub fn validate_command_context(&self, context: CommandContext) -> Result<(), ErrorEnvelope> {
+        self.validate_context(context)
+    }
+
     pub fn has_production_host(&self) -> bool {
         self.host.is_some()
     }
@@ -138,6 +142,53 @@ impl DesktopBridge {
         let host = ProductionHost::start(config, approver).map_err(internal)?;
         self.host = Some(Box::new(host));
         self.host_config = Some(validated);
+        Ok(())
+    }
+
+    pub fn install_production_host_with_api_key(
+        &mut self,
+        context: CommandContext,
+        config: HostConfig,
+        api_key: impl Into<String>,
+        approver: Option<Arc<dyn Approver + Send + Sync>>,
+    ) -> Result<(), ErrorEnvelope> {
+        self.validate_context(context)?;
+        if self.host.is_some() {
+            return Err(invalid("production host is already installed"));
+        }
+        let validated = config.clone().validate().map_err(internal)?;
+        self.validate_workspace(&validated.workspace)?;
+        let host =
+            ProductionHost::start_with_api_key(config, api_key, approver).map_err(internal)?;
+        self.host = Some(Box::new(host));
+        self.host_config = Some(validated);
+        Ok(())
+    }
+
+    /// Invalidates every permission fact after provider settings or credentials change.
+    pub fn configuration_changed(
+        &mut self,
+        context: CommandContext,
+    ) -> Result<CommandReceipt, ErrorEnvelope> {
+        self.validate_configuration_change(context)?;
+        let shutdown = self.cancel_and_shutdown_host();
+        let advanced = self.advance_security_context();
+        shutdown?;
+        advanced?;
+        Ok(self.receipt("configuration_changed", None))
+    }
+
+    pub fn validate_configuration_change(
+        &self,
+        context: CommandContext,
+    ) -> Result<(), ErrorEnvelope> {
+        self.validate_context(context)?;
+        if self.active_turn.is_some() || self.pending_approval.is_some() {
+            return Err(ErrorEnvelope::new(
+                ErrorCode::ApprovalRejected,
+                "configuration cannot change while a turn or approval is active",
+            ));
+        }
         Ok(())
     }
 
@@ -642,6 +693,35 @@ mod tests {
             ErrorCode::SandboxDenied
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn configuration_change_invalidates_host_and_is_blocked_during_turn() {
+        let (root, mut bridge, token, shutdown) = bridge_with_fake("configuration");
+        let context = bridge.context();
+        let receipt = bridge.configuration_changed(context).unwrap();
+        assert!(token.is_cancelled());
+        assert!(shutdown.load(Ordering::SeqCst));
+        assert!(receipt.generation > context.generation);
+        assert!(receipt.permission_epoch > context.permission_epoch);
+        assert!(!bridge.has_production_host());
+
+        let (active_root, mut active, _, _) = bridge_with_fake("configuration-active");
+        let active_context = active.context();
+        active.active_turn = Some(ActiveTurn {
+            id: 7,
+            session_id: "demo".into(),
+        });
+        assert_eq!(
+            active
+                .validate_configuration_change(active_context)
+                .unwrap_err()
+                .code,
+            ErrorCode::ApprovalRejected
+        );
+        assert_eq!(active.context(), active_context);
+        std::fs::remove_dir_all(root).ok();
+        std::fs::remove_dir_all(active_root).ok();
     }
 
     #[test]

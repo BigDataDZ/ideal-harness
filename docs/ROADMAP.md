@@ -442,13 +442,14 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 - 依赖: TASK-903、TASK-906
 - 完成证据: 新增 fail-closed 审批中心，只有宿主提供 request/call id、实际程序与完整参数、SandboxMode、风险原因、工作区、权限 epoch/profile hash、桌面与执行器 generation、OS/Home 等完整且仍新鲜的安全事实时才开放操作；审批服务/请求缺席、事实不完整、工作区不一致、generation/epoch 过期均默认拒绝并禁用按钮，批准必须按 requestId 单独勾选复核且仅批准本次，提交仍经既有 generation-aware `respond_approval` command，审批历史仅从 `approval_decided`/`authorization_invalidated` Event 重建；新增只读工作区观察页，仅从成对 `fs_read/fs_glob/fs_write/fs_edit` Event 投影文件树、预览和轻量文本 Diff，不向 WebView 开放文件系统或保存入口，拒绝绝对路径、遍历、控制字符和不安全 glob 结果，Diff 显示 call id、请求/结果 Event、expected_hash、最近 fs_read hash 的 CAS 匹配事实和 400 行上限；TASK-907 新增 7 项前端测试（总计 27 项）覆盖服务缺席、事实不全、过期审批、完整参数、审计失效、路径越界、失败的 symlink 逃逸、配对 Diff 和 CAS 冲突，Rust 工具层 path escape/symlink/CAS 测试同步全绿；1280/700 宽真实浏览器验收无控制台错误和横向溢出；未新增依赖或 Monaco，生产 JS 352.39 KB（gzip 109.91 KB，较 TASK-906 增加约 4.46 KB）；前端 typecheck/build/audit、桌面 Rust 3 项测试、workspace 全量测试及 Rust 1.85 构建全绿
 
-### TASK-908: Provider 设置与系统密钥存储 ⬜
+### TASK-908: Provider 设置与系统密钥存储 ✅
 - 目标范围: `apps/desktop/src/features/settings`、`apps/desktop/src-tauri`
 - 内容: 配置 base URL、model、fetch allowlist 和非敏感偏好；API key 写入操作系统安全存储，Rust 侧按需读取，WebView 永远拿不到明文；配置变更触发新的 generation/权限事实
 - 验收标准: key 不出现在 Event、日志、崩溃报告、前端状态和导出文件；安全存储不可用时拒绝保存而非降级明文；provider 连通性测试区分认证/网络/超时稳定码；删除 key 可验证生效
 - 允许新增依赖: Tauri 官方 Stronghold 插件或经 review 的系统 keyring crate 二选一，不得自行加密后落普通文件
 - 明确不做: 不同步云端配置；不在 UI 展示完整 key；不默认放宽 fetch allowlist
 - 依赖: TASK-903
+- 完成证据: Windows 端采用 `keyring 3.6.3` 的 `windows-native` 后端写入系统凭据库（兼容项目 Rust 1.85 MSRV），安全存储缺席/拒绝时 fail-closed，未实现明文文件回退；非敏感 Provider 配置独立写入 `.harness/desktop-settings.json`，默认 fetch 白名单为空并拒绝通配符、URL、localhost 与私网地址；WebView 仅能提交新 key 和读取 `hasApiKey`，密钥输入不进入 React state，Rust command、DTO、错误和 Provider `Debug` 均不返回明文；模型调用和连通性探测均在 Rust 侧按需取 key，探测 `/models` 以稳定结果区分 connected/authentication/network/timeout/rejected；保存配置、写入或删除 key 均关闭旧 Host 并推进 generation + permission epoch，活动 turn/审批期间拒绝变更；Windows Credential Manager 真实 round-trip/delete 测试、认证/网络/超时故障注入、配置落盘无 key、默认拒绝 allowlist、前端密钥库不可用状态等回归全绿；前端共 29 项测试、桌面 Rust 7 项测试，workspace 全量测试与严格 clippy 通过，生产 JS 356.67 KB（gzip 111.15 KB）
 
 ### TASK-909: 桌面 E2E、安装包、签名与发布门禁 ⬜
 - 目标范围: `apps/desktop`、`.github/workflows`、README、CHANGELOG

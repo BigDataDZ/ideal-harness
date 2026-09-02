@@ -1,16 +1,24 @@
 //! D25/TASK-903: explicit DTO command bridge and bounded Host lifecycle.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use harness_host::{
     CommandContext, CommandReceipt, DesktopBridge, ErrorCode, ErrorEnvelope, HostConfig,
-    SessionOperation, SessionReceipt,
+    ProductionHost, ProviderProbeFailure, SessionOperation, SessionReceipt,
 };
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
-pub(crate) struct DesktopState(Mutex<DesktopBridge>);
+use crate::secret_store::{SecretStore, SecretStoreError, SystemSecretStore};
+use crate::settings::{ProviderSettings, SettingsStore};
+
+pub(crate) struct DesktopState {
+    bridge: Mutex<DesktopBridge>,
+    settings: Mutex<SettingsStore>,
+    secrets: Arc<dyn SecretStore>,
+    workspace: PathBuf,
+}
 
 #[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -33,12 +41,45 @@ impl From<SecurityContextDto> for CommandContext {
 pub(crate) struct StartTurnDto {
     context: SecurityContextDto,
     session_id: String,
-    workspace: PathBuf,
     input: String,
-    base_url: String,
-    model: String,
-    #[serde(default)]
-    fetch_allow: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SettingsCommandDto {
+    context: SecurityContextDto,
+    settings: ProviderSettings,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SecretCommandDto {
+    context: SecurityContextDto,
+    api_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ContextCommandDto {
+    context: SecurityContextDto,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderSettingsDto {
+    settings: ProviderSettings,
+    has_api_key: bool,
+    secure_storage_available: bool,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderProbeDto {
+    Connected,
+    AuthenticationFailed,
+    NetworkUnavailable,
+    TimedOut,
+    Rejected,
 }
 
 #[derive(Deserialize)]
@@ -172,22 +213,133 @@ pub(crate) fn desktop_status(
 }
 
 #[tauri::command]
+pub(crate) fn get_provider_settings(
+    state: tauri::State<'_, DesktopState>,
+) -> Result<ProviderSettingsDto, CommandErrorDto> {
+    let settings = lock_settings(&state)?
+        .load()
+        .map_err(CommandErrorDto::from)?;
+    let (has_api_key, secure_storage_available) = match state.secrets.has_api_key() {
+        Ok(value) => (value, true),
+        Err(SecretStoreError::Unavailable) => (false, false),
+        Err(_) => (false, true),
+    };
+    Ok(ProviderSettingsDto {
+        settings,
+        has_api_key,
+        secure_storage_available,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn save_provider_settings(
+    request: SettingsCommandDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<CommandReceiptDto, CommandErrorDto> {
+    let context = request.context.into();
+    let mut bridge = lock_bridge(&state)?;
+    bridge
+        .validate_configuration_change(context)
+        .map_err(CommandErrorDto::from)?;
+    let config = host_config(&state.workspace, &request.settings);
+    config.validate().map_err(|_| {
+        CommandErrorDto::from(ErrorEnvelope::new(
+            ErrorCode::ToolArgsInvalid,
+            "provider settings are invalid",
+        ))
+    })?;
+    let settings = request.settings.validate().map_err(CommandErrorDto::from)?;
+    lock_settings(&state)?
+        .save(settings)
+        .map_err(CommandErrorDto::from)?;
+    bridge
+        .configuration_changed(context)
+        .map(CommandReceiptDto::from)
+        .map_err(CommandErrorDto::from)
+}
+
+#[tauri::command]
+pub(crate) fn store_api_key(
+    request: SecretCommandDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<CommandReceiptDto, CommandErrorDto> {
+    if request.api_key.trim().is_empty() {
+        return Err(CommandErrorDto::from(ErrorEnvelope::new(
+            ErrorCode::ToolArgsInvalid,
+            "API key is blank",
+        )));
+    }
+    let receipt = lock_bridge(&state)?
+        .configuration_changed(request.context.into())
+        .map_err(CommandErrorDto::from)?;
+    state
+        .secrets
+        .set_api_key(&request.api_key)
+        .map_err(secret_error)?;
+    Ok(receipt.into())
+}
+
+#[tauri::command]
+pub(crate) fn delete_api_key(
+    request: ContextCommandDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<CommandReceiptDto, CommandErrorDto> {
+    let receipt = lock_bridge(&state)?
+        .configuration_changed(request.context.into())
+        .map_err(CommandErrorDto::from)?;
+    match state.secrets.delete_api_key() {
+        Ok(()) | Err(SecretStoreError::Missing) => Ok(receipt.into()),
+        Err(error) => Err(secret_error(error)),
+    }
+}
+
+#[tauri::command]
+pub(crate) fn test_provider_connection(
+    request: ContextCommandDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<ProviderProbeDto, CommandErrorDto> {
+    let context = request.context.into();
+    lock_bridge(&state)?
+        .validate_command_context(context)
+        .map_err(CommandErrorDto::from)?;
+    let settings = lock_settings(&state)?
+        .load()
+        .map_err(CommandErrorDto::from)?;
+    let api_key = state.secrets.get_api_key().map_err(secret_error)?;
+    let mut host =
+        ProductionHost::start_with_api_key(host_config(&state.workspace, &settings), api_key, None)
+            .map_err(|_| {
+                CommandErrorDto::from(ErrorEnvelope::new(
+                    ErrorCode::Internal,
+                    "provider probe could not initialize",
+                ))
+            })?;
+    let result = host.probe_provider();
+    let _ = host.shutdown();
+    Ok(match result {
+        Ok(()) => ProviderProbeDto::Connected,
+        Err(ProviderProbeFailure::Authentication) => ProviderProbeDto::AuthenticationFailed,
+        Err(ProviderProbeFailure::Network) => ProviderProbeDto::NetworkUnavailable,
+        Err(ProviderProbeFailure::Timeout) => ProviderProbeDto::TimedOut,
+        Err(ProviderProbeFailure::Rejected) => ProviderProbeDto::Rejected,
+    })
+}
+
+#[tauri::command]
 pub(crate) fn start_turn(
     request: StartTurnDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<CommandReceiptDto, CommandErrorDto> {
     let mut bridge = lock_bridge(&state)?;
     let context = request.context.into();
-    let config = HostConfig {
-        base_url: request.base_url,
-        model: request.model,
-        fetch_allow: request.fetch_allow,
-        workspace: request.workspace.clone(),
-        plugin_root: None,
-    };
+    let settings = lock_settings(&state)?
+        .load()
+        .map_err(CommandErrorDto::from)?;
+    let config = host_config(&state.workspace, &settings);
     if !bridge.has_production_host() {
+        let api_key = state.secrets.get_api_key().map_err(secret_error)?;
         bridge
-            .install_production_host(context, config, None)
+            .install_production_host_with_api_key(context, config, api_key, None)
             .map_err(CommandErrorDto::from)?;
     } else {
         bridge
@@ -198,7 +350,7 @@ pub(crate) fn start_turn(
         .start_turn(
             context,
             &request.session_id,
-            &request.workspace,
+            &state.workspace,
             &request.input,
         )
         .map(CommandReceiptDto::from)
@@ -312,21 +464,71 @@ fn session_request(request: SessionOperationDto) -> (CommandContext, SessionOper
 fn lock_bridge<'a>(
     state: &'a tauri::State<'_, DesktopState>,
 ) -> Result<std::sync::MutexGuard<'a, DesktopBridge>, CommandErrorDto> {
-    state.0.lock().map_err(|_| CommandErrorDto {
+    state.bridge.lock().map_err(|_| CommandErrorDto {
         code: "internal",
         message: "宿主状态不可用",
     })
 }
 
+fn lock_settings<'a>(
+    state: &'a tauri::State<'_, DesktopState>,
+) -> Result<std::sync::MutexGuard<'a, SettingsStore>, CommandErrorDto> {
+    state.settings.lock().map_err(|_| CommandErrorDto {
+        code: "internal",
+        message: "设置状态不可用",
+    })
+}
+
+fn host_config(workspace: &Path, settings: &ProviderSettings) -> HostConfig {
+    HostConfig {
+        base_url: settings.base_url.clone(),
+        model: settings.model.clone(),
+        fetch_allow: settings.fetch_allow.clone(),
+        workspace: workspace.to_path_buf(),
+        plugin_root: None,
+    }
+}
+
+fn secret_error(error: SecretStoreError) -> CommandErrorDto {
+    let envelope = match error {
+        SecretStoreError::Missing => {
+            ErrorEnvelope::new(ErrorCode::ApprovalRejected, "API credential is missing")
+        }
+        SecretStoreError::Rejected => {
+            ErrorEnvelope::new(ErrorCode::ToolArgsInvalid, "API credential was rejected")
+        }
+        SecretStoreError::Unavailable => ErrorEnvelope::new(
+            ErrorCode::Internal,
+            "secure credential storage is unavailable",
+        ),
+    };
+    envelope.into()
+}
+
 pub(crate) fn initialize_state(workspace: &Path) -> Result<DesktopState, ErrorEnvelope> {
+    initialize_state_with_secrets(workspace, Arc::new(SystemSecretStore))
+}
+
+fn initialize_state_with_secrets(
+    workspace: &Path,
+    secrets: Arc<dyn SecretStore>,
+) -> Result<DesktopState, ErrorEnvelope> {
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|_| ErrorEnvelope::new(ErrorCode::Internal, "workspace is unavailable"))?;
     let sessions = workspace.join(".harness").join("desktop-sessions");
     std::fs::create_dir_all(&sessions)
         .map_err(|_| ErrorEnvelope::new(ErrorCode::Internal, "cannot create session directory"))?;
-    DesktopBridge::new(workspace, &sessions).map(|bridge| DesktopState(Mutex::new(bridge)))
+    DesktopBridge::new(&workspace, &sessions).map(|bridge| DesktopState {
+        bridge: Mutex::new(bridge),
+        settings: Mutex::new(SettingsStore::new(&workspace)),
+        secrets,
+        workspace,
+    })
 }
 
 pub(crate) fn close_window(window: &tauri::Window) {
-    if let Ok(mut bridge) = window.state::<DesktopState>().0.lock() {
+    if let Ok(mut bridge) = window.state::<DesktopState>().bridge.lock() {
         let _ = bridge.close();
     }
 }
@@ -334,6 +536,29 @@ pub(crate) fn close_window(window: &tauri::Window) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct MemorySecretStore(Mutex<Option<String>>);
+
+    impl SecretStore for MemorySecretStore {
+        fn set_api_key(&self, value: &str) -> Result<(), SecretStoreError> {
+            *self.0.lock().unwrap() = Some(value.to_owned());
+            Ok(())
+        }
+
+        fn get_api_key(&self) -> Result<String, SecretStoreError> {
+            self.0
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(SecretStoreError::Missing)
+        }
+
+        fn delete_api_key(&self) -> Result<(), SecretStoreError> {
+            self.0.lock().unwrap().take();
+            Ok(())
+        }
+    }
 
     fn root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ih-tauri-{}-{name}", std::process::id()))
@@ -343,8 +568,9 @@ mod tests {
     fn state_uses_shared_bridge_and_closes_fail_closed() {
         let root = root("state");
         std::fs::create_dir_all(&root).unwrap();
-        let state = initialize_state(&root).unwrap();
-        let mut bridge = state.0.lock().unwrap();
+        let state =
+            initialize_state_with_secrets(&root, Arc::new(MemorySecretStore::default())).unwrap();
+        let mut bridge = state.bridge.lock().unwrap();
         let context = bridge.context();
         assert_eq!(context.generation, 1);
         bridge.close().unwrap();
@@ -362,6 +588,24 @@ mod tests {
         );
         drop(bridge);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn secret_store_deletion_is_observable_without_returning_plaintext() {
+        let store = MemorySecretStore::default();
+        store.set_api_key("top-secret-key").unwrap();
+        assert_eq!(store.has_api_key(), Ok(true));
+        store.delete_api_key().unwrap();
+        assert_eq!(store.has_api_key(), Ok(false));
+
+        let response = ProviderSettingsDto {
+            settings: ProviderSettings::default(),
+            has_api_key: true,
+            secure_storage_available: true,
+        };
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(!encoded.contains("top-secret-key"));
+        assert!(!encoded.to_ascii_lowercase().contains("api_key"));
     }
 
     #[test]

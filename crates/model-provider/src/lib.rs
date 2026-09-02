@@ -357,11 +357,31 @@ struct StreamOptions {
 }
 
 /// OpenAI 兼容客户端（阻塞式）。Clone 安全：内部仅是连接池句柄与密钥副本。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OpenAiCompatClient {
     api_key: String,
     http: reqwest::blocking::Client,
     route: NetworkRoute,
+}
+
+impl std::fmt::Debug for OpenAiCompatClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiCompatClient")
+            .field("api_key", &"[REDACTED]")
+            .field("http", &self.http)
+            .field("route", &self.route)
+            .finish()
+    }
+}
+
+/// Stable connectivity outcomes for a provider settings check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderProbeFailure {
+    Authentication,
+    Network,
+    Timeout,
+    Rejected,
 }
 
 #[derive(Clone, Debug)]
@@ -440,6 +460,38 @@ impl OpenAiCompatClient {
             http,
             route: NetworkRoute::LoopbackOnly,
         })
+    }
+
+    /// Checks the provider's authenticated models endpoint without issuing a chat completion.
+    pub fn probe(&self, base_url: &str) -> Result<(), ProviderProbeFailure> {
+        let base = reqwest::Url::parse(base_url).map_err(|_| ProviderProbeFailure::Rejected)?;
+        match self.route {
+            NetworkRoute::LocalProxy if base.scheme() != "https" => {
+                return Err(ProviderProbeFailure::Rejected);
+            }
+            NetworkRoute::LoopbackOnly if !url_is_loopback(&base) => {
+                return Err(ProviderProbeFailure::Rejected);
+            }
+            _ => {}
+        }
+        let url = format!("{}/models", base_url.trim_end_matches('/'));
+        let response = self
+            .http
+            .get(url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ProviderProbeFailure::Timeout
+                } else {
+                    ProviderProbeFailure::Network
+                }
+            })?;
+        match response.status().as_u16() {
+            200..=299 => Ok(()),
+            401 | 403 => Err(ProviderProbeFailure::Authentication),
+            _ => Err(ProviderProbeFailure::Rejected),
+        }
     }
 }
 
@@ -751,6 +803,59 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::SandboxDenied);
+    }
+
+    fn probe_server(status: u16, delay: Duration) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request);
+            std::thread::sleep(delay);
+            let reason = if status == 200 { "OK" } else { "Unauthorized" };
+            write!(
+                stream,
+                "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        format!("http://{address}/v1")
+    }
+
+    #[test]
+    fn provider_probe_redacts_key_and_classifies_stable_outcomes() {
+        let ok = probe_server(200, Duration::ZERO);
+        let client =
+            OpenAiCompatClient::with_key_for_loopback_test("key", Duration::from_secs(2)).unwrap();
+        assert_eq!(client.probe(&ok), Ok(()));
+        let debug = format!("{client:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("api_key: \"key\""));
+
+        let unauthorized = probe_server(401, Duration::ZERO);
+        assert_eq!(
+            client.probe(&unauthorized),
+            Err(ProviderProbeFailure::Authentication)
+        );
+
+        let slow = probe_server(200, Duration::from_millis(150));
+        let short =
+            OpenAiCompatClient::with_key_for_loopback_test("key", Duration::from_millis(20))
+                .unwrap();
+        assert_eq!(short.probe(&slow), Err(ProviderProbeFailure::Timeout));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let unavailable = format!("http://{}/v1", listener.local_addr().unwrap());
+        let closer = std::thread::spawn(move || drop(listener.accept().unwrap()));
+        assert_eq!(
+            client.probe(&unavailable),
+            Err(ProviderProbeFailure::Network)
+        );
+        closer.join().unwrap();
     }
 
     #[test]
