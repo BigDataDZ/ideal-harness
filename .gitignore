@@ -8,3 +8,6 @@
 Thumbs.db
 # 会话演示产生的临时事件流（运行时生成于系统 temp 目录，此处防御性忽略）
 ideal-harness-demo.jsonl
+apps/desktop/test-results/
+apps/desktop/playwright-report/
+tmp/
