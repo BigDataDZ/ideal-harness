@@ -19,7 +19,7 @@ import {
   type ProviderSettings,
   type ProviderSettingsSnapshot,
 } from "./features/settings/index.tsx";
-import type { ProjectionSnapshot } from "./lib/projection/index.ts";
+import { SessionProjection, type ProjectionSnapshot } from "./lib/projection/index.ts";
 
 interface DesktopStatus {
   operation: string;
@@ -31,7 +31,7 @@ interface DesktopStatus {
 function App() {
   const [security, setSecurity] = useState<DesktopStatus | null>(null);
   const [sessions, setSessions] = useState<SessionCollectionState>({ kind: "loading" });
-  const [selectedSnapshot] = useState<ProjectionSnapshot | null>(null);
+  const [selectedSnapshot, setSelectedSnapshot] = useState<ProjectionSnapshot | null>(null);
   const [operation, dispatchOperation] = useReducer(operationReducer, { kind: "idle" });
   const [activeView, setActiveView] = useState<"chat" | "timeline" | "approval" | "workspace" | "settings">("chat");
   const [pendingApproval] = useState<PendingApprovalRequest | null>(null);
@@ -59,6 +59,22 @@ function App() {
 
   useEffect(() => connect(), [connect]);
 
+  // TASK-909：以 SessionProjection 从宿主事件帧重建选中会话的唯一快照。
+  const loadSnapshot = useCallback(async (sessionId: string) => {
+    const projection = new SessionProjection(sessionId);
+    let lastSeq = 0;
+    for (;;) {
+      const frames = await invoke<
+        Array<{ session_id: string; connection_generation: number; record: { seq: number; event: unknown } }>
+      >("session_event_frames", { request: { sessionId, lastSeq, limit: 500 } });
+      if (frames.length === 0) break;
+      for (const frame of frames) projection.applyFrame(frame);
+      lastSeq = frames[frames.length - 1].record.seq + 1;
+      if (frames.length < 500) break;
+    }
+    setSelectedSnapshot(projection.snapshot());
+  }, []);
+
   const loadSettings = useCallback(() => {
     invoke<ProviderSettingsSnapshot>("get_provider_settings")
       .then(setProviderSettings)
@@ -79,7 +95,10 @@ function App() {
       invoke<SessionReceiptDto>("session_operation", {
         request: operationRequest(requested, security),
       })
-        .then((receipt) => dispatchOperation({ type: "receipt", receipt }))
+        .then((receipt) => {
+          dispatchOperation({ type: "receipt", receipt });
+          void loadSnapshot(receipt.sessionId);
+        })
         .catch((cause: unknown) => dispatchOperation({ type: "failed", error: commandError(cause) }));
     },
     [security],

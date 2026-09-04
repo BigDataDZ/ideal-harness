@@ -59,7 +59,7 @@ export function SessionNavigator({
           value={sessionId}
           onChange={(event) => setSessionId(event.currentTarget.value)}
           placeholder="新会话 ID"
-          pattern="[A-Za-z0-9_-]+"
+          pattern="[A-Za-z0-9_\-]+"
           autoComplete="off"
           disabled={!canWrite}
         />

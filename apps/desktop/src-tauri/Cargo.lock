@@ -1542,6 +1542,7 @@ version = "0.9.0"
 dependencies = [
  "harness-host",
  "keyring",
+ "protocol",
  "serde",
  "serde_json",
  "tauri",

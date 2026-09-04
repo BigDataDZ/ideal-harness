@@ -8,7 +8,8 @@ mod settings;
 
 use commands::{
     cancel_turn, close_window, delete_api_key, desktop_status, get_provider_settings,
-    initialize_state, respond_approval, save_provider_settings, session_operation, start_turn,
+    initialize_state, respond_approval, save_provider_settings, session_event_frames,
+    session_operation, start_turn,
     steer_turn, stop_turn, store_api_key, test_provider_connection,
 };
 
@@ -25,6 +26,7 @@ fn main() {
             steer_turn,
             respond_approval,
             session_operation,
+            session_event_frames,
             get_provider_settings,
             save_provider_settings,
             store_api_key,

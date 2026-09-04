@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use approval::Approver;
-use protocol::{ErrorCode, ErrorEnvelope};
+use protocol::{ErrorCode, ErrorEnvelope, SessionEventFrame};
 use session::{fork, replay_session, revert_before_turn, JsonlSession};
 use tools::CancellationToken;
 
@@ -423,6 +423,32 @@ impl DesktopBridge {
             ));
         }
         Ok(canonical)
+    }
+
+    /// TASK-909：按序返回会话事件帧（seq > last_seq，至多 limit 条），
+    /// 供桌面客户端以 SessionProjection 重建唯一真相源。
+    pub fn session_event_frames(
+        &self,
+        session_id: &str,
+        last_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionEventFrame>, ErrorEnvelope> {
+        if self.closed {
+            return Err(invalid("bridge is closed"));
+        }
+        let path = self.session_path(session_id, false)?;
+        let events = replay_session(&path).map_err(internal)?;
+        let frames = events
+            .iter()
+            .filter(|record| record.seq > last_seq)
+            .take(limit)
+            .map(|record| SessionEventFrame {
+                session_id: session_id.to_string(),
+                connection_generation: self.generation,
+                record: record.clone(),
+            })
+            .collect();
+        Ok(frames)
     }
 
     fn session_path(&self, session_id: &str, must_be_new: bool) -> Result<PathBuf, ErrorEnvelope> {

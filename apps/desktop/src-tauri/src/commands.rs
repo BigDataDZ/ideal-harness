@@ -422,6 +422,21 @@ pub(crate) fn session_operation(
         .map_err(CommandErrorDto::from)
 }
 
+/// TASK-909：按序返回会话事件帧（seq > last_seq），供前端 SessionProjection 重建真相源。
+#[tauri::command]
+pub(crate) fn session_event_frames(
+    request: SessionEventFramesRequestDto,
+    state: tauri::State<'_, DesktopState>,
+) -> Result<Vec<SessionEventFrameDto>, CommandErrorDto> {
+    let frames = lock_bridge(&state)?
+        .session_event_frames(&request.session_id, request.last_seq, request.limit)
+        .map_err(CommandErrorDto::from)?;
+    Ok(frames
+        .into_iter()
+        .map(SessionEventFrameDto::from)
+        .collect())
+}
+
 fn session_request(request: SessionOperationDto) -> (CommandContext, SessionOperation) {
     match request {
         SessionOperationDto::Create {
@@ -635,5 +650,38 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("frame-src 'none'"));
+    }
+}
+
+/// TASK-909：session_event_frames 请求 DTO。
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionEventFramesRequestDto {
+    pub session_id: String,
+    #[serde(default)]
+    pub last_seq: u64,
+    #[serde(default = "default_frame_limit")]
+    pub limit: usize,
+}
+
+fn default_frame_limit() -> usize {
+    500
+}
+
+/// TASK-909：事件帧响应 DTO（wire 与 protocol::SessionEventFrame 对齐）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SessionEventFrameDto {
+    pub session_id: String,
+    pub connection_generation: u64,
+    pub record: protocol::SequencedEvent,
+}
+
+impl From<protocol::SessionEventFrame> for SessionEventFrameDto {
+    fn from(frame: protocol::SessionEventFrame) -> Self {
+        Self {
+            session_id: frame.session_id,
+            connection_generation: frame.connection_generation,
+            record: frame.record,
+        }
     }
 }
