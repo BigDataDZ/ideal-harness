@@ -1,6 +1,7 @@
 //! D25/TASK-903: fail-closed command gate shared by restricted desktop hosts.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use approval::Approver;
@@ -66,9 +67,21 @@ struct PendingApproval {
     executor_generation: u64,
 }
 
-trait ManagedHost: Send {
+trait ManagedHost: Send + Sync {
     fn cancellation_token(&self) -> CancellationToken;
-    fn shutdown(&mut self) -> anyhow::Result<()>;
+    fn shutdown(&self) -> anyhow::Result<()>;
+
+    /// TASK-909：在宿主自己的后台线程执行一个完整 turn（模型采样 → 工具 → 结论），
+    /// 完成时置位 done。宿主实现负责把事件写入 session 日志。
+    fn spawn_turn(
+        self: Arc<Self>,
+        session_path: PathBuf,
+        input: String,
+        done: Arc<AtomicBool>,
+    ) -> Result<(), ErrorEnvelope> {
+        let _ = (session_path, input, done);
+        Err(internal("turn execution is not supported by this host"))
+    }
 }
 
 impl ManagedHost for ProductionHost {
@@ -76,8 +89,29 @@ impl ManagedHost for ProductionHost {
         self.cancellation_token()
     }
 
-    fn shutdown(&mut self) -> anyhow::Result<()> {
+    fn shutdown(&self) -> anyhow::Result<()> {
         self.shutdown()
+    }
+
+    fn spawn_turn(
+        self: Arc<Self>,
+        session_path: PathBuf,
+        input: String,
+        done: Arc<AtomicBool>,
+    ) -> Result<(), ErrorEnvelope> {
+        let host_for_thread = Arc::clone(&self);
+        // 后台线程拥有宿主 Arc，跑完整个 agent loop；结束置位 done。
+        std::thread::spawn(move || {
+            struct TurnDoneGuard(Arc<AtomicBool>);
+            impl Drop for TurnDoneGuard {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            let _done = TurnDoneGuard(Arc::clone(&done));
+            run_turn_blocking(&host_for_thread, &session_path, &input);
+        });
+        Ok(())
     }
 }
 
@@ -90,8 +124,10 @@ pub struct DesktopBridge {
     closed: bool,
     active_turn: Option<ActiveTurn>,
     pending_approval: Option<PendingApproval>,
-    host: Option<Box<dyn ManagedHost>>,
+    host: Option<Arc<dyn ManagedHost>>,
     host_config: Option<ValidatedHostConfig>,
+    /// TASK-909：当前 turn 的完成标志；新 turn 启动前据此清理已完成的登记。
+    turn_done: Option<Arc<AtomicBool>>,
 }
 
 impl DesktopBridge {
@@ -105,6 +141,7 @@ impl DesktopBridge {
             permission_epoch: 1,
             next_turn_id: 0,
             closed: false,
+            turn_done: None,
             active_turn: None,
             pending_approval: None,
             host: None,
@@ -140,7 +177,7 @@ impl DesktopBridge {
         let validated = config.clone().validate().map_err(internal)?;
         self.validate_workspace(&validated.workspace)?;
         let host = ProductionHost::start(config, approver).map_err(internal)?;
-        self.host = Some(Box::new(host));
+        self.host = Some(Arc::new(host));
         self.host_config = Some(validated);
         Ok(())
     }
@@ -160,7 +197,7 @@ impl DesktopBridge {
         self.validate_workspace(&validated.workspace)?;
         let host =
             ProductionHost::start_with_api_key(config, api_key, approver).map_err(internal)?;
-        self.host = Some(Box::new(host));
+        self.host = Some(Arc::new(host));
         self.host_config = Some(validated);
         Ok(())
     }
@@ -224,7 +261,13 @@ impl DesktopBridge {
         }
         self.validate_workspace(workspace)?;
         validate_nonblank_bounded(input, "turn input")?;
-        let _ = self.session_path(session_id, false)?;
+        let session_path = self.session_path(session_id, false)?;
+        // TASK-909：上一 turn 已完成则清理登记，允许开启新 turn
+        if let Some(done) = &self.turn_done {
+            if done.load(Ordering::SeqCst) {
+                self.active_turn = None;
+            }
+        }
         if self.active_turn.is_some() {
             return Err(invalid("another turn is already active"));
         }
@@ -237,6 +280,16 @@ impl DesktopBridge {
             id: turn_id,
             session_id: session_id.to_owned(),
         });
+        let done = Arc::new(AtomicBool::new(false));
+        self.turn_done = Some(Arc::clone(&done));
+        let host = self.host.as_ref().cloned().ok_or_else(|| {
+            ErrorEnvelope::new(
+                ErrorCode::Internal,
+                "production host is unavailable; failing closed",
+            )
+        })?;
+        host.spawn_turn(session_path, input.to_string(), done)
+            .map_err(|error| ErrorEnvelope::new(ErrorCode::Internal, error.message.to_string()))?;
         Ok(self.receipt("start_turn", Some(turn_id)))
     }
 
@@ -487,7 +540,7 @@ impl DesktopBridge {
     }
 
     fn cancel_and_shutdown_host(&mut self) -> Result<(), ErrorEnvelope> {
-        let result = if let Some(mut host) = self.host.take() {
+        let result = if let Some(host) = self.host.take() {
             host.cancellation_token().cancel();
             host.shutdown().map_err(internal)
         } else {
@@ -569,7 +622,47 @@ fn invalid(message: impl Into<String>) -> ErrorEnvelope {
 }
 
 fn internal(error: impl std::fmt::Display) -> ErrorEnvelope {
-    ErrorEnvelope::new(ErrorCode::Internal, error.to_string())
+    ErrorEnvelope::new(ErrorCode::Internal, format!("{error}"))
+}
+
+/// TASK-909：turn 后台线程主体——重建模型表面历史、注入输入、跑完整闭环。
+/// 全部错误以 TurnAborted 等事件落在会话日志内（run_turn 自身保证配对）。
+fn run_turn_blocking(host: &ProductionHost, session_path: &Path, input: &str) {
+    use model_provider::ChatMessage;
+    let _ = std::fs::create_dir_all(session_path.parent().unwrap_or(Path::new(".")));
+    let mut session = match JsonlSession::create(session_path.to_path_buf()) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("[desktop-turn] session open failed: {error}");
+            return;
+        }
+    };
+    let events = match replay_session(session_path) {
+        Ok(events) => events,
+        Err(error) => {
+            eprintln!("[desktop-turn] replay failed: {error}");
+            return;
+        }
+    };
+    let history: Vec<ChatMessage> = session::project_model_surface(&events)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| ChatMessage::try_from(entry.message.clone()).ok())
+        .collect();
+    let queue = host.proxy_event_queue();
+    let external = move || {
+        queue
+            .lock()
+            .map(|mut events| std::mem::take(&mut *events))
+            .unwrap_or_default()
+    };
+    match host.build_agent_loop(&mut session, history, &external) {
+        Ok(mut agent) => {
+            agent.inbox.push(input.to_string());
+            agent.run_turn();
+        }
+        Err(error) => eprintln!("[desktop-turn] agent loop build failed: {}", error.message),
+    }
 }
 
 #[cfg(test)]
@@ -590,8 +683,18 @@ mod tests {
             self.token.clone()
         }
 
-        fn shutdown(&mut self) -> anyhow::Result<()> {
+        fn shutdown(&self) -> anyhow::Result<()> {
             self.shutdown.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn spawn_turn(
+            self: Arc<Self>,
+            _session_path: PathBuf,
+            _input: String,
+            done: Arc<AtomicBool>,
+        ) -> Result<(), ErrorEnvelope> {
+            done.store(true, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -613,7 +716,7 @@ mod tests {
         let mut bridge = DesktopBridge::new(&workspace, &sessions).unwrap();
         let token = CancellationToken::new();
         let shutdown = Arc::new(AtomicBool::new(false));
-        bridge.host = Some(Box::new(FakeHost {
+        bridge.host = Some(Arc::new(FakeHost {
             token: token.clone(),
             shutdown: Arc::clone(&shutdown),
         }));

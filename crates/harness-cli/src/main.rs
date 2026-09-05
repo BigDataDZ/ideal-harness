@@ -110,7 +110,7 @@ fn cmd_chat(args: &[String]) -> anyhow::Result<()> {
         std::io::BufReader::new(std::io::stdin()),
         std::io::stderr(),
     ));
-    let mut host = ProductionHost::start(
+    let host = ProductionHost::start(
         HostConfig {
             base_url: cfg.base_url.clone(),
             model: cfg.model.clone(),

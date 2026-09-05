@@ -466,13 +466,19 @@ impl OpenAiCompatClient {
 
     /// Checks the provider's authenticated models endpoint without issuing a chat completion.
     pub fn probe(&self, base_url: &str) -> Result<(), ProviderProbeFailure> {
-        let base = reqwest::Url::parse(base_url).map_err(|_| ProviderProbeFailure::Rejected { provider_message: None })?;
+        let base = reqwest::Url::parse(base_url).map_err(|_| ProviderProbeFailure::Rejected {
+            provider_message: None,
+        })?;
         match self.route {
             NetworkRoute::LocalProxy if base.scheme() != "https" => {
-                return Err(ProviderProbeFailure::Rejected { provider_message: None });
+                return Err(ProviderProbeFailure::Rejected {
+                    provider_message: None,
+                });
             }
             NetworkRoute::LoopbackOnly if !url_is_loopback(&base) => {
-                return Err(ProviderProbeFailure::Rejected { provider_message: None });
+                return Err(ProviderProbeFailure::Rejected {
+                    provider_message: None,
+                });
             }
             _ => {}
         }
@@ -852,7 +858,9 @@ mod tests {
         let unauthorized = probe_server(401, Duration::ZERO);
         assert_eq!(
             client.probe(&unauthorized),
-            Err(ProviderProbeFailure::Authentication)
+            Err(ProviderProbeFailure::Authentication {
+                provider_message: None
+            })
         );
 
         let slow = probe_server(200, Duration::from_millis(150));

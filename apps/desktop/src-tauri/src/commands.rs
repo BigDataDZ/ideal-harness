@@ -401,7 +401,7 @@ fn test_provider_connection_blocking(state: &DesktopState, request: ContextComma
         .map_err(secret_error)?
         .trim()
         .to_owned();
-    let mut host =
+    let host =
         ProductionHost::start_with_api_key(host_config(&state.workspace, &settings), api_key, None)
             .map_err(|_| {
                 CommandErrorDto::from(ErrorEnvelope::new(

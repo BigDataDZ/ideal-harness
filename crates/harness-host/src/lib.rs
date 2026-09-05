@@ -220,7 +220,7 @@ impl ProductionHost {
         self.cancel_token.clone()
     }
 
-    pub fn shutdown(&mut self) -> anyhow::Result<()> {
+    pub fn shutdown(&self) -> anyhow::Result<()> {
         self.cancel_token.cancel();
         self.proxy.shutdown()
     }

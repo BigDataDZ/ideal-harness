@@ -22,7 +22,7 @@ use tools::{ToolAudit, ToolExecution, ToolRegistry, ToolSpec};
 pub(crate) struct ProviderProxy {
     pub(crate) url: String,
     stop: Arc<AtomicBool>,
-    worker: Option<thread::JoinHandle<std::io::Result<()>>>,
+    worker: Mutex<Option<thread::JoinHandle<std::io::Result<()>>>>,
 }
 
 impl ProviderProxy {
@@ -83,13 +83,18 @@ impl ProviderProxy {
         Ok(Self {
             url: format!("http://{address}"),
             stop,
-            worker: Some(worker),
+            worker: Mutex::new(Some(worker)),
         })
     }
 
-    pub(crate) fn shutdown(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn shutdown(&self) -> anyhow::Result<()> {
         self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .map_err(|_| anyhow::anyhow!("network proxy worker lock poisoned"))?
+            .take()
+        {
             worker
                 .join()
                 .map_err(|_| anyhow::anyhow!("network proxy thread panicked"))??;
@@ -101,8 +106,10 @@ impl ProviderProxy {
 impl Drop for ProviderProxy {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        if let Ok(mut worker) = self.worker.lock() {
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -328,7 +335,7 @@ mod tests {
             }
         });
         let events = Arc::new(Mutex::new(Vec::new()));
-        let mut proxy = ProviderProxy::start_with_fetch_hosts_for_tests(
+        let proxy = ProviderProxy::start_with_fetch_hosts_for_tests(
             "https://provider.example/v1",
             &["127.0.0.1".to_string()],
             Arc::clone(&events),

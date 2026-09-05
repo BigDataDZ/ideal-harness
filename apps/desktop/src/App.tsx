@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useCallback, useEffect, useReducer, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 
 import {
   operationReducer,
@@ -38,6 +38,9 @@ function App() {
   const [providerSettings, setProviderSettings] = useState<ProviderSettingsSnapshot | null>(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
+  // TASK-909：运行中的投影与水位（turn 轮询复用）
+  const projectionRef = useRef<SessionProjection | null>(null);
+  const lastSeqRef = useRef(0);
 
   const connect = useCallback(() => {
     setSessions({ kind: "loading" });
@@ -72,7 +75,33 @@ function App() {
       lastSeq = frames[frames.length - 1].record.seq + 1;
       if (frames.length < 500) break;
     }
+    projectionRef.current = projection;
+    lastSeqRef.current = lastSeq;
     setSelectedSnapshot(projection.snapshot());
+  }, []);
+
+  // TASK-909：turn 运行期间轮询事件帧，把宿主产生的事件实时投影到面板。
+  const pollTurn = useCallback(async (sessionId: string) => {
+    const projection = projectionRef.current;
+    if (!projection) return;
+    const deadline = Date.now() + 180_000;
+    for (;;) {
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      const frames = await invoke<
+        Array<{ session_id: string; connection_generation: number; record: { seq: number; event: unknown } }>
+      >("session_event_frames", { request: { sessionId, lastSeq: lastSeqRef.current, limit: 500 } });
+      for (const frame of frames) {
+        projection.applyFrame(frame);
+        lastSeqRef.current = frame.record.seq + 1;
+      }
+      setSelectedSnapshot(projection.snapshot());
+      const turnEnded = frames.some(
+        (frame) =>
+          frame.record.event.type === "turn_completed" ||
+          frame.record.event.type === "turn_aborted",
+      );
+      if (turnEnded || Date.now() > deadline) break;
+    }
   }, []);
 
   const loadSettings = useCallback(() => {
@@ -118,6 +147,25 @@ function App() {
 
   const selectedId =
     sessions.kind === "ready" || sessions.kind === "disconnected" ? sessions.selectedId : null;
+
+  // TASK-909：发送即 start_turn（真实模型 + 工具闭环），并轮询事件帧驱动面板。
+  const startTurn = useCallback(
+    async (input: string) => {
+      const sessionId = selectedId;
+      if (!security || !sessionId) return;
+      await invoke("start_turn", {
+        request: {
+          context: { generation: security.generation, permissionEpoch: security.permissionEpoch },
+          sessionId,
+          input,
+        },
+      }).catch((cause: unknown) => {
+        setSettingsMessage(commandError(cause).message);
+      });
+      await pollTurn(sessionId);
+    },
+    [security, selectedId, pollTurn],
+  );
 
   const turnCommand = (command: "cancel_turn" | "steer_turn", turnId: number, input?: string) => {
     if (!security) return;
@@ -237,8 +285,10 @@ function App() {
         {activeView === "chat" ? (
           <ChatPanel
             snapshot={selectedSnapshot}
-            startAvailable={false}
-            onSend={() => undefined}
+            startAvailable={Boolean(selectedId)}
+            onSend={(input) => {
+              void startTurn(input);
+            }}
             onSteer={(turnId, input) => turnCommand("steer_turn", turnId, input)}
             onCancel={(turnId) => turnCommand("cancel_turn", turnId)}
             onResume={() => {
