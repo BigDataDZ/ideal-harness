@@ -63,6 +63,7 @@ pub(crate) struct SettingsCommandDto {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SecretCommandDto {
     context: SecurityContextDto,
+    settings: ProviderSettings,
     api_key: String,
 }
 
@@ -323,6 +324,11 @@ fn store_api_key_blocking(state: &DesktopState, request: SecretCommandDto) -> Re
     {
         let settings = lock_settings(state)?;
         let mut current = settings.load().map_err(CommandErrorDto::from)?;
+        // TASK-909 修复：表单里的 Base URL/Model/白名单与密钥同批生效
+        current.base_url = request.settings.base_url;
+        current.model = request.settings.model;
+        current.fetch_allow = request.settings.fetch_allow;
+        current.compact_mode = request.settings.compact_mode;
         current.api_key_mask = Some(key_mask(&trimmed_key));
         settings.save(current).map_err(CommandErrorDto::from)?;
     }

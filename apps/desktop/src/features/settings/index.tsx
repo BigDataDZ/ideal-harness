@@ -27,7 +27,7 @@ interface SettingsPanelProps {
   busy: boolean;
   message: string | null;
   onSave(settings: ProviderSettings): Promise<void>;
-  onStoreKey(key: string): Promise<void>;
+  onStoreKey(settings: ProviderSettings, key: string): Promise<void>;
   onDeleteKey(): Promise<void>;
   onProbe(): Promise<ProbeResult>;
 }
@@ -70,14 +70,11 @@ export function SettingsPanel({
     if (!input || input.value.trim() === "") return;
     const value = input.value;
     input.value = "";
-    // TASK-909 修复：写密钥前先把当前表单的 Base URL/Model 一并保存，
-    // 避免写密钥后的设置回读把未保存的表单编辑冲掉。
-    void onSave({
-      baseUrl,
-      model,
-      fetchAllow: fetchAllow.split(/\r?\n/).map((host) => host.trim()).filter(Boolean),
-      compactMode,
-    }).then(() => onStoreKey(value));
+    // TASK-909 修复：设置与密钥在同一命令内原子生效（无旧代际窗口）。
+    void onStoreKey(
+      { baseUrl, model, fetchAllow: fetchAllow.split(/\r?\n/).map((host) => host.trim()).filter(Boolean), compactMode },
+      value,
+    );
   };
 
   return (

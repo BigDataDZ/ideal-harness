@@ -168,8 +168,8 @@ function App() {
 
   const saveSettings = (settings: ProviderSettings) =>
     settingsMutation("save_provider_settings", { settings });
-  const storeKey = (apiKey: string) =>
-    settingsMutation("store_api_key", { apiKey });
+  const storeKey = (settings: ProviderSettings, apiKey: string) =>
+    settingsMutation("store_api_key", { settings, apiKey });
   const deleteKey = () =>
     settingsMutation("delete_api_key", {});
   const probeProvider = async (): Promise<ProbeResult> => {
