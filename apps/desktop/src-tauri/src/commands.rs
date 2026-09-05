@@ -269,12 +269,21 @@ pub(crate) fn store_api_key(
             "API key is blank",
         )));
     }
+    // TASK-909 修复：粘贴带入的换行/空格会让 Bearer 头被 Provider 拒绝——
+    // 入库前 trim；key 内部含空白字符属于明显的粘贴错误，直接拒绝而非静默截断。
+    let trimmed_key = request.api_key.trim().to_owned();
+    if trimmed_key.chars().any(|character| character.is_whitespace()) {
+        return Err(CommandErrorDto::from(ErrorEnvelope::new(
+            ErrorCode::ToolArgsInvalid,
+            "API key contains internal whitespace; please re-paste it without line breaks",
+        )));
+    }
     let receipt = lock_bridge(&state)?
         .configuration_changed(request.context.into())
         .map_err(CommandErrorDto::from)?;
     state
         .secrets
-        .set_api_key(&request.api_key)
+        .set_api_key(&trimmed_key)
         .map_err(secret_error)?;
     Ok(receipt.into())
 }
@@ -305,7 +314,12 @@ pub(crate) fn test_provider_connection(
     let settings = lock_settings(&state)?
         .load()
         .map_err(CommandErrorDto::from)?;
-    let api_key = state.secrets.get_api_key().map_err(secret_error)?;
+    let api_key = state
+        .secrets
+        .get_api_key()
+        .map_err(secret_error)?
+        .trim()
+        .to_owned();
     let mut host =
         ProductionHost::start_with_api_key(host_config(&state.workspace, &settings), api_key, None)
             .map_err(|_| {
@@ -337,7 +351,12 @@ pub(crate) fn start_turn(
         .map_err(CommandErrorDto::from)?;
     let config = host_config(&state.workspace, &settings);
     if !bridge.has_production_host() {
-        let api_key = state.secrets.get_api_key().map_err(secret_error)?;
+        let api_key = state
+        .secrets
+        .get_api_key()
+        .map_err(secret_error)?
+        .trim()
+        .to_owned();
         bridge
             .install_production_host_with_api_key(context, config, api_key, None)
             .map_err(CommandErrorDto::from)?;
