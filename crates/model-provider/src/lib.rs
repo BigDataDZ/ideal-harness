@@ -376,12 +376,14 @@ impl std::fmt::Debug for OpenAiCompatClient {
 }
 
 /// Stable connectivity outcomes for a provider settings check.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `provider_message` 携带 Provider 返回的原始错误描述（截断、不含凭据），
+/// 用于在 UI 上区分「key 无效」与「余额不足」等真实原因。
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProviderProbeFailure {
-    Authentication,
+    Authentication { provider_message: Option<String> },
     Network,
     Timeout,
-    Rejected,
+    Rejected { provider_message: Option<String> },
 }
 
 #[derive(Clone, Debug)]
@@ -464,13 +466,13 @@ impl OpenAiCompatClient {
 
     /// Checks the provider's authenticated models endpoint without issuing a chat completion.
     pub fn probe(&self, base_url: &str) -> Result<(), ProviderProbeFailure> {
-        let base = reqwest::Url::parse(base_url).map_err(|_| ProviderProbeFailure::Rejected)?;
+        let base = reqwest::Url::parse(base_url).map_err(|_| ProviderProbeFailure::Rejected { provider_message: None })?;
         match self.route {
             NetworkRoute::LocalProxy if base.scheme() != "https" => {
-                return Err(ProviderProbeFailure::Rejected);
+                return Err(ProviderProbeFailure::Rejected { provider_message: None });
             }
             NetworkRoute::LoopbackOnly if !url_is_loopback(&base) => {
-                return Err(ProviderProbeFailure::Rejected);
+                return Err(ProviderProbeFailure::Rejected { provider_message: None });
             }
             _ => {}
         }
@@ -487,12 +489,23 @@ impl OpenAiCompatClient {
                     ProviderProbeFailure::Network
                 }
             })?;
-        match response.status().as_u16() {
+        let status = response.status().as_u16();
+        let body = response.text().unwrap_or_default();
+        let provider_message = extract_provider_message(&body);
+        match status {
             200..=299 => Ok(()),
-            401 | 403 => Err(ProviderProbeFailure::Authentication),
-            _ => Err(ProviderProbeFailure::Rejected),
+            401 | 403 => Err(ProviderProbeFailure::Authentication { provider_message }),
+            _ => Err(ProviderProbeFailure::Rejected { provider_message }),
         }
     }
+}
+
+/// 从 Provider 错误响应体提取 `error.message`（OpenAI 兼容形状），
+/// 截断至 200 字符；不含任何凭据材料。
+fn extract_provider_message(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let message = value.get("error")?.get("message")?.as_str()?;
+    Some(message.chars().take(200).collect())
 }
 
 fn validate_key(key: String) -> Result<String, ErrorEnvelope> {
