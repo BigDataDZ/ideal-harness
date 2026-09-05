@@ -297,8 +297,7 @@ pub(crate) async fn store_api_key(
 }
 
 fn store_api_key_blocking(state: &DesktopState, request: SecretCommandDto) -> Result<CommandReceiptDto, CommandErrorDto> {
-
-    if request.api_key.trim().is_empty() {
+    log_diag(&state.workspace, "store_api_key: starting");
         return Err(CommandErrorDto::from(ErrorEnvelope::new(
             ErrorCode::ToolArgsInvalid,
             "API key is blank",
@@ -387,6 +386,7 @@ pub(crate) async fn test_provider_connection(
 }
 
 fn test_provider_connection_blocking(state: &DesktopState, request: ContextCommandDto) -> Result<ProviderProbeDto, CommandErrorDto> {
+    log_diag(&state.workspace, "probe: starting connectivity test");
 
     let context = request.context.into();
     lock_bridge(state)?
@@ -410,6 +410,11 @@ fn test_provider_connection_blocking(state: &DesktopState, request: ContextComma
                 ))
             })?;
     let result = host.probe_provider();
+    if let Err(ref failure) = result {
+        log_diag(&state.workspace, &format!("probe: FAILED {:?}", failure));
+    } else {
+        log_diag(&state.workspace, "probe: connected");
+    }
     let _ = host.shutdown();
     Ok(match result {
         Ok(()) => ProviderProbeDto::Connected,
@@ -437,8 +442,7 @@ pub(crate) async fn start_turn(
 }
 
 fn start_turn_blocking(state: &DesktopState, request: StartTurnDto) -> Result<CommandReceiptDto, CommandErrorDto> {
-
-    let mut bridge = lock_bridge(state)?;
+    log_diag(&state.workspace, &format!("start_turn: session={} input={:?}", request.session_id, request.input.chars().take(80).collect::<String>()));
     let context = request.context.into();
     let settings = lock_settings(state)?
         .load()
@@ -710,6 +714,27 @@ pub(crate) fn close_window(window: &tauri::Window) {
     if let Ok(mut bridge) = window.state::<DesktopState>().bridge.lock() {
         let _ = bridge.close();
     }
+}
+
+#[cfg(test)]
+/// TASK-909 诊断：追加到 `<workspace>/.harness/desktop.log` 的日志行。
+pub(crate) fn log_diag(workspace: &Path, message: &str) {
+    let log_dir = workspace.join(".harness");
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = log_dir.join("desktop.log");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "[{}] {}", timestamp, message);
+    }
+    eprintln!("[ideal-harness] {}", message);
 }
 
 #[cfg(test)]
