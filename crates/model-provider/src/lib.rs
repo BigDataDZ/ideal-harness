@@ -575,7 +575,10 @@ impl OpenAiCompatClient {
         let chat_url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
         let body = MinimalRequest {
             model,
-            messages: [MinimalMessage { role: "user", content: "hi" }],
+            messages: [MinimalMessage {
+                role: "user",
+                content: "hi",
+            }],
             max_tokens: 1,
             stream: false,
         };
@@ -879,9 +882,9 @@ mod tests {
         );
         assert_eq!(ctx.code, ErrorCode::ContextWindowExceeded);
 
-        // 其余结构化 code / 数字 code / 非 JSON 体 → Internal，绝不猜语义
+        // 其余结构化 code / 非 JSON 体 → Internal，绝不猜语义
+        // （invalid_api_key → ApprovalRejected 是 801 probe 的认证分类）
         for body in [
-            r#"{"error":{"code":"invalid_api_key","message":"x"}}"#,
             r#"{"error":{"code":305,"message":"x"}}"#,
             "upstream exploded",
         ] {
@@ -970,7 +973,10 @@ mod tests {
         let short =
             OpenAiCompatClient::with_key_for_loopback_test("key", Duration::from_millis(20))
                 .unwrap();
-        assert_eq!(short.probe(&slow, "test-model"), Err(ProviderProbeFailure::Timeout));
+        assert_eq!(
+            short.probe(&slow, "test-model"),
+            Err(ProviderProbeFailure::Timeout)
+        );
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let unavailable = format!("http://{}/v1", listener.local_addr().unwrap());
