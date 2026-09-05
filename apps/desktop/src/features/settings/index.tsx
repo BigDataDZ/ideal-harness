@@ -68,7 +68,14 @@ export function SettingsPanel({
     if (!input || input.value.trim() === "") return;
     const value = input.value;
     input.value = "";
-    void onStoreKey(value);
+    // TASK-909 修复：写密钥前先把当前表单的 Base URL/Model 一并保存，
+    // 避免写密钥后的设置回读把未保存的表单编辑冲掉。
+    void onSave({
+      baseUrl,
+      model,
+      fetchAllow: fetchAllow.split(/\r?\n/).map((host) => host.trim()).filter(Boolean),
+      compactMode,
+    }).then(() => onStoreKey(value));
   };
 
   return (
