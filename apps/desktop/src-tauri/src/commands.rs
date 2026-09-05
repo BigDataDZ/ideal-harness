@@ -298,6 +298,7 @@ pub(crate) async fn store_api_key(
 
 fn store_api_key_blocking(state: &DesktopState, request: SecretCommandDto) -> Result<CommandReceiptDto, CommandErrorDto> {
     log_diag(&state.workspace, "store_api_key: starting");
+    if request.api_key.trim().is_empty() {
         return Err(CommandErrorDto::from(ErrorEnvelope::new(
             ErrorCode::ToolArgsInvalid,
             "API key is blank",

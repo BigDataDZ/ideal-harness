@@ -77,7 +77,8 @@ impl Inbox {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
+        // BUG-07 fix: 同时检查 boundary_reports，确保"空"语义完整。
+        self.messages.is_empty() && self.boundary_reports.is_empty()
     }
 
     fn queue_boundary_report(&mut self, text: String) {

@@ -288,20 +288,35 @@ pub fn extract_delta(data_line: &str) -> Result<StreamDelta, ErrorEnvelope> {
 }
 
 /// 把非 2xx 响应映射为稳定错误码：
-/// 结构化匹配 body 中 `error.code == "context_length_exceeded"` →
-/// [`ErrorCode::ContextWindowExceeded`]；其余一律 [`ErrorCode::Internal`]。
+/// 结构化匹配 body 中 `error.code`：
+/// - `"context_length_exceeded"` → [`ErrorCode::ContextWindowExceeded`]
+/// - `"invalid_api_key"` / `"insufficient_quota"` / `"rate_limit_exceeded"` →
+///   [`ErrorCode::ApprovalRejected`]（认证/额度/限速——不合法凭据类，区别于服务故障）
+/// 其余一律 [`ErrorCode::Internal`]。
+///
 /// 绝不按 message 或正文文本猜测语义（红线 2）。
 fn classify_http_error(status: u16, body: &str) -> ErrorEnvelope {
+    // BUG-06 fix: 扩充错误码映射，认证相关错误码映射到 ApprovalRejected 而非 Internal，
+    // 以便调用方区分"凭据/额度不足"与"服务故障"两类失败。
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
         let code = v
             .get("error")
             .and_then(|e| e.get("code"))
             .and_then(|c| c.as_str());
-        if code == Some("context_length_exceeded") {
-            return ErrorEnvelope::new(
-                ErrorCode::ContextWindowExceeded,
-                format!("上游拒绝：上下文超限（HTTP {status}）"),
-            );
+        match code {
+            Some("context_length_exceeded") => {
+                return ErrorEnvelope::new(
+                    ErrorCode::ContextWindowExceeded,
+                    format!("上游拒绝：上下文超限（HTTP {status}）"),
+                );
+            }
+            Some("invalid_api_key" | "insufficient_quota" | "rate_limit_exceeded") => {
+                return ErrorEnvelope::new(
+                    ErrorCode::ApprovalRejected,
+                    format!("上游拒绝：认证/额度/限速（HTTP {status}）"),
+                );
+            }
+            _ => {}
         }
     }
     ErrorEnvelope::new(
@@ -464,8 +479,14 @@ impl OpenAiCompatClient {
         })
     }
 
-    /// Checks the provider's authenticated models endpoint without issuing a chat completion.
-    pub fn probe(&self, base_url: &str) -> Result<(), ProviderProbeFailure> {
+    /// Checks the provider's authenticated endpoint without issuing a real chat completion.
+    ///
+    /// 探测策略（双阶段回落）：
+    /// 1. 先 GET `{base_url}/models`——标准 OpenAI 兼容服务均支持。
+    /// 2. 若返回 404/405（端点不存在），则回落到 POST `{base_url}/chat/completions`
+    ///    发一条最小请求（max_tokens=1）——兼容仅实现 chat completions 的 provider
+    ///    （如 BigModel `/api/coding/paas/v4`）。
+    pub fn probe(&self, base_url: &str, model: &str) -> Result<(), ProviderProbeFailure> {
         let base = reqwest::Url::parse(base_url).map_err(|_| ProviderProbeFailure::Rejected {
             provider_message: None,
         })?;
@@ -482,10 +503,10 @@ impl OpenAiCompatClient {
             }
             _ => {}
         }
-        let url = format!("{}/models", base_url.trim_end_matches('/'));
+        let models_url = format!("{}/models", base_url.trim_end_matches('/'));
         let response = self
             .http
-            .get(url)
+            .get(&models_url)
             .bearer_auth(&self.api_key)
             .send()
             .map_err(|error| {
@@ -496,8 +517,84 @@ impl OpenAiCompatClient {
                 }
             })?;
         let status = response.status().as_u16();
+        // 404/405 表示 /models 端点不存在，回落到 chat completions 探测。
+        if status == 404 || status == 405 {
+            return self.probe_via_chat_completions(base_url, model);
+        }
         let body = response.text().unwrap_or_default();
         let provider_message = extract_provider_message(&body);
+        let detail = match &provider_message {
+            Some(message) => format!(": {message}"),
+            None => String::new(),
+        };
+        match status {
+            200..=299 => Ok(()),
+            401 | 403 => Err(ProviderProbeFailure::Authentication { provider_message }),
+            _ => Err(ProviderProbeFailure::Rejected {
+                provider_message: Some(format!("HTTP {status}{detail}")),
+            }),
+        }
+    }
+
+    /// 回落探测：向 `/chat/completions` 发最小请求（max_tokens=1）来验证连通性与认证。
+    /// 仅当 `/models` 返回 404/405 时调用。
+    fn probe_via_chat_completions(
+        &self,
+        base_url: &str,
+        model: &str,
+    ) -> Result<(), ProviderProbeFailure> {
+        // BUG-04 fix: 回落路径也必须经路由检查，防止 LoopbackOnly 路由下访问外部主机。
+        let base = reqwest::Url::parse(base_url).map_err(|_| ProviderProbeFailure::Rejected {
+            provider_message: None,
+        })?;
+        match self.route {
+            NetworkRoute::LocalProxy if base.scheme() != "https" => {
+                return Err(ProviderProbeFailure::Rejected {
+                    provider_message: None,
+                });
+            }
+            NetworkRoute::LoopbackOnly if !url_is_loopback(&base) => {
+                return Err(ProviderProbeFailure::Rejected {
+                    provider_message: None,
+                });
+            }
+            _ => {}
+        }
+        #[derive(Serialize)]
+        struct MinimalRequest<'a> {
+            model: &'a str,
+            messages: [MinimalMessage; 1],
+            max_tokens: u32,
+            stream: bool,
+        }
+        #[derive(Serialize)]
+        struct MinimalMessage {
+            role: &'static str,
+            content: &'static str,
+        }
+        let chat_url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+        let body = MinimalRequest {
+            model,
+            messages: [MinimalMessage { role: "user", content: "hi" }],
+            max_tokens: 1,
+            stream: false,
+        };
+        let response = self
+            .http
+            .post(&chat_url)
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ProviderProbeFailure::Timeout
+                } else {
+                    ProviderProbeFailure::Network
+                }
+            })?;
+        let status = response.status().as_u16();
+        let resp_body = response.text().unwrap_or_default();
+        let provider_message = extract_provider_message(&resp_body);
         let detail = match &provider_message {
             Some(message) => format!(": {message}"),
             None => String::new(),
@@ -856,14 +953,14 @@ mod tests {
         let ok = probe_server(200, Duration::ZERO);
         let client =
             OpenAiCompatClient::with_key_for_loopback_test("key", Duration::from_secs(2)).unwrap();
-        assert_eq!(client.probe(&ok), Ok(()));
+        assert_eq!(client.probe(&ok, "test-model"), Ok(()));
         let debug = format!("{client:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("api_key: \"key\""));
 
         let unauthorized = probe_server(401, Duration::ZERO);
         assert_eq!(
-            client.probe(&unauthorized),
+            client.probe(&unauthorized, "test-model"),
             Err(ProviderProbeFailure::Authentication {
                 provider_message: None
             })
@@ -873,13 +970,13 @@ mod tests {
         let short =
             OpenAiCompatClient::with_key_for_loopback_test("key", Duration::from_millis(20))
                 .unwrap();
-        assert_eq!(short.probe(&slow), Err(ProviderProbeFailure::Timeout));
+        assert_eq!(short.probe(&slow, "test-model"), Err(ProviderProbeFailure::Timeout));
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let unavailable = format!("http://{}/v1", listener.local_addr().unwrap());
         let closer = std::thread::spawn(move || drop(listener.accept().unwrap()));
         assert_eq!(
-            client.probe(&unavailable),
+            client.probe(&unavailable, "test-model"),
             Err(ProviderProbeFailure::Network)
         );
         closer.join().unwrap();

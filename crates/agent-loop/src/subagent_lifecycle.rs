@@ -454,9 +454,11 @@ mod tests {
         parent
             .run_subagent_lifecycle(&next, &next_delegation, &runner)
             .unwrap();
+        // BUG-07 fix 后 is_empty() 同时检查 boundary_reports，
+        // NextStep 报告已在 boundary_reports 中，等待 drain 时才交付。
         assert!(
-            parent.inbox.is_empty(),
-            "next-step must wait for the boundary"
+            !parent.inbox.is_empty(),
+            "next-step report should be queued in boundary_reports"
         );
         assert_eq!(parent.inbox.drain(), vec!["final report"]);
         assert_eq!(calls.load(Ordering::SeqCst), 2);

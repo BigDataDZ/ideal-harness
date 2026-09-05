@@ -160,7 +160,7 @@ impl ProductionHost {
     }
 
     pub fn probe_provider(&self) -> Result<(), ProviderProbeFailure> {
-        self.client.probe(&self.config.base_url)
+        self.client.probe(&self.config.base_url, &self.config.model)
     }
 
     pub fn config(&self) -> &ValidatedHostConfig {

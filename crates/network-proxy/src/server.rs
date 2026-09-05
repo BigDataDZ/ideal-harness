@@ -61,6 +61,8 @@ impl<S: AuditSink + 'static> ProxyServer<S> {
         while !stop.load(Ordering::Acquire) {
             match self.listener.accept() {
                 Ok((client, _)) => {
+                    // BUG-05 fix: 定期清理已完成的 worker 句柄，防止 Vec 无限增长。
+                    workers.retain(|w: &thread::JoinHandle<io::Result<()>>| !w.is_finished());
                     // TASK-810：并发上限——超限立即 503 并留审计事件
                     if active.load(Ordering::SeqCst) >= MAX_CONCURRENT_CONNECTIONS {
                         let mut client = client;

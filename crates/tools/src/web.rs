@@ -162,14 +162,22 @@ impl WebFetchTool {
         if content.len() > MAX_SPILL_BYTES {
             return Err(args_error("fetched content exceeds spill size limit"));
         }
-        // TASK-810：总量硬上限
-        let spilled = self
-            .spilled_bytes
-            .fetch_add(content.len() as u64, Ordering::Relaxed);
-        if spilled + content.len() as u64 > MAX_SPILL_TOTAL_BYTES {
-            self.spilled_bytes
-                .fetch_sub(content.len() as u64, Ordering::Relaxed);
-            return Err(args_error("web spill budget exhausted"));
+        // BUG-03 fix: 用 compare_exchange 循环实现原子 check-and-reserve，
+        // 消除 fetch_add + fetch_sub 之间的竞态与 u64 underflow 风险。
+        let content_len = content.len() as u64;
+        loop {
+            let current = self.spilled_bytes.load(Ordering::Relaxed);
+            let new = current.saturating_add(content_len);
+            if new > MAX_SPILL_TOTAL_BYTES {
+                return Err(args_error("web spill budget exhausted"));
+            }
+            if self
+                .spilled_bytes
+                .compare_exchange(current, new, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
         }
         fs::create_dir_all(&self.spill_root)
             .map_err(|error| io_error("create spill directory", error))?;

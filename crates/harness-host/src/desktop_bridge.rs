@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use approval::Approver;
 use protocol::{ErrorCode, ErrorEnvelope, SessionEventFrame};
-use session::{fork, replay_session, revert_before_turn, JsonlSession};
+use session::{fork, replay_session, revert_before_turn, JsonlSession, SessionStore};
 use tools::CancellationToken;
 
 use crate::{HostConfig, ProductionHost, ValidatedHostConfig};
@@ -630,6 +630,7 @@ fn internal(error: impl std::fmt::Display) -> ErrorEnvelope {
 fn run_turn_blocking(host: &ProductionHost, session_path: &Path, input: &str) {
     use model_provider::ChatMessage;
     let _ = std::fs::create_dir_all(session_path.parent().unwrap_or(Path::new(".")));
+    // BUG-01 fix: 只打开一次会话文件，用同一个句柄 replay，消除 TOCTOU 窗口。
     let mut session = match JsonlSession::create(session_path.to_path_buf()) {
         Ok(session) => session,
         Err(error) => {
@@ -637,18 +638,35 @@ fn run_turn_blocking(host: &ProductionHost, session_path: &Path, input: &str) {
             return;
         }
     };
-    let events = match replay_session(session_path) {
+    let events = match session.replay_events() {
         Ok(events) => events,
         Err(error) => {
             eprintln!("[desktop-turn] replay failed: {error}");
             return;
         }
     };
-    let history: Vec<ChatMessage> = session::project_model_surface(&events)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|entry| ChatMessage::try_from(entry.message.clone()).ok())
-        .collect();
+    // BUG-02 fix: project_model_surface 失败必须落 TurnAborted 事件，不能静默降级为空历史。
+    let history: Vec<ChatMessage> = match session::project_model_surface(&events) {
+        Ok(surface) => surface
+            .into_iter()
+            .filter_map(|entry| ChatMessage::try_from(entry.message).ok())
+            .collect(),
+        Err(error) => {
+            let turn_id = session.len();
+            let _ = session.append(protocol::Event::TurnAborted {
+                turn_id,
+                reason: format!(
+                    "model surface projection failed ({:?}): {}",
+                    error.code, error.message
+                ),
+            });
+            eprintln!(
+                "[desktop-turn] surface projection failed: {:?} {}",
+                error.code, error.message
+            );
+            return;
+        }
+    };
     let queue = host.proxy_event_queue();
     let external = move || {
         queue
