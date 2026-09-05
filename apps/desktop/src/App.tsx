@@ -41,12 +41,15 @@ function App() {
   // TASK-909：运行中的投影与水位（turn 轮询复用）
   const projectionRef = useRef<SessionProjection | null>(null);
   const lastSeqRef = useRef(0);
+  // TASK-909 修复：安全上下文用 ref 同步追踪（React state 在链式调用中是旧值）
+  const securityRef = useRef<DesktopStatus | null>(null);
 
   const connect = useCallback(() => {
     setSessions({ kind: "loading" });
     invoke<DesktopStatus>("desktop_status")
       .then((status) => {
         setSecurity(status);
+        securityRef.current = status;
         setSessions({ kind: "ready", sessions: [], selectedId: null });
       })
       .catch((cause: unknown) => {
@@ -188,8 +191,9 @@ function App() {
   };
 
   const settingsContext = () => {
-    if (!security) throw new Error("host unavailable");
-    return { generation: security.generation, permissionEpoch: security.permissionEpoch };
+    const current = securityRef.current;
+    if (!current) throw new Error("host unavailable");
+    return { generation: current.generation, permissionEpoch: current.permissionEpoch };
   };
 
   const settingsMutation = async (command: string, details: Record<string, unknown>) => {
@@ -200,6 +204,7 @@ function App() {
         request: { context: settingsContext(), ...details },
       });
       setSecurity(receipt);
+      securityRef.current = receipt;
       loadSettings();
       setSettingsMessage("设置已生效，安全代际已更新");
     } catch (cause) {
