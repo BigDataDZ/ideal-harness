@@ -661,7 +661,25 @@ fn run_turn_blocking(host: &ProductionHost, session_path: &Path, input: &str) {
             agent.inbox.push(input.to_string());
             agent.run_turn();
         }
-        Err(error) => eprintln!("[desktop-turn] agent loop build failed: {}", error.message),
+        Err(error) => eprintln!(
+            "[desktop-turn] loop build failed: {:?} {}",
+            error.code, error.message
+        ),
+    }
+    // 诊断：打印事件摘要
+    if let Ok(events) = replay_session(session_path) {
+        for sequenced in events.iter().rev().take(6).rev() {
+            let kind = match &sequenced.event {
+                protocol::Event::TurnAborted { reason, .. } => format!("turn_aborted: {reason}"),
+                protocol::Event::TurnCompleted { .. } => "turn_completed".into(),
+                protocol::Event::ToolCallRequested { tool, .. } => format!("call {tool}"),
+                protocol::Event::ToolResultAdded { outcome, .. } => {
+                    format!("result {outcome:?}").chars().take(120).collect()
+                }
+                _ => continue,
+            };
+            eprintln!("[desktop-turn] seq={} {}", sequenced.seq, kind);
+        }
     }
 }
 

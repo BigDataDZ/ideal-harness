@@ -743,6 +743,102 @@ mod tests {
         std::env::temp_dir().join(format!("ih-tauri-{}-{name}", std::process::id()))
     }
 
+    /// TASK-909/808 验收 2：真实模型全流程冒烟。
+    /// 需要 IDEAL_HARNESS_SMOKE_KEY 环境变量与真实网络；#[ignore] 与 CI 隔离。
+    /// 流程：设置+key 原子生效 → 新建会话 → start_turn（读文件→CAS 编辑→完成）→ 校验文件与事件。
+    #[test]
+    #[ignore = "requires IDEAL_HARNESS_SMOKE_KEY and network access to the real provider"]
+    fn real_model_smoke_end_to_end() {
+        let Ok(api_key) = std::env::var("IDEAL_HARNESS_SMOKE_KEY") else {
+            eprintln!("smoke skipped: IDEAL_HARNESS_SMOKE_KEY not set");
+            return;
+        };
+        let workspace = root("real-smoke");
+        let _ = std::fs::remove_dir_all(&workspace);
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(
+            workspace.join("src/hello.rs"),
+            "pub const GREETING: &str = \"foo-version\";\n",
+        )
+        .unwrap();
+
+        let state = initialize_state_with_secrets(
+            &workspace,
+            std::sync::Arc::new(SystemSecretStore) as std::sync::Arc<dyn SecretStore>,
+        )
+        .unwrap();
+
+        // 1) 设置 + key 原子生效（单次代际推进 1→2）
+        let context = SecurityContextDto { generation: 1, permission_epoch: 1 };
+        store_api_key_blocking(
+            &state,
+            SecretCommandDto {
+                context: context.clone(),
+                settings: ProviderSettings {
+                    base_url: "https://open.bigmodel.cn/api/coding/paas/v4".into(),
+                    model: "glm-5.3-flash".into(),
+                    fetch_allow: vec![],
+                    compact_mode: false,
+                    api_key_mask: None,
+                },
+                api_key,
+            },
+        )
+        .expect("store key");
+        // 代际已推进：后续命令必须携带新代际（旧代际被拒是 603 防护的正确行为）
+        let context = SecurityContextDto { generation: 2, permission_epoch: 2 };
+
+        // 2) 新建会话
+        session_operation_blocking(
+            &state,
+            SessionOperationDto::Create {
+                context: context.clone(),
+                session_id: "smoke".into(),
+            },
+        )
+        .expect("create session");
+
+        // 3) start_turn：真实模型驱动的编辑任务
+        let receipt = start_turn_blocking(
+            &state,
+            StartTurnDto {
+                context: context.clone(),
+                session_id: "smoke".into(),
+                input: "请读取 src/hello.rs，把其中的 foo-version 改成 bar-version 并保存文件。".into(),
+            },
+        )
+        .expect("start turn");
+        let _turn_id = receipt.turn_id;
+
+        // 4) 轮询等待 turn 完成（最长 180 秒）——只读会话文件原始文本，桌面 crate
+        //    不直接依赖 session/protocol，保持依赖方向纯粹。
+        let session_path =
+            workspace.join(".harness").join("desktop-sessions").join("smoke.jsonl");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        loop {
+            let raw = std::fs::read_to_string(&session_path).unwrap_or_default();
+            if raw.contains("turn_completed") || raw.contains("turn_aborted") {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("turn did not finish within 180s; session: {raw}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1_500));
+        }
+
+        // 5) 断言：文件被真实 CAS 编辑
+        let final_content = std::fs::read_to_string(workspace.join("src/hello.rs")).unwrap();
+        assert!(
+            final_content.contains("bar-version"),
+            "真实模型必须完成编辑，实际内容: {final_content}"
+        );
+        // 6) 断言：事件轨迹包含真实工具链
+        let events_raw = std::fs::read_to_string(&session_path).unwrap();
+        assert!(events_raw.contains("fs_read"), "缺 fs_read");
+        assert!(events_raw.contains("fs_edit"), "缺 fs_edit");
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
     #[test]
     fn state_uses_shared_bridge_and_closes_fail_closed() {
         let root = root("state");
