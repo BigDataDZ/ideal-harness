@@ -13,8 +13,25 @@ use commands::{
     steer_turn, stop_turn, store_api_key, test_provider_connection,
 };
 
+/// TASK-909 修复：workspace 必须是**稳定的按用户固定目录**——
+/// 此前用进程 CWD，从开始菜单启动时 CWD 随机，导致设置与会话“重启即消失”。
+/// 优先级：IDEAL_HARNESS_DESKTOP_WORKSPACE 环境变量 > %USERPROFILE%\.ideal-harness。
+fn resolve_workspace() -> std::path::PathBuf {
+    if let Ok(override_dir) = std::env::var("IDEAL_HARNESS_DESKTOP_WORKSPACE") {
+        if !override_dir.trim().is_empty() {
+            return std::path::PathBuf::from(override_dir);
+        }
+    }
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .expect("desktop home directory must be available");
+    std::path::PathBuf::from(home).join(".ideal-harness")
+}
+
 fn main() {
-    let workspace = std::env::current_dir().expect("desktop working directory must be available");
+    let workspace = resolve_workspace();
+    std::fs::create_dir_all(&workspace)
+        .expect("desktop workspace directory must be creatable");
     let state = initialize_state(&workspace).expect("desktop security boundary must initialize");
     tauri::Builder::default()
         .manage(state)

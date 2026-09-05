@@ -18,6 +18,9 @@ pub(crate) struct ProviderSettings {
     pub(crate) fetch_allow: Vec<String>,
     #[serde(default)]
     pub(crate) compact_mode: bool,
+    /// TASK-909 修复：已存 key 的掩码指纹（非密钥材料），设置页显示「存的是哪把」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) api_key_mask: Option<String>,
 }
 
 impl Default for ProviderSettings {
@@ -27,6 +30,7 @@ impl Default for ProviderSettings {
             model: "deepseek-chat".into(),
             fetch_allow: Vec::new(),
             compact_mode: false,
+            api_key_mask: None,
         }
     }
 }

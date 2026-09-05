@@ -84,10 +84,10 @@ pub(crate) struct ProviderSettingsDto {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderProbeDto {
     Connected,
-    AuthenticationFailed,
+    AuthenticationFailed { provider_message: Option<String> },
     NetworkUnavailable,
     TimedOut,
-    Rejected,
+    Rejected { provider_message: Option<String> },
 }
 
 #[derive(Deserialize)]
@@ -319,8 +319,26 @@ fn store_api_key_blocking(state: &DesktopState, request: SecretCommandDto) -> Re
         .secrets
         .set_api_key(&trimmed_key)
         .map_err(secret_error)?;
+    // TASK-909 修复：记录掩码指纹（非密钥材料），设置页显示「存的是哪把」
+    {
+        let settings = lock_settings(state)?;
+        let mut current = settings.load().map_err(CommandErrorDto::from)?;
+        current.api_key_mask = Some(key_mask(&trimmed_key));
+        settings.save(current).map_err(CommandErrorDto::from)?;
+    }
     Ok(receipt.into())
 
+}
+
+/// key 掩码指纹：首 4 + 尾 4，中间省略。
+fn key_mask(key: &str) -> String {
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() <= 8 {
+        return "*".repeat(chars.len());
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 #[tauri::command]
@@ -335,15 +353,20 @@ pub(crate) async fn delete_api_key(
 }
 
 fn delete_api_key_blocking(state: &DesktopState, request: ContextCommandDto) -> Result<CommandReceiptDto, CommandErrorDto> {
-
     let receipt = lock_bridge(state)?
         .configuration_changed(request.context.into())
         .map_err(CommandErrorDto::from)?;
     match state.secrets.delete_api_key() {
-        Ok(()) | Err(SecretStoreError::Missing) => Ok(receipt.into()),
+        Ok(()) | Err(SecretStoreError::Missing) => {
+            // TASK-909 修复：删 key 同步清除掩码指纹
+            let settings = lock_settings(state)?;
+            let mut current = settings.load().map_err(CommandErrorDto::from)?;
+            current.api_key_mask = None;
+            settings.save(current).map_err(CommandErrorDto::from)?;
+            Ok(receipt.into())
+        }
         Err(error) => Err(secret_error(error)),
     }
-
 }
 
 #[tauri::command]
@@ -384,10 +407,14 @@ fn test_provider_connection_blocking(state: &DesktopState, request: ContextComma
     let _ = host.shutdown();
     Ok(match result {
         Ok(()) => ProviderProbeDto::Connected,
-        Err(ProviderProbeFailure::Authentication) => ProviderProbeDto::AuthenticationFailed,
+        Err(ProviderProbeFailure::Authentication { provider_message }) => {
+            ProviderProbeDto::AuthenticationFailed { provider_message }
+        }
         Err(ProviderProbeFailure::Network) => ProviderProbeDto::NetworkUnavailable,
         Err(ProviderProbeFailure::Timeout) => ProviderProbeDto::TimedOut,
-        Err(ProviderProbeFailure::Rejected) => ProviderProbeDto::Rejected,
+        Err(ProviderProbeFailure::Rejected { provider_message }) => {
+            ProviderProbeDto::Rejected { provider_message }
+        }
     })
 
 }

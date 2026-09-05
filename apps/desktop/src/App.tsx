@@ -171,9 +171,13 @@ function App() {
   const probeProvider = async (): Promise<ProbeResult> => {
     setSettingsBusy(true);
     try {
-      const result = await invoke<ProbeResult>("test_provider_connection", {
-        request: { context: settingsContext() },
-      });
+      // TASK-909 修复：响应为 externally-tagged 枚举，归一化为 { kind, providerMessage }
+      const raw = await invoke<Record<string, { provider_message?: string } | null>>(
+        "test_provider_connection",
+        { request: { context: settingsContext() } },
+      );
+      const kind = Object.keys(raw)[0] as ProbeResult;
+      const providerMessage = raw[kind]?.provider_message ?? null;
       const labels: Record<ProbeResult, string> = {
         connected: "连接成功",
         authentication_failed: "认证失败：请更新 API Key",
@@ -181,8 +185,9 @@ function App() {
         timed_out: "连接超时",
         rejected: "Provider 拒绝请求",
       };
-      setSettingsMessage(labels[result]);
-      return result;
+      const label = `${labels[kind] ?? "Provider 拒绝请求"}${providerMessage ? `（${providerMessage}）` : ""}`;
+      setSettingsMessage(label);
+      return kind;
     } catch (cause) {
       setSettingsMessage(commandError(cause).message);
       return "rejected";

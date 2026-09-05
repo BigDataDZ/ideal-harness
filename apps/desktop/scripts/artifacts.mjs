@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const inputs = process.argv.slice(2);
 if (inputs.length === 0) {
@@ -63,9 +64,12 @@ const readNpmPackages = (text) => {
     .map(([key, info]) => [key.replace("node_modules/", ""), info.version ?? ""]);
 };
 
-const cargoPath = join(process.cwd(), "../../Cargo.lock");
+// 锁文件相对脚本位置解析（apps/desktop/scripts → 仓库根），CWD 无关。
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(scriptDir, "..", "..", "..");
+const cargoPath = join(repoRoot, "Cargo.lock");
 if (existsSync(cargoPath)) readLock(cargoPath, "cargo", readTomlPackages);
-const npmPath = join(process.cwd(), "package-lock.json");
+const npmPath = join(repoRoot, "apps", "desktop", "package-lock.json");
 if (existsSync(npmPath)) readLock(npmPath, "npm", readNpmPackages);
 
 const sbom = {

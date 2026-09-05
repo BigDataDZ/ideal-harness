@@ -11,6 +11,8 @@ export interface ProviderSettingsSnapshot {
   settings: ProviderSettings;
   hasApiKey: boolean;
   secureStorageAvailable: boolean;
+  /** 已存 key 的掩码指纹（非密钥材料），用于确认「存的是哪把」。 */
+  apiKeyMask?: string;
 }
 
 export type ProbeResult =
@@ -85,6 +87,9 @@ export function SettingsPanel({
         <span className={snapshot?.secureStorageAvailable ? "read-only-badge" : "approval-readiness approval-readiness--invalid"}>
           {snapshot?.secureStorageAvailable ? "系统密钥库可用" : "系统密钥库不可用"}
         </span>
+        {snapshot?.apiKeyMask ? (
+          <p className="settings-note">已存 key 指纹：{snapshot.apiKeyMask}</p>
+        ) : null}
       </header>
       {!snapshot ? <div className="feature-empty"><strong>正在读取本机设置</strong></div> : (
         <div className="settings-grid">
