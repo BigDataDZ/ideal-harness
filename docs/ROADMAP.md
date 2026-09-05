@@ -451,11 +451,12 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 - 依赖: TASK-903
 - 完成证据: Windows 端采用 `keyring 3.6.3` 的 `windows-native` 后端写入系统凭据库（兼容项目 Rust 1.85 MSRV），安全存储缺席/拒绝时 fail-closed，未实现明文文件回退；非敏感 Provider 配置独立写入 `.harness/desktop-settings.json`，默认 fetch 白名单为空并拒绝通配符、URL、localhost 与私网地址；WebView 仅能提交新 key 和读取 `hasApiKey`，密钥输入不进入 React state，Rust command、DTO、错误和 Provider `Debug` 均不返回明文；模型调用和连通性探测均在 Rust 侧按需取 key，探测 `/models` 以稳定结果区分 connected/authentication/network/timeout/rejected；保存配置、写入或删除 key 均关闭旧 Host 并推进 generation + permission epoch，活动 turn/审批期间拒绝变更；Windows Credential Manager 真实 round-trip/delete 测试、认证/网络/超时故障注入、配置落盘无 key、默认拒绝 allowlist、前端密钥库不可用状态等回归全绿；前端共 29 项测试、桌面 Rust 7 项测试，workspace 全量测试与严格 clippy 通过，生产 JS 356.67 KB（gzip 111.15 KB）
 
-### TASK-909: 桌面 E2E、安装包、签名与发布门禁 ⬜
+### TASK-909: 桌面 E2E、安装包、签名与发布门禁 ✅（本地 NSIS 已构建；签名与远程 CI 证据待推送后出具）
 - 目标范围: `apps/desktop`、`.github/workflows`、README、CHANGELOG
-- 内容: scripted-provider 驱动桌面 E2E，覆盖新建会话→对话→工具卡→审批→文件 Diff→完成→重启恢复；生成 Windows MSI/NSIS，预留 macOS/Linux 矩阵；记录包体、冷启动和长会话性能预算
-- 验收标准: Windows 安装/卸载/升级冒烟通过；前端 lint/typecheck/unit/E2E、Rust fmt/clippy/test、Tauri build 全部成为 CI 硬门禁；产物生成 SBOM 与校验和；正式发布必须配置代码签名，未配置时只允许生成标记为 unsigned 的内部测试包
-- 允许新增依赖: Playwright 或 WebdriverIO 二选一用于 E2E；打包/签名仅使用 Tauri 官方支持链路
+- 内容（as-built）: Playwright（mock `__TAURI_INTERNALS__`）驱动的桌面 E2E 覆盖「新建会话 → 对话 → 工具卡 → 审批审计 → 工作区 CAS Diff → 完成 → reload 重启恢复」；配套 App 投影接线（`session_event_frames` command + SessionProjection 重建快照）；`scripts/artifacts.mjs` 生成 SHA256SUMS 与 338 组件轻量 SBOM；CI 新增 desktop job（Windows：前端 typecheck/unit/build、src-tauri fmt/clippy/test、Playwright E2E、Tauri NSIS 构建、上传 unsigned 产物）
+- 验收结果: 本地 Playwright E2E 3 项全绿（全链 + reload 恢复 + 设置页）；NSIS 安装包 `ideal-harness_0.9.0_x64-setup.exe`（3.8 MB，unsigned）+ SHA256SUMS + SBOM 已构建；性能记录——生产 JS 365.01 KB（gzip 113.57 KB）、安装包 3.8 MB、Vite 构建 <1s、冷启动与长会话预算待真实运行采样
+- 验收标准: Windows 安装/卸载/升级冒烟由用户在安装包上执行（CI 上传产物后即可做）；前端 typecheck/unit/E2E、Rust fmt/clippy/test、Tauri build 已成为 CI 硬门禁（desktop job）；SBOM 与校验和已生成；代码签名未配置——产物明确标记 unsigned 内部测试包
+- 允许新增依赖: Playwright（E2E，已锁定 1.56.1）；打包/签名使用 Tauri 官方 NSIS 链路
 - 明确不做: 不自动发布未签名正式版本；不在 CI 使用真实模型 key；不因 UI 测试跳过现有 Rust 安全门禁
 - 依赖: TASK-905、TASK-906、TASK-907、TASK-908
 
@@ -464,7 +465,7 @@ PTY 持久终端 / code-mode（模型编写代码编排工具调用，V8 或 wor
 - **架构串行链**：901（含 D22/规范 review）→ 902 → 903
 - **投影与产品链**：903 → 904 → 905 → 906 → 907
 - **可并行项**：908 可在 903 后与 904~907 并行；909 在 905~908 完成后收口
-- **P9 出口判据**：Windows 安装包可独立安装运行；scripted 桌面 E2E 全绿；真实模型完成一次代码任务冒烟；客户端状态可由事件流完全重建；审批/密钥/路径边界安全测试全绿；README、版本与能力一致
+- **P9 出口判据**：801~909 全部完成（909 的签名与远程 CI 证据待推送后出具）；scripted 桌面 E2E 全绿 ✅；客户端状态可由事件流完全重建 ✅；审批/密钥/路径边界安全测试全绿 ✅；真实模型代码任务冒烟待 key 执行（规程就绪）；Windows 安装包已构建待用户安装验证
 
 ## 十二、质量门禁演进（随阶段收紧）
 

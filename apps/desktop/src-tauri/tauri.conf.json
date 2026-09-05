@@ -24,11 +24,18 @@
     ],
     "security": {
       "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; font-src 'self'; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'none'",
-      "capabilities": ["desktop-shell"]
+      "capabilities": [
+        "desktop-shell"
+      ]
     }
   },
   "bundle": {
-    "active": false,
-    "icon": []
+    "active": true,
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "targets": [
+      "nsis"
+    ]
   }
 }
