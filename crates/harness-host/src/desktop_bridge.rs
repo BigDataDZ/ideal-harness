@@ -402,7 +402,10 @@ impl DesktopBridge {
         if context.generation != self.generation {
             return Err(ErrorEnvelope::new(
                 ErrorCode::CursorInvalid,
-                "desktop command generation is stale",
+                format!(
+                    "desktop command generation is stale (host {}, client {}); refresh and retry",
+                    self.generation, context.generation
+                ),
             ));
         }
         if context.permission_epoch != self.permission_epoch {

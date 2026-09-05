@@ -155,8 +155,12 @@ function App() {
       loadSettings();
       setSettingsMessage("设置已生效，安全代际已更新");
     } catch (cause) {
-      setSettingsMessage(commandError(cause).message);
-      connect();
+      const error = commandError(cause);
+      setSettingsMessage(error.message);
+      if (error.code === "cursor_invalid") {
+        // 代际失步：刷新宿主状态后让用户重试，而不是停留在必败状态
+        connect();
+      }
     } finally {
       setSettingsBusy(false);
     }
