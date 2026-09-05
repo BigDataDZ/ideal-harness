@@ -68,7 +68,7 @@ function App() {
     let lastSeq = 0;
     for (;;) {
       const frames = await invoke<
-        Array<{ session_id: string; connection_generation: number; record: { seq: number; event: unknown } }>
+        Array<{ session_id: string; connection_generation: number; record: { seq: number; event: Record<string, unknown> } }>
       >("session_event_frames", { request: { sessionId, lastSeq, limit: 500 } });
       if (frames.length === 0) break;
       for (const frame of frames) projection.applyFrame(frame);
@@ -88,7 +88,7 @@ function App() {
     for (;;) {
       await new Promise((resolve) => setTimeout(resolve, 1_500));
       const frames = await invoke<
-        Array<{ session_id: string; connection_generation: number; record: { seq: number; event: unknown } }>
+        Array<{ session_id: string; connection_generation: number; record: { seq: number; event: Record<string, unknown> } }>
       >("session_event_frames", { request: { sessionId, lastSeq: lastSeqRef.current, limit: 500 } });
       for (const frame of frames) {
         projection.applyFrame(frame);

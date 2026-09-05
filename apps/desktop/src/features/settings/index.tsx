@@ -107,7 +107,7 @@ export function SettingsPanel({
               <button type="button" className="danger-button" onClick={() => void onDeleteKey()} disabled={!snapshot.hasApiKey || busy}>删除密钥</button>
             </div>
             <p className={snapshot.hasApiKey ? "positive-text" : "warning-text"}>{snapshot.hasApiKey ? "已保存密钥（明文不可读取）" : "尚未保存密钥"}</p>
-            <button type="button" onClick={() => void onProbe()} disabled={!snapshot.hasApiKey || busy}>测试连接</button>
+            <button type="button" onClick={() => { void onSave({ baseUrl, model, fetchAllow: fetchAllow.split(/\r?\n/).map((h) => h.trim()).filter(Boolean), compactMode }).then(() => onProbe()); }} disabled={!snapshot.hasApiKey || busy}>测试连接</button>
           </div>
         </div>
       )}
