@@ -5,7 +5,7 @@
  * 输出：<安装包目录>/SHA256SUMS 与 sbom.json（Cargo.lock + package-lock 组件清单）。
  */
 import { createHash } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 
 const inputs = process.argv.slice(2);
@@ -14,9 +14,27 @@ if (inputs.length === 0) {
   process.exit(1);
 }
 
-const outDir = dirname(resolve(inputs[0]));
+// Windows CI（PowerShell）不展开通配符——脚本自行匹配目录内的 .exe 产物。
+const artifacts = inputs.flatMap((input) => {
+  const resolved = resolve(input);
+  if (!input.includes("*")) return [resolved];
+  const directory = dirname(resolved);
+  const pattern = basename(resolved);
+  const regex = new RegExp(
+    `^${pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*")}$`,
+  );
+  return readdirSync(directory)
+    .filter((name) => regex.test(name))
+    .map((name) => join(directory, name));
+});
+if (artifacts.length === 0) {
+  console.error("no artifacts matched");
+  process.exit(1);
+}
+
+const outDir = dirname(resolve(artifacts[0]));
 const lines = [];
-for (const artifact of inputs) {
+for (const artifact of artifacts) {
   const content = readFileSync(artifact);
   const digest = createHash("sha256").update(content).digest("hex");
   lines.push(`${digest}  ${basename(artifact)}`);
