@@ -498,10 +498,16 @@ impl OpenAiCompatClient {
         let status = response.status().as_u16();
         let body = response.text().unwrap_or_default();
         let provider_message = extract_provider_message(&body);
+        let detail = match &provider_message {
+            Some(message) => format!(": {message}"),
+            None => String::new(),
+        };
         match status {
             200..=299 => Ok(()),
             401 | 403 => Err(ProviderProbeFailure::Authentication { provider_message }),
-            _ => Err(ProviderProbeFailure::Rejected { provider_message }),
+            _ => Err(ProviderProbeFailure::Rejected {
+                provider_message: Some(format!("HTTP {status}{detail}")),
+            }),
         }
     }
 }
