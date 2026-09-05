@@ -13,11 +13,19 @@ use tauri::Manager;
 use crate::secret_store::{SecretStore, SecretStoreError, SystemSecretStore};
 use crate::settings::{ProviderSettings, SettingsStore};
 
+#[derive(Clone)]
 pub(crate) struct DesktopState {
-    bridge: Mutex<DesktopBridge>,
-    settings: Mutex<SettingsStore>,
+    bridge: Arc<Mutex<DesktopBridge>>,
+    settings: Arc<Mutex<SettingsStore>>,
     secrets: Arc<dyn SecretStore>,
     workspace: PathBuf,
+}
+
+fn internal_error_dto(message: String) -> CommandErrorDto {
+    CommandErrorDto {
+        code: "internal",
+        message: Box::leak(message.into_boxed_str()),
+    }
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -213,10 +221,18 @@ pub(crate) fn desktop_status(
 }
 
 #[tauri::command]
-pub(crate) fn get_provider_settings(
+pub(crate) async fn get_provider_settings(
     state: tauri::State<'_, DesktopState>,
 ) -> Result<ProviderSettingsDto, CommandErrorDto> {
-    let settings = lock_settings(&state)?
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || get_provider_settings_blocking(&state))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn get_provider_settings_blocking(state: &DesktopState) -> Result<ProviderSettingsDto, CommandErrorDto> {
+
+    let settings = lock_settings(state)?
         .load()
         .map_err(CommandErrorDto::from)?;
     let (has_api_key, secure_storage_available) = match state.secrets.has_api_key() {
@@ -229,15 +245,24 @@ pub(crate) fn get_provider_settings(
         has_api_key,
         secure_storage_available,
     })
+
 }
 
 #[tauri::command]
-pub(crate) fn save_provider_settings(
+pub(crate) async fn save_provider_settings(
     request: SettingsCommandDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<CommandReceiptDto, CommandErrorDto> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || save_provider_settings_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn save_provider_settings_blocking(state: &DesktopState, request: SettingsCommandDto) -> Result<CommandReceiptDto, CommandErrorDto> {
+
     let context = request.context.into();
-    let mut bridge = lock_bridge(&state)?;
+    let mut bridge = lock_bridge(state)?;
     bridge
         .validate_configuration_change(context)
         .map_err(CommandErrorDto::from)?;
@@ -249,20 +274,29 @@ pub(crate) fn save_provider_settings(
         ))
     })?;
     let settings = request.settings.validate().map_err(CommandErrorDto::from)?;
-    lock_settings(&state)?
+    lock_settings(state)?
         .save(settings)
         .map_err(CommandErrorDto::from)?;
     bridge
         .configuration_changed(context)
         .map(CommandReceiptDto::from)
         .map_err(CommandErrorDto::from)
+
 }
 
 #[tauri::command]
-pub(crate) fn store_api_key(
+pub(crate) async fn store_api_key(
     request: SecretCommandDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<CommandReceiptDto, CommandErrorDto> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || store_api_key_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn store_api_key_blocking(state: &DesktopState, request: SecretCommandDto) -> Result<CommandReceiptDto, CommandErrorDto> {
+
     if request.api_key.trim().is_empty() {
         return Err(CommandErrorDto::from(ErrorEnvelope::new(
             ErrorCode::ToolArgsInvalid,
@@ -278,7 +312,7 @@ pub(crate) fn store_api_key(
             "API key contains internal whitespace; please re-paste it without line breaks",
         )));
     }
-    let receipt = lock_bridge(&state)?
+    let receipt = lock_bridge(state)?
         .configuration_changed(request.context.into())
         .map_err(CommandErrorDto::from)?;
     state
@@ -286,32 +320,50 @@ pub(crate) fn store_api_key(
         .set_api_key(&trimmed_key)
         .map_err(secret_error)?;
     Ok(receipt.into())
+
 }
 
 #[tauri::command]
-pub(crate) fn delete_api_key(
+pub(crate) async fn delete_api_key(
     request: ContextCommandDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<CommandReceiptDto, CommandErrorDto> {
-    let receipt = lock_bridge(&state)?
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || delete_api_key_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn delete_api_key_blocking(state: &DesktopState, request: ContextCommandDto) -> Result<CommandReceiptDto, CommandErrorDto> {
+
+    let receipt = lock_bridge(state)?
         .configuration_changed(request.context.into())
         .map_err(CommandErrorDto::from)?;
     match state.secrets.delete_api_key() {
         Ok(()) | Err(SecretStoreError::Missing) => Ok(receipt.into()),
         Err(error) => Err(secret_error(error)),
     }
+
 }
 
 #[tauri::command]
-pub(crate) fn test_provider_connection(
+pub(crate) async fn test_provider_connection(
     request: ContextCommandDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<ProviderProbeDto, CommandErrorDto> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || test_provider_connection_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn test_provider_connection_blocking(state: &DesktopState, request: ContextCommandDto) -> Result<ProviderProbeDto, CommandErrorDto> {
+
     let context = request.context.into();
-    lock_bridge(&state)?
+    lock_bridge(state)?
         .validate_command_context(context)
         .map_err(CommandErrorDto::from)?;
-    let settings = lock_settings(&state)?
+    let settings = lock_settings(state)?
         .load()
         .map_err(CommandErrorDto::from)?;
     let api_key = state
@@ -337,16 +389,25 @@ pub(crate) fn test_provider_connection(
         Err(ProviderProbeFailure::Timeout) => ProviderProbeDto::TimedOut,
         Err(ProviderProbeFailure::Rejected) => ProviderProbeDto::Rejected,
     })
+
 }
 
 #[tauri::command]
-pub(crate) fn start_turn(
+pub(crate) async fn start_turn(
     request: StartTurnDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<CommandReceiptDto, CommandErrorDto> {
-    let mut bridge = lock_bridge(&state)?;
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || start_turn_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn start_turn_blocking(state: &DesktopState, request: StartTurnDto) -> Result<CommandReceiptDto, CommandErrorDto> {
+
+    let mut bridge = lock_bridge(state)?;
     let context = request.context.into();
-    let settings = lock_settings(&state)?
+    let settings = lock_settings(state)?
         .load()
         .map_err(CommandErrorDto::from)?;
     let config = host_config(&state.workspace, &settings);
@@ -374,51 +435,83 @@ pub(crate) fn start_turn(
         )
         .map(CommandReceiptDto::from)
         .map_err(CommandErrorDto::from)
+
 }
 
 #[tauri::command]
-pub(crate) fn stop_turn(
+pub(crate) async fn stop_turn(
     request: TurnCommandDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<CommandReceiptDto, CommandErrorDto> {
-    cancel_active_turn(request, state)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || stop_turn_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn stop_turn_blocking(state: &DesktopState, request: TurnCommandDto) -> Result<CommandReceiptDto, CommandErrorDto> {
+    cancel_active_turn_blocking(state, request)
 }
 
 #[tauri::command]
-pub(crate) fn cancel_turn(
+pub(crate) async fn cancel_turn(
     request: TurnCommandDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<CommandReceiptDto, CommandErrorDto> {
-    cancel_active_turn(request, state)
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cancel_turn_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
 }
 
-fn cancel_active_turn(
+fn cancel_turn_blocking(state: &DesktopState, request: TurnCommandDto) -> Result<CommandReceiptDto, CommandErrorDto> {
+    cancel_active_turn_blocking(state, request)
+}
+
+fn cancel_active_turn_blocking(
+    state: &DesktopState,
     request: TurnCommandDto,
-    state: tauri::State<'_, DesktopState>,
 ) -> Result<CommandReceiptDto, CommandErrorDto> {
-    lock_bridge(&state)?
+    lock_bridge(state)?
         .cancel_turn(request.context.into(), request.turn_id)
         .map(CommandReceiptDto::from)
         .map_err(CommandErrorDto::from)
 }
 
 #[tauri::command]
-pub(crate) fn steer_turn(
+pub(crate) async fn steer_turn(
     request: SteerDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<CommandReceiptDto, CommandErrorDto> {
-    lock_bridge(&state)?
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || steer_turn_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn steer_turn_blocking(state: &DesktopState, request: SteerDto) -> Result<CommandReceiptDto, CommandErrorDto> {
+
+    lock_bridge(state)?
         .steer(request.context.into(), request.turn_id, &request.input)
         .map(CommandReceiptDto::from)
         .map_err(CommandErrorDto::from)
+
 }
 
 #[tauri::command]
-pub(crate) fn respond_approval(
+pub(crate) async fn respond_approval(
     request: ApprovalResponseDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<CommandReceiptDto, CommandErrorDto> {
-    lock_bridge(&state)?
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || respond_approval_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn respond_approval_blocking(state: &DesktopState, request: ApprovalResponseDto) -> Result<CommandReceiptDto, CommandErrorDto> {
+
+    lock_bridge(state)?
         .respond_approval(
             request.context.into(),
             &request.request_id,
@@ -427,33 +520,52 @@ pub(crate) fn respond_approval(
         )
         .map(CommandReceiptDto::from)
         .map_err(CommandErrorDto::from)
+
 }
 
 #[tauri::command]
-pub(crate) fn session_operation(
+pub(crate) async fn session_operation(
     request: SessionOperationDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<SessionReceiptDto, CommandErrorDto> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || session_operation_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn session_operation_blocking(state: &DesktopState, request: SessionOperationDto) -> Result<SessionReceiptDto, CommandErrorDto> {
+
     let (context, operation) = session_request(request);
-    lock_bridge(&state)?
+    lock_bridge(state)?
         .session_operation(context, operation)
         .map(SessionReceiptDto::from)
         .map_err(CommandErrorDto::from)
+
 }
 
 /// TASK-909：按序返回会话事件帧（seq > last_seq），供前端 SessionProjection 重建真相源。
 #[tauri::command]
-pub(crate) fn session_event_frames(
+pub(crate) async fn session_event_frames(
     request: SessionEventFramesRequestDto,
     state: tauri::State<'_, DesktopState>,
 ) -> Result<Vec<SessionEventFrameDto>, CommandErrorDto> {
-    let frames = lock_bridge(&state)?
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || session_event_frames_blocking(&state, request))
+        .await
+        .map_err(|error| internal_error_dto(format!("command join failed: {error}")))?
+}
+
+fn session_event_frames_blocking(state: &DesktopState, request: SessionEventFramesRequestDto) -> Result<Vec<SessionEventFrameDto>, CommandErrorDto> {
+
+    let frames = lock_bridge(state)?
         .session_event_frames(&request.session_id, request.last_seq, request.limit)
         .map_err(CommandErrorDto::from)?;
     Ok(frames
         .into_iter()
         .map(SessionEventFrameDto::from)
         .collect())
+
 }
 
 fn session_request(request: SessionOperationDto) -> (CommandContext, SessionOperation) {
@@ -496,7 +608,7 @@ fn session_request(request: SessionOperationDto) -> (CommandContext, SessionOper
 }
 
 fn lock_bridge<'a>(
-    state: &'a tauri::State<'_, DesktopState>,
+    state: &'a DesktopState,
 ) -> Result<std::sync::MutexGuard<'a, DesktopBridge>, CommandErrorDto> {
     state.bridge.lock().map_err(|_| CommandErrorDto {
         code: "internal",
@@ -505,7 +617,7 @@ fn lock_bridge<'a>(
 }
 
 fn lock_settings<'a>(
-    state: &'a tauri::State<'_, DesktopState>,
+    state: &'a DesktopState,
 ) -> Result<std::sync::MutexGuard<'a, SettingsStore>, CommandErrorDto> {
     state.settings.lock().map_err(|_| CommandErrorDto {
         code: "internal",
@@ -554,8 +666,8 @@ fn initialize_state_with_secrets(
     std::fs::create_dir_all(&sessions)
         .map_err(|_| ErrorEnvelope::new(ErrorCode::Internal, "cannot create session directory"))?;
     DesktopBridge::new(&workspace, &sessions).map(|bridge| DesktopState {
-        bridge: Mutex::new(bridge),
-        settings: Mutex::new(SettingsStore::new(&workspace)),
+        bridge: Arc::new(Mutex::new(bridge)),
+        settings: Arc::new(Mutex::new(SettingsStore::new(&workspace))),
         secrets,
         workspace,
     })
